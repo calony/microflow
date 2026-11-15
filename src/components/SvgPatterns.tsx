@@ -5,12 +5,19 @@
 
 import React from 'react';
 import { Material } from '../types/microfab';
+import { DEFAULT_MATERIALS } from '../lib/materials';
 
 interface SvgPatternsProps {
   materials: Material[];
 }
 
 export const SvgPatterns: React.FC<SvgPatternsProps> = ({ materials }) => {
+  const materialIds = new Set(materials.map((m) => m.id));
+  const patternMaterials = [
+    ...materials,
+    ...DEFAULT_MATERIALS.filter((m) => !materialIds.has(m.id)),
+  ];
+
   return (
     <defs>
       {/* Universal Hatch Patterns */}
@@ -87,7 +94,7 @@ export const SvgPatterns: React.FC<SvgPatternsProps> = ({ materials }) => {
       </pattern>
 
       {/* Material Specific Composite Patterns (Base color + Hatch) */}
-      {materials.map((mat) => {
+      {patternMaterials.map((mat) => {
         const patternId = `mat-fill-${mat.id}`;
         return (
           <pattern

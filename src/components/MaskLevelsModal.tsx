@@ -35,6 +35,9 @@ import {
   AlertTriangle,
   ArrowRight,
   LayoutGrid,
+  ChevronDown,
+  PanelLeft,
+  Eraser,
 } from 'lucide-react';
 import { GdsLayoutEditor } from './GdsLayoutEditor';
 
@@ -104,6 +107,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   const [conflictPrompt, setConflictPrompt] = useState<ConflictPromptData | null>(null);
   const [feedbackNotice, setFeedbackNotice] = useState<{ message: string; type: 'success' | 'warn' } | null>(null);
   const [editorTab, setEditorTab] = useState<'apertures' | 'gds'>('apertures');
+  const [mobileReticleDrawerOpen, setMobileReticleDrawerOpen] = useState<boolean>(false);
+  const [desktopMasksSidebarOpen, setDesktopMasksSidebarOpen] = useState<boolean>(true);
   const notifyTimerRef = useRef<number | null>(null);
 
   const handleEditorNotify = (message: string, type: 'success' | 'warn') => {
@@ -179,23 +184,47 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     setSelectedMaskId(newMask.id);
   };
 
-  // Handler: Delete mask level
+  const isMaskAssigned = (mask: PhotomaskLevel): boolean =>
+    Boolean(
+      (mask.assignedStepId && lithoSteps.some(({ step }) => step.id === mask.assignedStepId)) ||
+        lithoSteps.some(({ step }) => step.lithography?.maskId === mask.id)
+    );
+
+  // Handler: Delete unassigned mask level
   const handleDeleteMask = (maskId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (masks.length <= 1) {
-      setFeedbackNotice({
-        message: 'The process flow requires at least one photomask level.',
-        type: 'warn',
-      });
-      setTimeout(() => setFeedbackNotice(null), 3500);
+    const targetMask = masks.find((m) => m.id === maskId);
+    if (!targetMask) return;
+
+    if (isMaskAssigned(targetMask)) {
+      handleEditorNotify(
+        'Assigned mask levels cannot be deleted. Clear its aperture track or unassign it from the step first.',
+        'warn'
+      );
       return;
     }
+
     const newFlow = deleteMaskFromFlow(flow, maskId);
     onUpdateFlow(newFlow);
-    const remaining = (newFlow.masks || []);
-    if (remaining.length > 0) {
-      setSelectedMaskId(remaining[0].id);
+    const remaining = newFlow.masks || [];
+    if (selectedMaskId === maskId) {
+      setSelectedMaskId(remaining[0]?.id || '');
     }
+    handleEditorNotify(`Deleted unassigned mask "${targetMask.name}".`, 'success');
+  };
+
+  // Handler: Clear all apertures on a mask level track
+  const handleClearApertureTrack = (targetMask: PhotomaskLevel | null = selectedMask, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (!targetMask) return;
+    handleUpdateMask({
+      ...targetMask,
+      windows: [],
+    });
+    if (targetMask.id === selectedMask?.id) {
+      setActiveWindowId(null);
+    }
+    handleEditorNotify(`Cleared aperture track on "${targetMask.name}".`, 'success');
   };
 
   // Handler: Assign to Step with Conflict Detection & Confirmation
@@ -477,221 +506,386 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/80 backdrop-blur-md">
-      <div
-        className={`relative flex flex-col w-full bg-slate-950 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden text-slate-100 animate-in fade-in zoom-in-95 duration-150 ${
-          editorTab === 'gds' ? 'max-w-7xl h-[94vh] max-h-[900px]' : 'max-w-6xl h-[92vh] max-h-[850px]'
-        }`}
-      >
-        {/* Top Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 bg-slate-900 border-b border-slate-800 shrink-0">
-          <div className="flex items-center gap-3">
-            <span className="w-8 h-8 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center text-white shadow-md shadow-sky-950/50">
-              <Scan className="w-4 h-4" />
-            </span>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-base font-bold text-white tracking-tight">
-                  Photolithography Mask Levels
-                </h2>
-                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                  {masks.length} {masks.length === 1 ? 'Reticle' : 'Reticles'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Manage reticle hierarchy, draw or import 2D GDS layouts, slice section lines, and configure 1D mask apertures.
-              </p>
+  const renderReticleSidebarContent = () => {
+    const getMaskAssignedStep = (mask: PhotomaskLevel) =>
+      mask.assignedStepId
+        ? lithoSteps.find(({ step }) => step.id === mask.assignedStepId) || null
+        : lithoSteps.find(({ step }) => step.lithography?.maskId === mask.id) || null;
+
+    const assignedFilteredMasks = filteredMasks
+      .filter((mask) => isMaskAssigned(mask))
+      .sort((a, b) => {
+        const sa = getMaskAssignedStep(a)?.index ?? Number.MAX_SAFE_INTEGER;
+        const sb = getMaskAssignedStep(b)?.index ?? Number.MAX_SAFE_INTEGER;
+        return sa - sb;
+      });
+    const unassignedFilteredMasks = filteredMasks.filter((mask) => !isMaskAssigned(mask));
+
+    const renderMaskCard = (mask: PhotomaskLevel, idx: number) => {
+      const isSelected = selectedMask?.id === mask.id;
+      const assigned = getMaskAssignedStep(mask);
+      const mMetrics = calculateMaskMetrics(mask, waferWidth);
+      const isAssigned = isMaskAssigned(mask);
+
+      return (
+        <div
+          key={mask.id}
+          onClick={() => {
+            setSelectedMaskId(mask.id);
+            setMobileReticleDrawerOpen(false);
+          }}
+          className={`group relative p-3 rounded-xl border transition-all cursor-pointer ${
+            isSelected
+              ? 'bg-sky-950/30 border-sky-500/80 shadow-md shadow-sky-950/40'
+              : 'bg-slate-950/70 border-slate-800 hover:border-slate-700 hover:bg-slate-950'
+          }`}
+        >
+          {/* Header: Level Tag & Name */}
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-2 min-w-0 flex-1 truncate">
+              <span
+                className="w-2.5 h-2.5 rounded-full shrink-0"
+                style={{ backgroundColor: mask.color || RETICLE_PALETTE[idx % RETICLE_PALETTE.length] }}
+              />
+              <span className="font-mono text-[11px] font-semibold text-slate-400 shrink-0">
+                {mask.layerCode || `L${idx + 1}`}
+              </span>
+              <span className="text-xs font-semibold text-slate-200 truncate group-hover:text-sky-300 transition-colors">
+                {mask.name}
+              </span>
+            </div>
+
+            {/* Duplicate & Clear Track (Assigned) / Delete (Unassigned) actions */}
+            <div className="flex items-center gap-1 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+              <button
+                onClick={(e) => handleDuplicateMask(mask, e)}
+                className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800"
+                title="Duplicate Mask Level"
+              >
+                <Copy className="w-3 h-3" />
+              </button>
+              {isAssigned ? (
+                <button
+                  onClick={(e) => handleClearApertureTrack(mask, e)}
+                  disabled={mask.windows.length === 0}
+                  className="p-1 rounded text-amber-400 hover:text-amber-300 hover:bg-amber-950/30 disabled:opacity-30 disabled:pointer-events-none"
+                  title={
+                    mask.windows.length === 0
+                      ? 'Aperture track is already clear (assigned masks cannot be deleted)'
+                      : 'Clear aperture track (assigned mask levels cannot be deleted)'
+                  }
+                >
+                  <Eraser className="w-3 h-3" />
+                </button>
+              ) : (
+                <button
+                  onClick={(e) => handleDeleteMask(mask.id, e)}
+                  className="p-1 rounded text-rose-400 hover:text-rose-300 hover:bg-rose-950/30"
+                  title="Delete Unassigned Mask Level"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              )}
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          {/* Miniature Reticle Aperture Preview Strip */}
+          <div className="h-2 w-full bg-slate-900 rounded overflow-hidden border border-slate-800 relative mb-2">
+            {mask.windows.map((w, wIdx) => {
+              const leftPct = (w.xStart / waferWidth) * 100;
+              const widthPct = ((w.xEnd - w.xStart) / waferWidth) * 100;
+              return (
+                <div
+                  key={w.id || `mini_${wIdx}`}
+                  className="absolute top-0 bottom-0"
+                  style={{
+                    left: `${leftPct}%`,
+                    width: `${Math.max(1, widthPct)}%`,
+                    backgroundColor: mask.color || '#38bdf8',
+                  }}
+                />
+              );
+            })}
+          </div>
+
+          {/* Metadata strip */}
+          <div className="flex items-center justify-between text-[10px] text-slate-400">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="capitalize text-slate-300 font-medium">
+                {mask.polarity} Resist
+              </span>
+              <span>·</span>
+              <span>{mMetrics.apertureCount} {mMetrics.apertureCount === 1 ? 'Aperture' : 'Apertures'}</span>
+              <span>·</span>
+              <span className="font-mono text-amber-400/90">{mMetrics.clearPercentage}% Clear</span>
+            </div>
+          </div>
+
+          {/* Assigned Step Status */}
+          <div className="mt-2 pt-1.5 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
+            {assigned ? (
+              <div className="flex items-center gap-1 text-sky-400 truncate">
+                <Check className="w-3 h-3 shrink-0" />
+                <span className="truncate">
+                  Step {assigned.index + 1}: {assigned.step.title}
+                </span>
+              </div>
+            ) : (
+              <span className="text-amber-400/80 italic text-[10px]">
+                Unassigned (Ready for assignment)
+              </span>
+            )}
+          </div>
+        </div>
+      );
+    };
+
+    return (
+      <>
+        {/* Search Bar */}
+        <div className="p-3 border-b border-slate-800">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-2.5 w-3.5 h-3.5 text-slate-500" />
+            <input
+              type="text"
+              placeholder="Search mask levels..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-8 pr-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500"
+            />
+          </div>
+        </div>
+
+        {/* Mask Level Cards List: Assigned (Top) & Unassigned (Bottom) */}
+        <div className="flex-1 overflow-y-auto p-3 space-y-3">
+          {filteredMasks.length > 0 ? (
+            <>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-sky-400 flex items-center gap-1.5">
+                    <Check className="w-3 h-3" />
+                    <span>Assigned Masks ({assignedFilteredMasks.length})</span>
+                  </span>
+                </div>
+                {assignedFilteredMasks.length > 0 ? (
+                  <div className="space-y-2">
+                    {assignedFilteredMasks.map((mask, i) => renderMaskCard(mask, i))}
+                  </div>
+                ) : (
+                  <div className="px-3 py-2 rounded-lg border border-dashed border-slate-800 text-[11px] text-slate-500 italic">
+                    No assigned masks{searchQuery.trim() ? ' match your search' : ''}.
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2.5 border-t border-slate-800/80 space-y-2">
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400">
+                    Unassigned Masks ({unassignedFilteredMasks.length})
+                  </span>
+                </div>
+                {unassignedFilteredMasks.length > 0 ? (
+                  <div className="space-y-2">
+                    {unassignedFilteredMasks.map((mask, i) =>
+                      renderMaskCard(mask, assignedFilteredMasks.length + i)
+                    )}
+                  </div>
+                ) : (
+                  <div className="px-3 py-2 rounded-lg border border-dashed border-slate-800 text-[11px] text-slate-500 italic">
+                    No unassigned masks{searchQuery.trim() ? ' match your search' : ''}.
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="p-6 text-center text-slate-500 text-xs">
+              {masks.length === 0
+                ? 'No mask levels defined yet. Click "+ Add Another Mask" below.'
+                : 'No mask levels match your search.'}
+            </div>
+          )}
+        </div>
+
+        {/* Sidebar Bottom summary */}
+        <div className="p-3 border-t border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 flex items-center justify-between">
+          <span>Total Reticles: {masks.length}</span>
+          <button
+            onClick={handleCreateNewMask}
+            className="text-sky-400 hover:text-sky-300 font-medium hover:underline text-[11px]"
+          >
+            + Add Another Mask
+          </button>
+        </div>
+      </>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+      <div
+        className={`relative flex flex-col w-full bg-slate-950 border-0 sm:border sm:border-slate-800 rounded-none sm:rounded-2xl shadow-2xl overflow-hidden text-slate-100 animate-in fade-in zoom-in-95 duration-150 ${
+          editorTab === 'gds' ? 'max-w-7xl h-[100dvh] sm:h-[94vh] sm:max-h-[900px]' : 'max-w-6xl h-[100dvh] sm:h-[92vh] sm:max-h-[850px]'
+        }`}
+      >
+        {/* Top Header */}
+        <div className="px-2.5 py-1.5 sm:px-5 sm:py-3 bg-slate-900 border-b border-slate-800 shrink-0 space-y-1.5 lg:space-y-0 lg:flex lg:items-center lg:justify-between lg:gap-3">
+          {/* Row 1: Title + New + Close */}
+          <div className="flex items-center justify-between gap-2 min-w-0">
+            <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+              <span className="w-6 h-6 sm:w-8 sm:h-8 rounded-lg sm:rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center text-white shadow-md shadow-sky-950/50 shrink-0">
+                <Scan className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 sm:gap-2">
+                  <h2 className="text-xs sm:text-base font-bold text-white tracking-tight truncate">
+                    Photolithography Mask Levels
+                  </h2>
+                  <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/20 shrink-0">
+                    {masks.length}
+                    <span className="hidden sm:inline"> {masks.length === 1 ? 'Reticle' : 'Reticles'}</span>
+                  </span>
+                </div>
+                <p className="hidden md:block text-xs text-slate-400 truncate">
+                  Manage reticle hierarchy, draw or import 2D GDS layouts, slice section lines, and configure 1D mask apertures.
+                </p>
+              </div>
+            </div>
+
+            {/* Mobile/Tablet Quick Close & New Mask Row 1 */}
+            <div className="flex lg:hidden items-center gap-1.5 shrink-0">
+              <button
+                onClick={handleCreateNewMask}
+                className="flex items-center gap-1 px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold shadow-sm active:scale-95"
+              >
+                <Plus className="w-3 h-3" />
+                <span className="hidden sm:inline">New Mask</span>
+                <span className="sm:hidden">New</span>
+              </button>
+              <button
+                onClick={onClose}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                title="Close Mask Levels Panel"
+              >
+                <X className="w-4.5 h-4.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Row 2 on <lg (compact reticle dropdown trigger + segmented switcher), Inline on lg+ */}
+          <div className="flex items-center justify-between lg:justify-end gap-2 shrink-0">
+            {/* Mobile / Tablet Active Reticle Selector Trigger */}
+            <button
+              type="button"
+              onClick={() => setMobileReticleDrawerOpen(true)}
+              className="lg:hidden flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-xs font-medium text-slate-200 transition-colors min-w-0 flex-1 max-w-[55%]"
+              title="Switch Reticle Level"
+            >
+              <span
+                className="w-2.5 h-2.5 rounded-full shrink-0"
+                style={{ backgroundColor: selectedMask?.color || '#38bdf8' }}
+              />
+              <span className="truncate font-mono text-[11px]">
+                {selectedMask ? `${selectedMask.layerCode ? selectedMask.layerCode + ' · ' : ''}${selectedMask.name}` : 'Select Reticle'}
+              </span>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0 ml-auto" />
+            </button>
+
             {/* Workspace Mode Switcher */}
-            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-xs">
+            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px] sm:text-xs shrink-0">
               <button
                 type="button"
                 onClick={() => setEditorTab('apertures')}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-2.5 py-1 sm:py-1.5 rounded-md font-medium transition-colors ${
                   editorTab === 'apertures'
                     ? 'bg-sky-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <Sliders className="w-3.5 h-3.5" />
-                <span>1D Aperture Track</span>
+                <span>1D Track</span>
               </button>
               <button
                 type="button"
                 onClick={() => setEditorTab('gds')}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-2.5 py-1 sm:py-1.5 rounded-md font-medium transition-colors ${
                   editorTab === 'gds'
                     ? 'bg-indigo-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <LayoutGrid className="w-3.5 h-3.5" />
-                <span>2D GDS Layout &amp; Cut</span>
+                <span>2D GDS</span>
               </button>
             </div>
 
-            <button
-              onClick={handleCreateNewMask}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md shadow-sky-900/30 transition-all active:scale-95"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>New Mask Level</span>
-            </button>
+            {/* Desktop Masks List Toggle + New + Close */}
+            <div className="hidden lg:flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setDesktopMasksSidebarOpen((v) => !v)}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                  desktopMasksSidebarOpen
+                    ? 'bg-slate-800 border-slate-700 text-sky-300 hover:bg-slate-700'
+                    : 'bg-slate-950 border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800'
+                }`}
+                title={desktopMasksSidebarOpen ? 'Hide Masks List' : 'Show Masks List'}
+              >
+                <PanelLeft className="w-3.5 h-3.5" />
+                <span>{desktopMasksSidebarOpen ? 'Hide Masks' : 'Masks'}</span>
+              </button>
 
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
-              title="Close Mask Levels Panel"
-            >
-              <X className="w-5 h-5" />
-            </button>
+              <button
+                onClick={handleCreateNewMask}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md shadow-sky-900/30 transition-all active:scale-95"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>New Mask Level</span>
+              </button>
+
+              <button
+                onClick={onClose}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                title="Close Mask Levels Panel"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
         </div>
 
         {/* Master-Detail Workspace */}
-        <div className="flex-1 flex overflow-hidden min-h-0">
-          {/* LEFT SIDEBAR: Mask Set Hierarchy List */}
-          <div className="w-80 md:w-96 flex flex-col border-r border-slate-800 bg-slate-900/60 shrink-0">
-            {/* Search Bar */}
-            <div className="p-3 border-b border-slate-800">
-              <div className="relative">
-                <Search className="absolute left-2.5 top-2.5 w-3.5 h-3.5 text-slate-500" />
-                <input
-                  type="text"
-                  placeholder="Search mask levels..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-8 pr-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500"
-                />
+        <div className="relative flex-1 flex overflow-hidden min-h-0">
+          {/* LEFT SIDEBAR: Desktop Docked Mask Set Hierarchy List */}
+          {desktopMasksSidebarOpen && (
+            <div className="hidden lg:flex w-80 xl:w-96 flex-col border-r border-slate-800 bg-slate-900/60 shrink-0">
+              {renderReticleSidebarContent()}
+            </div>
+          )}
+
+          {/* Mobile / Tablet Slide-Over Reticles Drawer */}
+          {mobileReticleDrawerOpen && (
+            <div className="lg:hidden absolute inset-0 z-30 flex">
+              <div
+                className="absolute inset-0 bg-slate-950/75 backdrop-blur-xs"
+                onClick={() => setMobileReticleDrawerOpen(false)}
+              />
+              <div className="relative w-80 max-w-[88vw] h-full flex flex-col border-r border-slate-800 bg-slate-900 shadow-2xl">
+                <div className="flex items-center justify-between px-3 py-2.5 border-b border-slate-800 bg-slate-900">
+                  <span className="text-xs font-bold uppercase tracking-wider text-sky-400">
+                    Reticle Library ({masks.length})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setMobileReticleDrawerOpen(false)}
+                    className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                {renderReticleSidebarContent()}
               </div>
             </div>
-
-            {/* Mask Level Cards List */}
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {filteredMasks.map((mask, idx) => {
-                const isSelected = selectedMask?.id === mask.id;
-                const assigned = mask.assignedStepId
-                  ? lithoSteps.find(({ step }) => step.id === mask.assignedStepId)
-                  : null;
-                const mMetrics = calculateMaskMetrics(mask, waferWidth);
-
-                return (
-                  <div
-                    key={mask.id}
-                    onClick={() => setSelectedMaskId(mask.id)}
-                    className={`group relative p-3 rounded-xl border transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-sky-950/30 border-sky-500/80 shadow-md shadow-sky-950/40'
-                        : 'bg-slate-950/70 border-slate-800 hover:border-slate-700 hover:bg-slate-950'
-                    }`}
-                  >
-                    {/* Header: Level Tag & Name */}
-                    <div className="flex items-center justify-between mb-1.5">
-                      <div className="flex items-center gap-2 min-w-0 flex-1 truncate">
-                        <span
-                          className="w-2.5 h-2.5 rounded-full shrink-0"
-                          style={{ backgroundColor: mask.color || RETICLE_PALETTE[idx % RETICLE_PALETTE.length] }}
-                        />
-                        <span className="font-mono text-[11px] font-semibold text-slate-400 shrink-0">
-                          {mask.layerCode || `L${idx + 1}`}
-                        </span>
-                        <span className="text-xs font-semibold text-slate-200 truncate group-hover:text-sky-300 transition-colors">
-                          {mask.name}
-                        </span>
-                      </div>
-
-                      {/* Duplicate & Delete actions */}
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button
-                          onClick={(e) => handleDuplicateMask(mask, e)}
-                          className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800"
-                          title="Duplicate Mask Level"
-                        >
-                          <Copy className="w-3 h-3" />
-                        </button>
-                        <button
-                          onClick={(e) => handleDeleteMask(mask.id, e)}
-                          className="p-1 rounded text-rose-400 hover:text-rose-300 hover:bg-rose-950/30"
-                          title="Delete Mask Level"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Miniature Reticle Aperture Preview Strip */}
-                    <div className="h-2 w-full bg-slate-900 rounded overflow-hidden border border-slate-800 relative mb-2">
-                      {mask.windows.map((w, wIdx) => {
-                        const leftPct = (w.xStart / waferWidth) * 100;
-                        const widthPct = ((w.xEnd - w.xStart) / waferWidth) * 100;
-                        return (
-                          <div
-                            key={w.id || `mini_${wIdx}`}
-                            className="absolute top-0 bottom-0"
-                            style={{
-                              left: `${leftPct}%`,
-                              width: `${Math.max(1, widthPct)}%`,
-                              backgroundColor: mask.color || '#38bdf8',
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-
-                    {/* Metadata strip */}
-                    <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <div className="flex items-center gap-1.5">
-                        <span className="capitalize text-slate-300 font-medium">
-                          {mask.polarity} Resist
-                        </span>
-                        <span>·</span>
-                        <span>{mMetrics.apertureCount} {mMetrics.apertureCount === 1 ? 'Aperture' : 'Apertures'}</span>
-                        <span>·</span>
-                        <span className="font-mono text-amber-400/90">{mMetrics.clearPercentage}% Clear</span>
-                      </div>
-                    </div>
-
-                    {/* Assigned Step Status */}
-                    <div className="mt-2 pt-1.5 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
-                      {assigned ? (
-                        <div className="flex items-center gap-1 text-sky-400 truncate">
-                          <Check className="w-3 h-3 shrink-0" />
-                          <span className="truncate">
-                            Step {assigned.index + 1}: {assigned.step.title}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-amber-400/80 italic text-[10px]">
-                          Unassigned (Ready for assignment)
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-
-              {filteredMasks.length === 0 && (
-                <div className="p-6 text-center text-slate-500 text-xs">
-                  No mask levels match your search.
-                </div>
-              )}
-            </div>
-
-            {/* Sidebar Bottom summary */}
-            <div className="p-3 border-t border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 flex items-center justify-between">
-              <span>Total Reticles: {masks.length}</span>
-              <button
-                onClick={handleCreateNewMask}
-                className="text-sky-400 hover:text-sky-300 font-medium hover:underline text-[11px]"
-              >
-                + Add Another Mask
-              </button>
-            </div>
-          </div>
+          )}
 
           {/* RIGHT MAIN PANEL: Active Mask CAD Inspector or 2D GDS Layout Editor */}
           {editorTab === 'gds' ? (
@@ -704,13 +898,13 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               />
             </div>
           ) : selectedMask ? (
-            <div className="flex-1 flex flex-col overflow-y-auto bg-slate-950 p-4 sm:p-6 space-y-5">
+            <div className="flex-1 flex flex-col min-w-0 overflow-y-auto bg-slate-950 p-3 sm:p-6 space-y-3.5 sm:space-y-5">
               {/* Mask General Configuration Card */}
-              <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
+              <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3.5 sm:space-y-4">
+                <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3 pb-3 border-b border-slate-800/80">
+                  <div className="flex items-center gap-2 sm:gap-3 min-w-0 w-full sm:w-auto sm:flex-1">
                     <span
-                      className="w-4 h-4 rounded-full border border-white/20 shrink-0"
+                      className="w-3.5 h-3.5 sm:w-4 sm:h-4 rounded-full border border-white/20 shrink-0"
                       style={{ backgroundColor: selectedMask.color || '#38bdf8' }}
                     />
                     <input
@@ -722,7 +916,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                           name: e.target.value,
                         })
                       }
-                      className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1 font-bold text-sm text-white focus:outline-none focus:border-sky-500 flex-1 max-w-md"
+                      className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 sm:px-3 py-1.5 sm:py-1 font-bold text-xs sm:text-sm text-white focus:outline-none focus:border-sky-500 min-w-0 flex-1 max-w-md"
                       placeholder="Mask Level Name"
                     />
                     <input
@@ -734,15 +928,15 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                           layerCode: e.target.value.toUpperCase(),
                         })
                       }
-                      className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 font-mono text-xs text-sky-400 focus:outline-none focus:border-sky-500 w-24 text-center uppercase"
+                      className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 sm:py-1 font-mono text-xs text-sky-400 focus:outline-none focus:border-sky-500 w-20 sm:w-24 text-center uppercase shrink-0"
                       placeholder="CODE"
                       title="Mask Layer Code (e.g. GATE-01)"
                     />
                   </div>
 
                   {/* Polarity & Duplicate/Delete */}
-                  <div className="flex items-center gap-2">
-                    <div className="flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 text-xs">
+                  <div className="flex items-center gap-2 w-full sm:w-auto">
+                    <div className="grid grid-cols-2 flex-1 sm:flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 text-[11px] sm:text-xs">
                       <button
                         onClick={() =>
                           handleUpdateMask({
@@ -750,7 +944,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                             polarity: 'positive',
                           })
                         }
-                        className={`px-2.5 py-1 rounded font-medium transition-colors ${
+                        className={`px-2.5 py-1 rounded font-medium whitespace-nowrap transition-colors ${
                           selectedMask.polarity === 'positive'
                             ? 'bg-sky-600 text-white'
                             : 'text-slate-400 hover:text-slate-200'
@@ -766,7 +960,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                             polarity: 'negative',
                           })
                         }
-                        className={`px-2.5 py-1 rounded font-medium transition-colors ${
+                        className={`px-2.5 py-1 rounded font-medium whitespace-nowrap transition-colors ${
                           selectedMask.polarity === 'negative'
                             ? 'bg-amber-600 text-white'
                             : 'text-slate-400 hover:text-slate-200'
@@ -779,25 +973,35 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
                     <button
                       onClick={() => handleDuplicateMask(selectedMask)}
-                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs transition-colors"
-                      title="Duplicate this Mask Level"
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs transition-colors shrink-0"
+                      title="Duplicate this Mask Level (creates an unassigned copy)"
                     >
                       <Copy className="w-3.5 h-3.5" />
                     </button>
+
+                    {!isMaskAssigned(selectedMask) && (
+                      <button
+                        onClick={() => handleDeleteMask(selectedMask.id)}
+                        className="p-1.5 rounded-lg bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 border border-rose-500/30 text-xs transition-colors shrink-0"
+                        title="Delete this unassigned Mask Level"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {/* Step Assignment Row */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
-                  <div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                  <div className="min-w-0">
                     <label className="block text-[11px] text-slate-400 mb-1 font-medium">
                       Assigned Photolithography Step in Process Flow
                     </label>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
                       <select
                         value={selectedMask.assignedStepId || 'none'}
                         onChange={(e) => handleAssignStep(e.target.value)}
-                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono"
+                        className="min-w-0 flex-1 w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono truncate"
                       >
                         <option value="none">-- Unassigned (Stand-alone Reticle) --</option>
                         {lithoSteps.map(({ step, index }) => {
@@ -836,7 +1040,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     </div>
                   </div>
 
-                  <div>
+                  <div className="min-w-0">
                     <label className="block text-[11px] text-slate-400 mb-1 font-medium">
                       Description / Layer Function Notes
                     </label>
@@ -856,7 +1060,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 </div>
 
                 {/* Reticle Color Swatches */}
-                <div className="flex items-center gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
                   <span className="text-[11px] text-slate-400">Reticle Accent Color:</span>
                   <div className="flex items-center gap-1.5">
                     {RETICLE_PALETTE.map((color) => (
@@ -903,52 +1107,61 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               )}
 
               {/* INTERACTIVE APERTURE TRACK SECTION */}
-              <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
+              <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
                     <span className="font-semibold text-xs text-slate-200">
-                      Aperture Track (Slit Positions & Dimensions)
+                      Aperture Track
                     </span>
-                    <span className="text-[11px] text-slate-400">
+                    <span className="hidden sm:inline text-[11px] text-slate-400">
                       · Drag to slide · Drag borders to resize · 50nm snapping
                     </span>
                   </div>
 
                   {/* Preset Pattern Buttons */}
-                  <div className="flex items-center gap-1.5 text-xs">
-                    <span className="text-[10px] text-slate-400 mr-1">Presets:</span>
+                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                    <span className="text-[10px] text-slate-400 mr-0.5">Presets:</span>
                     <button
                       onClick={() => handleApplyPreset('center-slit')}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
                       title="Single Center Slit"
                     >
                       Center Slit
                     </button>
                     <button
                       onClick={() => handleApplyPreset('dual-pad')}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
                       title="Dual Contact Openings"
                     >
                       Dual Pads
                     </button>
                     <button
                       onClick={() => handleApplyPreset('grating')}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
                       title="Periodic Grating Slits"
                     >
                       Grating
                     </button>
                     <button
                       onClick={() => handleApplyPreset('invert')}
-                      className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                      className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
                       title="Invert Chrome / Clear"
                     >
                       <FlipHorizontal className="w-3 h-3" />
                       <span>Invert</span>
                     </button>
                     <button
+                      onClick={() => handleClearApertureTrack(selectedMask)}
+                      disabled={selectedMask.windows.length === 0}
+                      className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-amber-950/50 text-amber-300 hover:text-amber-200 text-[11px] border border-slate-700 hover:border-amber-500/40 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+                      title="Clear all apertures from this mask track (dark field)"
+                    >
+                      <Eraser className="w-3 h-3" />
+                      <span>Clear Track</span>
+                    </button>
+                    <button
                       onClick={handleAddWindow}
-                      className="flex items-center gap-1 px-2.5 py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold transition-colors"
+                      className="flex items-center gap-1 px-2.5 py-1 sm:py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold transition-colors"
                     >
                       <Plus className="w-3 h-3" />
                       <span>Add Slit</span>
@@ -961,7 +1174,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   ref={trackRef}
                   onPointerMove={handlePointerMove}
                   onPointerUp={handlePointerUp}
-                  className="relative h-14 bg-slate-950 border border-slate-800 rounded-xl overflow-hidden cursor-default select-none shadow-inner"
+                  onPointerCancel={handlePointerUp}
+                  className="relative h-14 bg-slate-950 border border-slate-800 rounded-xl overflow-hidden cursor-default select-none shadow-inner touch-none"
                 >
                   {/* Chrome Opaque Background */}
                   <div
@@ -1002,7 +1216,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                       >
                         {/* Left edge resize handle */}
                         <div
-                          className="absolute left-0 top-0 bottom-0 w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
+                          className="absolute left-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
                           onPointerDown={(e) => handlePointerDown(e, win, 'resize-start')}
                           title="Drag to resize left edge"
                         >
@@ -1016,7 +1230,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
                         {/* Right edge resize handle */}
                         <div
-                          className="absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
+                          className="absolute right-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
                           onPointerDown={(e) => handlePointerDown(e, win, 'resize-end')}
                           title="Drag to resize right edge"
                         >
@@ -1037,11 +1251,11 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 </div>
               </div>
 
-              {/* PRECISION NUMERIC APERTURE TABLE */}
-              <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
-                <div className="flex items-center justify-between">
+              {/* PRECISION NUMERIC APERTURE TABLE / MOBILE CARDS */}
+              <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-semibold text-xs text-slate-200">
-                    Aperture Windows Coordinates ({selectedMask.windows.length})
+                    Aperture Windows ({selectedMask.windows.length})
                   </span>
 
                   <button
@@ -1049,18 +1263,98 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 text-xs font-semibold transition-colors"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>Add Aperture Window</span>
+                    <span>Add Window</span>
                   </button>
                 </div>
 
-                <div className="border border-slate-800 rounded-xl overflow-hidden">
+                {/* Mobile Stacked Aperture Cards (< sm) */}
+                <div className="sm:hidden space-y-2">
+                  {selectedMask.windows.map((win, idx) => {
+                    const widthNm = Math.round(win.xEnd - win.xStart);
+                    const widthUm = (widthNm / 1000).toFixed(2);
+                    return (
+                      <div
+                        key={`m_${win.id || idx}`}
+                        className={`p-2.5 rounded-xl border space-y-2 ${
+                          activeWindowId === win.id
+                            ? 'bg-sky-950/25 border-sky-500/50'
+                            : 'bg-slate-950/60 border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between text-xs">
+                          <div className="flex items-center gap-2 font-mono text-slate-200 font-semibold">
+                            <span
+                              className="w-2.5 h-2.5 rounded-full"
+                              style={{ backgroundColor: selectedMask.color || '#38bdf8' }}
+                            />
+                            <span>W-{idx + 1}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px]">
+                              {widthNm >= 1000 ? `${widthUm} µm` : `${widthNm} nm`}
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => handleRemoveWindow(win.id)}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/30 transition-colors"
+                            title="Delete this aperture"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="space-y-1 block">
+                            <span className="block text-[10px] font-mono text-slate-400">
+                              Start X₁ ({(win.xStart / 1000).toFixed(2)} µm)
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              max={waferWidth}
+                              step="50"
+                              value={win.xStart}
+                              onChange={(e) =>
+                                handleUpdateWindowCoord(win.id, 'xStart', parseFloat(e.target.value || '0'))
+                              }
+                              className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                            />
+                          </label>
+                          <label className="space-y-1 block">
+                            <span className="block text-[10px] font-mono text-slate-400">
+                              End X₂ ({(win.xEnd / 1000).toFixed(2)} µm)
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              max={waferWidth}
+                              step="50"
+                              value={win.xEnd}
+                              onChange={(e) =>
+                                handleUpdateWindowCoord(win.id, 'xEnd', parseFloat(e.target.value || '0'))
+                              }
+                              className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {selectedMask.windows.length === 0 && (
+                    <div className="p-4 text-center text-xs text-slate-500 italic border border-slate-800 rounded-xl bg-slate-950/40">
+                      No apertures defined (dark field). Tap &quot;Add Window&quot; or pick a preset above.
+                    </div>
+                  )}
+                </div>
+
+                {/* Desktop & Tablet Precision Numeric Table (>= sm) */}
+                <div className="hidden sm:block border border-slate-800 rounded-xl overflow-x-auto">
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-900/90 text-[11px] text-slate-400 font-mono uppercase tracking-wider border-b border-slate-800">
                       <tr>
                         <th className="px-3.5 py-2">Window #</th>
-                        <th className="px-3.5 py-2">Start $X_1$ (nm)</th>
-                        <th className="px-3.5 py-2">End $X_2$ (nm)</th>
-                        <th className="px-3.5 py-2">Width $\Delta X$</th>
+                        <th className="px-3.5 py-2">Start X₁ (nm)</th>
+                        <th className="px-3.5 py-2">End X₂ (nm)</th>
+                        <th className="px-3.5 py-2">Width ΔX</th>
                         <th className="px-3.5 py-2 text-right">Actions</th>
                       </tr>
                     </thead>
@@ -1143,7 +1437,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                         <tr>
                           <td colSpan={5} className="px-4 py-6 text-center text-slate-500 italic">
                             No apertures defined. This reticle is completely opaque (dark field).
-                            Click "Add Aperture Window" or choose a preset above.
+                            Click &quot;Add Window&quot; or choose a preset above.
                           </td>
                         </tr>
                       )}
@@ -1159,16 +1453,23 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
           )}
         </div>
 
-        {/* Bottom Modal Footer */}
-        <div className="flex items-center justify-between px-5 py-3 bg-slate-900 border-t border-slate-800 text-xs shrink-0">
-          <div className="flex items-center gap-2 text-slate-400">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>Changes made to mask levels automatically synchronize with assigned lithography steps in real time.</span>
+        {/* Bottom Modal Footer (hidden on phones in 2D GDS tab to maximize canvas area) */}
+        <div
+          className={`${
+            editorTab === 'gds' ? 'hidden sm:flex' : 'flex'
+          } items-center justify-between gap-2 px-3 sm:px-5 py-2.5 sm:py-3 bg-slate-900 border-t border-slate-800 text-xs shrink-0`}
+        >
+          <div className="flex items-center gap-2 text-slate-400 min-w-0">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+            <span className="hidden sm:inline truncate">
+              Changes made to mask levels automatically synchronize with assigned lithography steps in real time.
+            </span>
+            <span className="sm:hidden truncate">Live synced with flow steps</span>
           </div>
 
           <button
             onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition-all shadow-md active:scale-95"
+            className="px-4 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition-all shadow-md active:scale-95 shrink-0"
           >
             Done
           </button>

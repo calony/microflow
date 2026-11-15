@@ -21,6 +21,7 @@ import { SubstrateEditor } from './components/SubstrateEditor';
 import { ensureFlowMasks, syncStepWindowsToMask } from './lib/maskUtils';
 import { ensureFlowBlocks, createBlock, assignStepToBlock } from './lib/blockUtils';
 import { ThicknessUnit } from './lib/units';
+import { ListOrdered, Layers as LayersIcon, Sliders as SlidersIcon, X } from 'lucide-react';
 
 export default function App() {
   // Load initial process from localStorage if present, or fallback to CMOS preset
@@ -29,7 +30,7 @@ export default function App() {
       const saved = localStorage.getItem('microflow_current_flow') || localStorage.getItem('etchflow_current_flow');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed?.steps?.length > 0) {
+        if (parsed && Array.isArray(parsed.steps)) {
           // ensure substrateLayers exists
           if (!parsed.substrateLayers || parsed.substrateLayers.length === 0) {
             parsed.substrateLayers = [
@@ -50,7 +51,9 @@ export default function App() {
     return ensureFlowBlocks(ensureFlowMasks(PRESET_PROCESS_FLOWS[0]));
   });
 
-  const [activeStepIndex, setActiveStepIndex] = useState<number>(0);
+  const [activeStepIndex, setActiveStepIndex] = useState<number>(() =>
+    flow.steps.length > 0 ? 0 : -1
+  );
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playSpeed, setPlaySpeed] = useState<number>(1);
   const [thicknessUnit, setThicknessUnit] = useState<ThicknessUnit>(() => {
@@ -71,9 +74,13 @@ export default function App() {
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
 
-  // Panel visibility state for flexible layout and maximized wafer canvas
-  const [leftSidebarOpen, setLeftSidebarOpen] = useState<boolean>(true);
-  const [rightSidebarOpen, setRightSidebarOpen] = useState<boolean>(true);
+  // Panel visibility state: docked open on desktop (>=1024px), drawer-closed on mobile/tablet
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 1024 : true
+  );
+  const [rightSidebarOpen, setRightSidebarOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 1024 : true
+  );
   const [isMaskTrackMinimized, setIsMaskTrackMinimized] = useState<boolean>(false);
 
   // Save to localStorage on changes
@@ -112,6 +119,9 @@ export default function App() {
   const handleTogglePlay = () => {
     if (!isPlaying) {
       setIsMaskTrackMinimized(true);
+      if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+        setLeftSidebarOpen(false);
+      }
     }
     if (!isPlaying && flow.steps.length > 0 && activeStepIndex >= flow.steps.length - 1) {
       setActiveStepIndex(0);
@@ -173,7 +183,7 @@ export default function App() {
 
   const handleSelectPreset = (preset: ProcessFlow) => {
     setFlow(ensureFlowBlocks(ensureFlowMasks(preset)));
-    setActiveStepIndex(0);
+    setActiveStepIndex(preset.steps.length > 0 ? 0 : -1);
     setIsPlaying(false);
     setShowPresets(false);
   };
@@ -206,25 +216,35 @@ export default function App() {
       ];
     }
     setFlow(ensureFlowBlocks(ensureFlowMasks(newFlow)));
-    setActiveStepIndex(0);
+    setActiveStepIndex(newFlow.steps.length > 0 ? 0 : -1);
+  };
+
+  const isCompactViewport = () =>
+    typeof window !== 'undefined' && window.innerWidth < 1024;
+
+  const handleToggleLeftSidebar = () => {
+    setLeftSidebarOpen((prev) => {
+      const next = !prev;
+      if (next && isCompactViewport()) setRightSidebarOpen(false);
+      return next;
+    });
+  };
+
+  const handleToggleRightSidebar = () => {
+    setRightSidebarOpen((prev) => {
+      const next = !prev;
+      if (next && isCompactViewport()) setLeftSidebarOpen(false);
+      return next;
+    });
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
+    <div className="flex flex-col h-dvh w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
       {/* Top Application Header */}
       <Header
         flow={flow}
-        activeStepIndex={activeStepIndex}
-        isPlaying={isPlaying}
-        playSpeed={playSpeed}
-        onChangePlaySpeed={setPlaySpeed}
         thicknessUnit={thicknessUnit}
         onChangeThicknessUnit={setThicknessUnit}
-        onTogglePlay={handleTogglePlay}
-        onStepChange={(idx) => {
-          setActiveStepIndex(idx);
-          setIsPlaying(false);
-        }}
         onUpdateTitle={handleUpdateTitle}
         onOpenPresets={() => setShowPresets(true)}
         onOpenMaterials={() => setShowMaterials(true)}
@@ -237,32 +257,63 @@ export default function App() {
         onExportJson={handleExportJson}
         onImportJson={handleImportJson}
         leftSidebarOpen={leftSidebarOpen}
-        onToggleLeftSidebar={() => setLeftSidebarOpen(!leftSidebarOpen)}
+        onToggleLeftSidebar={handleToggleLeftSidebar}
         rightSidebarOpen={rightSidebarOpen}
-        onToggleRightSidebar={() => setRightSidebarOpen(!rightSidebarOpen)}
+        onToggleRightSidebar={handleToggleRightSidebar}
       />
 
-      {/* Main 3-Column CAD Workspace */}
-      <div className="flex-1 flex overflow-hidden relative">
+      {/* Main 3-Column CAD Workspace (Drawers on <1024px mobile/tablet, Docked Columns on lg+) */}
+      <div className="flex-1 flex overflow-hidden relative min-h-0">
+        {/* Compact-viewport Backdrop for active drawer */}
+        {(leftSidebarOpen || rightSidebarOpen) && (
+          <div
+            onClick={() => {
+              setLeftSidebarOpen(false);
+              setRightSidebarOpen(false);
+            }}
+            className="lg:hidden fixed inset-0 z-30 bg-slate-950/65 backdrop-blur-[1px]"
+          />
+        )}
+
         {/* Left: Process Flow Timeline */}
         {leftSidebarOpen && (
-          <aside className="w-72 xl:w-80 flex-shrink-0 h-full border-r border-slate-800">
-            <ProcessFlowSidebar
-              flow={flow}
-              activeStepIndex={activeStepIndex}
-              thicknessUnit={thicknessUnit}
-              onSelectStepIndex={(idx) => {
-                setActiveStepIndex(idx);
-                setIsPlaying(false);
-              }}
-              onUpdateFlow={setFlow}
-              onOpenPresets={() => setShowPresets(true)}
-            />
+          <aside className="fixed inset-y-0 left-0 z-40 w-[86vw] max-w-[330px] h-full border-r border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-72 xl:w-80 lg:shadow-none flex-shrink-0">
+            <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
+              <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                <ListOrdered className="w-3.5 h-3.5 text-sky-400" />
+                <span>Process Flow Timeline</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setLeftSidebarOpen(false)}
+                className="flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 text-slate-300 hover:text-white text-[11px]"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Close</span>
+              </button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden">
+              <ProcessFlowSidebar
+                flow={flow}
+                activeStepIndex={activeStepIndex}
+                thicknessUnit={thicknessUnit}
+                isPlaying={isPlaying}
+                playSpeed={playSpeed}
+                onChangePlaySpeed={setPlaySpeed}
+                onTogglePlay={handleTogglePlay}
+                onSelectStepIndex={(idx) => {
+                  setActiveStepIndex(idx);
+                  setIsPlaying(false);
+                }}
+                onUpdateFlow={setFlow}
+                onOpenPresets={() => setShowPresets(true)}
+              />
+            </div>
           </aside>
         )}
 
         {/* Center: Canvas Viewport & Photomask Track */}
-        <main className="flex-1 flex flex-col h-full bg-[#030712] p-2.5 sm:p-3 overflow-hidden space-y-2.5 sm:space-y-3 min-w-0">
+        <main className="flex-1 flex flex-col h-full bg-[#030712] p-1.5 sm:p-3 overflow-hidden space-y-2 sm:space-y-3 min-w-0">
           {/* Photomask Aperture Editor (Active if current step is Lithography) */}
           {activeStep && activeStep.type === 'lithography' && (
             <div className="flex-shrink-0">
@@ -304,59 +355,118 @@ export default function App() {
 
         {/* Right: Substrate Layer Editor OR Step Deep Parameters Editor */}
         {rightSidebarOpen && (
-          <aside className="w-80 xl:w-96 flex-shrink-0 h-full border-l border-slate-800">
-            {isSubstrateActive ? (
-              <SubstrateEditor
-                flow={flow}
-                thicknessUnit={thicknessUnit}
-                onUpdateFlow={setFlow}
-                onOpenMaterialsModal={() => setShowMaterials(true)}
-              />
-            ) : activeStep ? (
-              <StepEditor
-                step={activeStep}
-                waferWidth={flow.substrateWidth}
-                materials={flow.materials}
-                thicknessUnit={thicknessUnit}
-                onUpdateStep={handleUpdateStep}
-                onOpenMaterialsModal={() => setShowMaterials(true)}
-                onMergeMaterials={(incomingMats) => {
-                  const existingIds = new Set(flow.materials.map((m) => m.id));
-                  const missing = incomingMats.filter((m) => !existingIds.has(m.id));
-                  if (missing.length > 0) {
-                    setFlow((prev) => {
-                      const prevIds = new Set(prev.materials.map((m) => m.id));
-                      const toAdd = incomingMats.filter((m) => !prevIds.has(m.id));
-                      if (toAdd.length === 0) return prev;
-                      return { ...prev, materials: [...prev.materials, ...toAdd] };
-                    });
-                  }
-                }}
-                blocks={flow.blocks}
-                masks={flow.masks}
-                onOpenMaskLevelsModal={(maskId) => {
-                  setFocusMaskId(maskId);
-                  setShowMaskLevels(true);
-                }}
-                onCreateBlock={(name) => {
-                  const { flow: updated, block: newBlock } = createBlock(flow, name);
-                  const currentStep = updated.steps[activeStepIndex];
-                  if (currentStep) {
-                    const assignedFlow = assignStepToBlock(updated, currentStep.id, newBlock.id);
-                    const newIdx = assignedFlow.steps.findIndex((s) => s.id === currentStep.id);
-                    setFlow(assignedFlow);
-                    if (newIdx >= 0 && newIdx !== activeStepIndex) {
-                      setActiveStepIndex(newIdx);
+          <aside className="fixed inset-y-0 right-0 z-40 w-[88vw] max-w-[370px] h-full border-l border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-80 xl:w-96 lg:shadow-none flex-shrink-0">
+            <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
+              <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                <SlidersIcon className="w-3.5 h-3.5 text-sky-400" />
+                <span>{isSubstrateActive ? 'Substrate Stack' : 'Step Parameters'}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setRightSidebarOpen(false)}
+                className="flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 text-slate-300 hover:text-white text-[11px]"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Done</span>
+              </button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden">
+              {isSubstrateActive ? (
+                <SubstrateEditor
+                  flow={flow}
+                  thicknessUnit={thicknessUnit}
+                  onUpdateFlow={setFlow}
+                  onOpenMaterialsModal={() => setShowMaterials(true)}
+                />
+              ) : activeStep ? (
+                <StepEditor
+                  step={activeStep}
+                  waferWidth={flow.substrateWidth}
+                  materials={flow.materials}
+                  thicknessUnit={thicknessUnit}
+                  onUpdateStep={handleUpdateStep}
+                  onOpenMaterialsModal={() => setShowMaterials(true)}
+                  onMergeMaterials={(incomingMats) => {
+                    const existingIds = new Set(flow.materials.map((m) => m.id));
+                    const missing = incomingMats.filter((m) => !existingIds.has(m.id));
+                    if (missing.length > 0) {
+                      setFlow((prev) => {
+                        const prevIds = new Set(prev.materials.map((m) => m.id));
+                        const toAdd = incomingMats.filter((m) => !prevIds.has(m.id));
+                        if (toAdd.length === 0) return prev;
+                        return { ...prev, materials: [...prev.materials, ...toAdd] };
+                      });
                     }
-                  } else {
-                    setFlow(updated);
-                  }
-                }}
-              />
-            ) : null}
+                  }}
+                  blocks={flow.blocks}
+                  masks={flow.masks}
+                  onOpenMaskLevelsModal={(maskId) => {
+                    setFocusMaskId(maskId);
+                    setShowMaskLevels(true);
+                  }}
+                  onCreateBlock={(name) => {
+                    const { flow: updated, block: newBlock } = createBlock(flow, name);
+                    const currentStep = updated.steps[activeStepIndex];
+                    if (currentStep) {
+                      const assignedFlow = assignStepToBlock(updated, currentStep.id, newBlock.id);
+                      const newIdx = assignedFlow.steps.findIndex((s) => s.id === currentStep.id);
+                      setFlow(assignedFlow);
+                      if (newIdx >= 0 && newIdx !== activeStepIndex) {
+                        setActiveStepIndex(newIdx);
+                      }
+                    } else {
+                      setFlow(updated);
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
           </aside>
         )}
       </div>
+
+      {/* Mobile & Tablet Bottom Panel Switcher (< lg) */}
+      <nav className="lg:hidden shrink-0 grid grid-cols-3 bg-slate-900 border-t border-slate-800 text-[11px] font-medium select-none z-20">
+        <button
+          type="button"
+          onClick={handleToggleLeftSidebar}
+          className={`flex items-center justify-center gap-1.5 py-2.5 border-r border-slate-800/80 transition-colors ${
+            leftSidebarOpen
+              ? 'bg-sky-950/50 text-sky-300 font-semibold'
+              : 'text-slate-300 active:bg-slate-800'
+          }`}
+        >
+          <ListOrdered className="w-3.5 h-3.5" />
+          <span>Flow ({flow.steps.length})</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setLeftSidebarOpen(false);
+            setRightSidebarOpen(false);
+          }}
+          className={`flex items-center justify-center gap-1.5 py-2.5 border-r border-slate-800/80 transition-colors ${
+            !leftSidebarOpen && !rightSidebarOpen
+              ? 'bg-sky-950/50 text-sky-300 font-semibold'
+              : 'text-slate-300 active:bg-slate-800'
+          }`}
+        >
+          <LayersIcon className="w-3.5 h-3.5" />
+          <span>Wafer View</span>
+        </button>
+        <button
+          type="button"
+          onClick={handleToggleRightSidebar}
+          className={`flex items-center justify-center gap-1.5 py-2.5 transition-colors ${
+            rightSidebarOpen
+              ? 'bg-sky-950/50 text-sky-300 font-semibold'
+              : 'text-slate-300 active:bg-slate-800'
+          }`}
+        >
+          <SlidersIcon className="w-3.5 h-3.5" />
+          <span>{isSubstrateActive ? 'Substrate' : 'Params'}</span>
+        </button>
+      </nav>
 
       {/* Modals */}
       {showPresets && (

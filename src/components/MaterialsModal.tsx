@@ -89,26 +89,27 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
-      <div className="relative w-full max-w-4xl max-h-[85vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col text-slate-200 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-2 sm:p-4">
+      <div className="relative w-full max-w-4xl max-h-[94dvh] sm:max-h-[85vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col text-slate-200 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
-          <div>
-            <h2 className="text-base font-bold text-white">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-6 sm:py-4 border-b border-slate-800 shrink-0">
+          <div className="min-w-0">
+            <h2 className="text-sm sm:text-base font-bold text-white truncate">
               Semiconductor Materials & Thin Films Library
             </h2>
-            <p className="text-xs text-slate-400">
+            <p className="hidden sm:block text-xs text-slate-400">
               Configure physical layers, optical properties, and cleanroom hatch patterns
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             <button
               onClick={handleStartAdd}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md transition-colors"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md transition-colors"
             >
               <Plus className="w-4 h-4" />
-              <span>Add Custom Material</span>
+              <span className="hidden sm:inline">Add Custom Material</span>
+              <span className="sm:hidden">Custom</span>
             </button>
             <button
               onClick={onClose}
@@ -120,9 +121,9 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
         </div>
 
         {/* Content Body */}
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex flex-col md:flex-row overflow-y-auto md:overflow-hidden">
           {/* Left: Material List & Filter */}
-          <div className="w-3/5 border-r border-slate-800 flex flex-col">
+          <div className="w-full md:w-3/5 border-b md:border-b-0 md:border-r border-slate-800 flex flex-col max-h-[42dvh] md:max-h-none shrink-0 md:shrink">
             {/* Category filter tabs */}
             <div className="flex items-center gap-1 p-2 bg-slate-950/60 border-b border-slate-800 text-xs overflow-x-auto">
               {['all', 'substrate', 'dielectric', 'metal', 'semiconductor', 'photoresist', 'polymer', 'custom'].map(
@@ -201,7 +202,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
           </div>
 
           {/* Right: Material Inspector & Editor Form */}
-          <div className="w-2/5 p-4 overflow-y-auto bg-slate-950/40">
+          <div className="w-full md:w-2/5 p-3 sm:p-4 md:overflow-y-auto bg-slate-950/40">
             {editingMat ? (
               <div className="space-y-3 text-xs">
                 <span className="text-xs font-bold text-sky-400 uppercase tracking-wide block">

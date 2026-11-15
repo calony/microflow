@@ -13,7 +13,7 @@ import {
   MaterialSegment,
   ScallopWall,
 } from '../types/microfab';
-import { getMaterialById } from './materials';
+import { getMaterialById, resolveResistMaterialId } from './materials';
 
 const DEFAULT_SAMPLE_COLUMNS = 300;
 
@@ -704,9 +704,9 @@ function applyLithographySide(
   targetSide: 'front' | 'back'
 ): void {
   const cfg = step.lithography;
-  const resistMatId = cfg?.resistMaterialId ?? 'mat_pr_pos';
-  const resistThickness = cfg?.resistThickness ?? 1000;
   const polarity = cfg?.polarity ?? 'positive';
+  const resistMatId = resolveResistMaterialId(polarity, cfg?.resistMaterialId);
+  const resistThickness = cfg?.resistThickness ?? 1000;
   const windows = cfg?.windows ?? [];
   const sidewallAngle = cfg?.sidewallAngle ?? 90;
 

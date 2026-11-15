@@ -871,7 +871,7 @@ export function deleteStepFromTimeline(
   flow: ProcessFlow,
   stepIdx: number
 ): ProcessFlow {
-  if (flow.steps.length <= 1) return flow;
+  if (stepIdx < 0 || stepIdx >= flow.steps.length) return flow;
   const targetStep = flow.steps[stepIdx];
   if (!targetStep) return flow;
 
@@ -888,10 +888,16 @@ export function deleteStepFromTimeline(
   }
 
   const updatedSteps = flow.steps.filter((_, i) => i !== stepIdx);
+  const updatedMasks = flow.masks
+    ? flow.masks.map((m) =>
+        m.assignedStepId === targetStep.id ? { ...m, assignedStepId: undefined } : m
+      )
+    : flow.masks;
   return {
     ...flow,
     blocks: updatedBlocks,
     steps: updatedSteps,
+    masks: updatedMasks,
   };
 }
 

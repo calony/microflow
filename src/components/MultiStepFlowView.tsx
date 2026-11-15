@@ -202,24 +202,24 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-slate-950/95 backdrop-blur-md text-slate-100">
       {/* Top Header Controls */}
-      <div className="flex items-center justify-between px-6 py-3.5 bg-slate-900 border-b border-slate-800 shadow-md">
-        <div className="flex items-center gap-3">
-          <LayoutGrid className="w-5 h-5 text-sky-400" />
-          <div>
-            <h2 className="text-sm font-bold text-white tracking-wide">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-6 py-2.5 sm:py-3.5 bg-slate-900 border-b border-slate-800 shadow-md shrink-0">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+          <LayoutGrid className="w-5 h-5 text-sky-400 shrink-0" />
+          <div className="min-w-0">
+            <h2 className="text-xs sm:text-sm font-bold text-white tracking-wide truncate">
               Publication-Ready Process Flow Generator
             </h2>
-            <span className="text-xs text-slate-400 font-mono">
+            <span className="hidden sm:block text-xs text-slate-400 font-mono">
               IEEE / Nature Style Cross-Section Figure Sequence
             </span>
           </div>
         </div>
 
         {/* Figure Customization Options */}
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           {/* Columns */}
-          <div className="flex items-center gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 text-xs">
-            <span className="px-2 text-slate-400">Layout:</span>
+          <div className="flex items-center gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 text-[11px] sm:text-xs">
+            <span className="hidden sm:inline px-2 text-slate-400">Layout:</span>
             {[1, 2, 3].map((cols) => (
               <button
                 key={cols}
@@ -238,7 +238,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
           {/* Substrate Frame Toggle */}
           <button
             onClick={() => setIncludeSubstrateFrame(!includeSubstrateFrame)}
-            className={`px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors ${
+            className={`px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-medium transition-colors ${
               includeSubstrateFrame
                 ? 'bg-emerald-600/20 border-emerald-500/50 text-emerald-300'
                 : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
@@ -249,50 +249,52 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
           </button>
 
           {/* Theme Selector */}
-          <div className="flex items-center gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 text-xs">
+          <div className="flex items-center gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 text-[11px] sm:text-xs">
             <button
               onClick={() => setTheme('paper')}
-              className={`px-2.5 py-0.5 rounded font-medium transition-colors ${
+              className={`px-2 sm:px-2.5 py-0.5 rounded font-medium transition-colors ${
                 theme === 'paper'
                   ? 'bg-white text-slate-900 shadow-sm'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Paper White (IEEE)
+              <span className="hidden sm:inline">Paper White (IEEE)</span>
+              <span className="sm:hidden">Paper</span>
             </button>
             <button
               onClick={() => setTheme('dark')}
-              className={`px-2.5 py-0.5 rounded font-medium transition-colors ${
+              className={`px-2 sm:px-2.5 py-0.5 rounded font-medium transition-colors ${
                 theme === 'dark'
                   ? 'bg-sky-600 text-white shadow-sm'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              CAD Dark
+              <span className="hidden sm:inline">CAD Dark</span>
+              <span className="sm:hidden">Dark</span>
             </button>
           </div>
 
           {/* Export Buttons */}
           <button
             onClick={handleExportSvg}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium transition-colors"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[11px] sm:text-xs font-medium transition-colors"
           >
             <FileDown className="w-3.5 h-3.5 text-sky-400" />
-            <span>Export SVG</span>
+            <span>SVG</span>
           </button>
 
           <button
             onClick={handleExportPng}
             disabled={isExporting}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md transition-colors"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] sm:text-xs font-semibold shadow-md transition-colors"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>{isExporting ? 'Exporting...' : 'Export High-Res PNG'}</span>
+            <span>{isExporting ? 'Exporting...' : 'PNG'}</span>
           </button>
 
           <button
             onClick={onClose}
-            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+            className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] sm:text-xs font-medium transition-colors"
           >
             Close
           </button>
@@ -302,12 +304,12 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
       {/* Main Multi-Step Canvas Viewport */}
       <div
         ref={containerRef}
-        className={`flex-1 overflow-auto p-8 flex justify-center ${
+        className={`flex-1 overflow-auto p-3 sm:p-8 ${
           theme === 'paper' ? 'bg-slate-200' : 'bg-slate-950'
         }`}
       >
         <div
-          className={`p-8 rounded-xl shadow-2xl transition-all ${
+          className={`mx-auto p-4 sm:p-8 rounded-xl shadow-2xl transition-all shrink-0 ${
             theme === 'paper'
               ? 'bg-white text-slate-900 border border-slate-300'
               : 'bg-[#060a12] text-slate-100 border border-slate-800'

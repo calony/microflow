@@ -4,6 +4,7 @@
  */
 
 import { ProcessFlow, ProcessStep, PhotomaskLevel, MaskWindow } from '../types/microfab';
+import { resolveResistMaterialId } from './materials';
 
 export const RETICLE_PALETTE = [
   '#38bdf8', // Sky
@@ -123,6 +124,7 @@ export function updateMaskAndSyncSteps(
             ...step.lithography,
             windows: updatedMask.windows.map((w) => ({ ...w })),
             polarity: updatedMask.polarity,
+            resistMaterialId: resolveResistMaterialId(updatedMask.polarity, step.lithography.resistMaterialId),
             maskName: updatedMask.name,
             maskId: updatedMask.id,
             maskColor: updatedMask.color,
@@ -195,6 +197,7 @@ export function assignMaskToStep(
           maskId: mask.id,
           maskName: mask.name,
           polarity: mask.polarity,
+          resistMaterialId: resolveResistMaterialId(mask.polarity, litho.resistMaterialId),
           maskColor: mask.color,
           windows: mask.windows.map((w) => ({ ...w })),
         },
@@ -258,6 +261,7 @@ export function swapMaskAssignments(
           maskId: maskA.id,
           maskName: maskA.name,
           polarity: maskA.polarity,
+          resistMaterialId: resolveResistMaterialId(maskA.polarity, litho.resistMaterialId),
           maskColor: maskA.color,
           windows: maskA.windows.map((w) => ({ ...w })),
         },
@@ -281,6 +285,7 @@ export function swapMaskAssignments(
           maskId: maskB.id,
           maskName: maskB.name,
           polarity: maskB.polarity,
+          resistMaterialId: resolveResistMaterialId(maskB.polarity, litho.resistMaterialId),
           maskColor: maskB.color,
           windows: maskB.windows.map((w) => ({ ...w })),
         },
@@ -376,30 +381,37 @@ export function createNewMaskInFlow(
 }
 
 /**
- * Deletes a mask level and unlinks any assigned step.
+ * Deletes an unassigned mask level. Assigned mask levels are preserved.
  */
 export function deleteMaskFromFlow(
   flow: ProcessFlow,
   maskId: string
 ): ProcessFlow {
+  const targetMask = (flow.masks || []).find((m) => m.id === maskId);
+  const isAssigned =
+    Boolean(
+      targetMask?.assignedStepId &&
+        flow.steps.some((s) => s.id === targetMask.assignedStepId && s.type === 'lithography')
+    ) || flow.steps.some((s) => s.type === 'lithography' && s.lithography?.maskId === maskId);
+
+  if (isAssigned) {
+    return flow;
+  }
+
   const currentMasks = (flow.masks || []).filter((m) => m.id !== maskId);
-  const updatedSteps = flow.steps.map((step) => {
-    if (step.type === 'lithography' && step.lithography?.maskId === maskId) {
-      return {
-        ...step,
-        lithography: {
-          ...step.lithography,
-          maskId: undefined,
-        },
-      };
-    }
-    return step;
-  });
+  const updatedGdsLayout = flow.gdsLayout
+    ? {
+        ...flow.gdsLayout,
+        layers: flow.gdsLayout.layers.map((l) =>
+          l.assignedMaskId === maskId ? { ...l, assignedMaskId: undefined } : l
+        ),
+      }
+    : flow.gdsLayout;
 
   return {
     ...flow,
     masks: currentMasks,
-    steps: updatedSteps,
+    gdsLayout: updatedGdsLayout,
   };
 }
 

@@ -108,24 +108,23 @@ export function getNextSectionLabel(existing: GdsSectionLine[]): string {
 export function getLayoutSectionLines(
   layout: GdsLayoutData,
   fallbackWidth: number = 10000
-): { sectionLines: GdsSectionLine[]; activeSectionLine: GdsSectionLine } {
-  const rawList =
-    layout.sectionLines && layout.sectionLines.length > 0
-      ? layout.sectionLines
-      : layout.sectionLine
-      ? [layout.sectionLine]
-      : [
-          {
-            id: 'sec_default_a',
-            label: "A-A'",
-            x1: 0,
-            y1: Math.round(fallbackWidth * 0.5),
-            x2: fallbackWidth,
-            y2: Math.round(fallbackWidth * 0.5),
-            color: SECTION_LINE_COLORS[0],
-            resizeWaferToCut: false,
-          },
-        ];
+): { sectionLines: GdsSectionLine[]; activeSectionLine: GdsSectionLine | null } {
+  const rawList = Array.isArray(layout.sectionLines)
+    ? layout.sectionLines
+    : layout.sectionLine
+    ? [layout.sectionLine]
+    : [
+        {
+          id: 'sec_default_a',
+          label: "A-A'",
+          x1: 0,
+          y1: Math.round(fallbackWidth * 0.5),
+          x2: fallbackWidth,
+          y2: Math.round(fallbackWidth * 0.5),
+          color: SECTION_LINE_COLORS[0],
+          resizeWaferToCut: false,
+        },
+      ];
 
   const sectionLines = rawList.map((s, idx) => ({
     ...s,
@@ -133,7 +132,7 @@ export function getLayoutSectionLines(
   }));
 
   const activeSectionLine =
-    sectionLines.find((s) => s.id === layout.activeSectionId) || sectionLines[0];
+    sectionLines.find((s) => s.id === layout.activeSectionId) || sectionLines[0] || null;
 
   return { sectionLines, activeSectionLine };
 }
@@ -1191,6 +1190,71 @@ export function resizePointShapeToBounds(
       x: Math.round(targetMinX + (p.x - b.minX) * scaleX),
       y: Math.round(targetMinY + (p.y - b.minY) * scaleY),
     })),
+  };
+}
+
+/**
+ * Rescales a GdsShape around its bounding-box center by scaleX and scaleY factors.
+ */
+export function rescaleGdsShape(
+  shape: GdsShape,
+  scaleX: number,
+  scaleY: number,
+  scalePathWidth: boolean = true
+): GdsShape {
+  const sx = Math.max(0.01, scaleX);
+  const sy = Math.max(0.01, scaleY);
+
+  if (shape.type === 'rect') {
+    const x = shape.x ?? 0;
+    const y = shape.y ?? 0;
+    const w = shape.width ?? 100;
+    const h = shape.height ?? 100;
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const nw = Math.max(10, Math.round(w * sx));
+    const nh = Math.max(10, Math.round(h * sy));
+    return {
+      ...shape,
+      x: Math.round(cx - nw * 0.5),
+      y: Math.round(cy - nh * 0.5),
+      width: nw,
+      height: nh,
+    };
+  }
+
+  if (shape.type === 'circle') {
+    const avgScale = (sx + sy) * 0.5;
+    return {
+      ...shape,
+      radius: Math.max(10, Math.round((shape.radius ?? 50) * avgScale)),
+    };
+  }
+
+  const pts = shape.points || [];
+  if (pts.length === 0) return shape;
+  const b = getGdsShapeBounds(shape);
+  const cx = b.minX + b.width * 0.5;
+  const cy = b.minY + b.height * 0.5;
+  const scaledPts = pts.map((p) => ({
+    x: Math.round(cx + (p.x - cx) * sx),
+    y: Math.round(cy + (p.y - cy) * sy),
+  }));
+
+  if (shape.type === 'path') {
+    const avgScale = (sx + sy) * 0.5;
+    return {
+      ...shape,
+      points: scaledPts,
+      pathWidth: scalePathWidth
+        ? Math.max(10, Math.round((shape.pathWidth ?? 200) * avgScale))
+        : shape.pathWidth,
+    };
+  }
+
+  return {
+    ...shape,
+    points: scaledPts,
   };
 }
 

@@ -43,6 +43,7 @@ import {
   Eye,
   EyeOff,
   ChevronRight,
+  ChevronLeft,
   ChevronDown,
   Sliders,
   FolderPlus,
@@ -50,12 +51,22 @@ import {
   Check,
   Link2,
   GripVertical,
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  Search,
+  X,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
   flow: ProcessFlow;
   activeStepIndex: number;
   thicknessUnit?: ThicknessUnit;
+  isPlaying: boolean;
+  playSpeed: number;
+  onChangePlaySpeed: (speed: number) => void;
+  onTogglePlay: () => void;
   onSelectStepIndex: (index: number) => void;
   onUpdateFlow: (updated: ProcessFlow) => void;
   onOpenPresets: () => void;
@@ -65,6 +76,10 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   flow,
   activeStepIndex,
   thicknessUnit = 'nm',
+  isPlaying,
+  playSpeed,
+  onChangePlaySpeed,
+  onTogglePlay,
   onSelectStepIndex,
   onUpdateFlow,
   onOpenPresets,
@@ -98,8 +113,75 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
 
   const [dragSource, setDragSource] = useState<DragSource | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
+  const [stepSearchQuery, setStepSearchQuery] = useState<string>('');
 
   const blocks = flow.blocks || [];
+  const subLayers = flow.substrateLayers || [
+    {
+      id: 'sub_default',
+      name: 'Bulk Silicon <100>',
+      materialId: flow.substrateMaterialId || 'mat_si_sub',
+      thickness: flow.substrateThickness || 3000,
+    },
+  ];
+  const totalSubThickness = subLayers.reduce((acc, l) => acc + (l.thickness || 0), 0);
+  const isSubstrateSelected = activeStepIndex === -1;
+
+  const normalizedSearch = stepSearchQuery.trim().toLowerCase();
+  const isSearchActive = normalizedSearch.length > 0;
+
+  const blockMatchesQuery = (block: ProcessBlock): boolean => {
+    if (!normalizedSearch) return true;
+    return `${block.name} ${block.description || ''}`.toLowerCase().includes(normalizedSearch);
+  };
+
+  const stepMatchesQuery = (step: ProcessStep, globalIdx: number, block?: ProcessBlock): boolean => {
+    if (!normalizedSearch) return true;
+    const mat = step.materialId
+      ? flow.materials.find((m) => m.id === step.materialId)
+      : undefined;
+    const targetEtchMat =
+      step.etch?.targetMaterialId && step.etch.targetMaterialId !== 'all'
+        ? flow.materials.find((m) => m.id === step.etch?.targetMaterialId)
+        : undefined;
+    const searchable = [
+      String(globalIdx + 1),
+      `step ${globalIdx + 1}`,
+      step.title,
+      step.type,
+      step.side || 'front',
+      step.notes || '',
+      mat?.name || '',
+      mat?.formula || '',
+      targetEtchMat?.name || '',
+      step.deposition?.method || '',
+      step.lithography?.maskName || '',
+      step.lithography?.polarity || '',
+      step.etch?.etchType || '',
+      step.strip?.stripType || '',
+      step.strip?.solvent || '',
+      step.bonding?.bondingMethod || '',
+      step.bonding?.importedFlowTitle || '',
+      block?.name || '',
+      block?.description || '',
+    ]
+      .join(' ')
+      .toLowerCase();
+    return searchable.includes(normalizedSearch);
+  };
+
+  const matchedStepCount = isSearchActive
+    ? flow.steps.filter((step, idx) => {
+        const blk = step.blockId ? blocks.find((b) => b.id === step.blockId) : undefined;
+        return stepMatchesQuery(step, idx, blk);
+      }).length
+    : flow.steps.length;
+
+  const substrateMatchesSearch =
+    !isSearchActive ||
+    `0 starting substrate stack ${subLayers.map((l) => l.name || l.materialId).join(' ')}`
+      .toLowerCase()
+      .includes(normalizedSearch);
 
   const getStepIcon = (type: ProcessStepType) => {
     switch (type) {
@@ -303,10 +385,15 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   };
 
   const handleDeleteStep = (idx: number) => {
-    if (flow.steps.length <= 1) return;
     const newFlow = deleteStepFromTimeline(flow, idx);
     onUpdateFlow(newFlow);
-    onSelectStepIndex(Math.max(0, idx - 1));
+    if (newFlow.steps.length === 0) {
+      onSelectStepIndex(-1);
+    } else if (activeStepIndex === idx) {
+      onSelectStepIndex(idx > 0 ? idx - 1 : 0);
+    } else if (activeStepIndex > idx) {
+      onSelectStepIndex(activeStepIndex - 1);
+    }
   };
 
   const handleToggleStep = (idx: number) => {
@@ -387,17 +474,6 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
     const newFlow = toggleBlockCollapsed(flow, blockId);
     onUpdateFlow(newFlow);
   };
-
-  const subLayers = flow.substrateLayers || [
-    {
-      id: 'sub_default',
-      name: 'Bulk Silicon <100>',
-      materialId: flow.substrateMaterialId || 'mat_si_sub',
-      thickness: flow.substrateThickness || 3000,
-    },
-  ];
-  const totalSubThickness = subLayers.reduce((acc, l) => acc + (l.thickness || 0), 0);
-  const isSubstrateSelected = activeStepIndex === -1;
 
   const applyFlowWithActivePreserved = (nextFlow: ProcessFlow) => {
     if (nextFlow === flow) return;
@@ -580,7 +656,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       <div key={step.id} className="space-y-0.5">
         {showBeforeLine && <DropLine />}
         <div
-          draggable
+          draggable={!isSearchActive}
           onDragStart={handleStepDragStart}
           onDragOver={handleStepDragOver}
           onDrop={handleStepDrop}
@@ -598,10 +674,12 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         >
           <div className="flex items-center gap-1.5 min-w-0 pr-1 flex-1">
             {/* Drag handle */}
-            <GripVertical
-              className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5"
-              aria-label="Drag to reorder step"
-            />
+            {!isSearchActive && (
+              <GripVertical
+                className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5"
+                aria-label="Drag to reorder step"
+              />
+            )}
 
             {/* Step global index badge */}
             <span
@@ -716,9 +794,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             <Copy className="w-3.5 h-3.5" />
           </button>
           <button
-            disabled={flow.steps.length <= 1}
             onClick={() => handleDeleteStep(globalIdx)}
-            className="p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 disabled:opacity-20 transition-colors"
+            className="p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition-colors"
             title="Delete Step"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -762,7 +839,146 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         </div>
       </div>
 
+      {/* Play Flow Transport & Playback Options */}
+      <div className="px-3 py-2 border-b border-slate-800 bg-slate-950/70 space-y-1.5 shrink-0">
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            disabled={flow.steps.length === 0 || activeStepIndex === 0}
+            onClick={() => onSelectStepIndex(flow.steps.length > 0 ? 0 : -1)}
+            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            title="First Process Step (Step 1)"
+          >
+            <SkipBack className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            type="button"
+            disabled={activeStepIndex <= -1}
+            onClick={() => onSelectStepIndex(activeStepIndex - 1)}
+            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            title="Previous Step"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            type="button"
+            disabled={flow.steps.length === 0}
+            onClick={onTogglePlay}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors disabled:opacity-35 disabled:pointer-events-none ${
+              isPlaying
+                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sm'
+            }`}
+            title={
+              flow.steps.length === 0
+                ? 'Add at least one process step to play'
+                : isPlaying
+                ? 'Pause Playback'
+                : 'Play Process Sequence'
+            }
+          >
+            {isPlaying ? (
+              <>
+                <Pause className="w-3.5 h-3.5 fill-current" />
+                <span>Pause</span>
+              </>
+            ) : (
+              <>
+                <Play className="w-3.5 h-3.5 fill-current" />
+                <span>Play Flow</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            disabled={activeStepIndex >= flow.steps.length - 1}
+            onClick={() => onSelectStepIndex(activeStepIndex + 1)}
+            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            title="Next Step"
+          >
+            <ChevronRight className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            type="button"
+            disabled={flow.steps.length === 0 || activeStepIndex >= flow.steps.length - 1}
+            onClick={() => onSelectStepIndex(flow.steps.length - 1)}
+            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            title={`Last Process Step (Step ${flow.steps.length})`}
+          >
+            <SkipForward className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between text-[11px] gap-2">
+          <span className="font-mono text-slate-300">
+            {activeStepIndex === -1
+              ? `Substrate (0/${flow.steps.length})`
+              : `Step ${activeStepIndex + 1} / ${flow.steps.length}`}
+          </span>
+
+          <div
+            className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300"
+            title="Playback Speed"
+          >
+            <span className="text-[10px] text-slate-500 font-mono">Speed</span>
+            <select
+              value={playSpeed}
+              onChange={(e) => onChangePlaySpeed(parseFloat(e.target.value))}
+              aria-label="Playback Speed"
+              className="bg-transparent text-sky-400 font-mono font-semibold text-[11px] focus:outline-none cursor-pointer"
+            >
+              <option value="0.5" className="bg-slate-900 text-slate-200">0.5×</option>
+              <option value="1" className="bg-slate-900 text-slate-200">1×</option>
+              <option value="1.5" className="bg-slate-900 text-slate-200">1.5×</option>
+              <option value="2" className="bg-slate-900 text-slate-200">2×</option>
+              <option value="3" className="bg-slate-900 text-slate-200">3×</option>
+              <option value="5" className="bg-slate-900 text-slate-200">5×</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Step Search Filter */}
+      <div className="px-2.5 py-2 border-b border-slate-800 bg-slate-950/50 shrink-0">
+        <div className="relative flex items-center">
+          <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 pointer-events-none" />
+          <input
+            type="text"
+            value={stepSearchQuery}
+            onChange={(e) => setStepSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && stepSearchQuery) {
+                setStepSearchQuery('');
+              }
+            }}
+            placeholder="Search steps or modules (name, type, #)..."
+            aria-label="Search process steps or modules"
+            className="w-full pl-8 pr-16 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition-colors"
+          />
+          {isSearchActive && (
+            <div className="absolute right-1.5 flex items-center gap-1">
+              <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded">
+                {matchedStepCount}/{flow.steps.length}
+              </span>
+              <button
+                type="button"
+                onClick={() => setStepSearchQuery('')}
+                className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                title="Clear search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Starting Substrate (Step 0) Item */}
+      {substrateMatchesSearch && (
       <div className="p-2 border-b border-slate-800 bg-slate-950/40">
         <div
           onClick={() => onSelectStepIndex(-1)}
@@ -827,6 +1043,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           </div>
         </div>
       </div>
+      )}
 
       {/* FABRICATION STEPS LIST - GROUPED BY BLOCK HIERARCHY */}
       <div
@@ -939,10 +1156,58 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         {(() => {
           const timelineItems = buildTimelineItems(flow);
           if (timelineItems.length === 0) {
-            return null;
+            return (
+              <div className="p-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl bg-slate-950/30 space-y-1">
+                <div className="font-medium text-slate-400">No process steps yet</div>
+                <div className="text-[11px] text-slate-500">
+                  Configure the starting substrate above or add a fabrication step below.
+                </div>
+              </div>
+            );
           }
 
-          return timelineItems.map((item, timelineIdx) => {
+          const visibleTimelineItems = isSearchActive
+            ? timelineItems
+                .map((item, timelineIdx) => {
+                  if (item.kind === 'step') {
+                    return stepMatchesQuery(item.step, item.idx)
+                      ? { item, timelineIdx, visibleSteps: null }
+                      : null;
+                  }
+                  if (blockMatchesQuery(item.block)) {
+                    return { item, timelineIdx, visibleSteps: item.steps };
+                  }
+                  const matchingSteps = item.steps.filter(({ step, idx }) =>
+                    stepMatchesQuery(step, idx, item.block)
+                  );
+                  if (matchingSteps.length === 0) return null;
+                  return { item, timelineIdx, visibleSteps: matchingSteps };
+                })
+                .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+            : timelineItems.map((item, timelineIdx) => ({
+                item,
+                timelineIdx,
+                visibleSteps: item.kind === 'block' ? item.steps : null,
+              }));
+
+          if (isSearchActive && visibleTimelineItems.length === 0 && !substrateMatchesSearch) {
+            return (
+              <div className="p-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl bg-slate-950/30 space-y-2">
+                <div className="font-medium text-slate-300">
+                  No steps or modules match &ldquo;{stepSearchQuery.trim()}&rdquo;
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setStepSearchQuery('')}
+                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-[11px] font-medium transition-colors"
+                >
+                  Clear Search
+                </button>
+              </div>
+            );
+          }
+
+          return visibleTimelineItems.map(({ item, timelineIdx, visibleSteps }) => {
             if (item.kind === 'step') {
               return renderStepItem(item.step, item.idx, {
                 scope: 'timeline',
@@ -950,7 +1215,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               });
             }
 
-            const { block, steps: blockStepsWithIndex } = item;
+            const { block } = item;
+            const blockStepsWithIndex = visibleSteps || item.steps;
             const isEditing = editingBlockId === block.id;
             const isBlockBeingDragged =
               dragSource?.kind === 'block' && dragSource.blockId === block.id;
@@ -1206,7 +1472,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   </div>
 
                   {/* Block Steps */}
-                  {!block.collapsed && (
+                  {(!block.collapsed || isSearchActive) && (
                     <div
                       className="p-1.5 space-y-1 bg-slate-950/20"
                       onDragOver={(e) => {

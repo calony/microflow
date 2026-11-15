@@ -130,13 +130,16 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   isLockedRef.current = lockedMetrics !== null;
 
   // SVG coordinate dimensions derived dynamically from container
-  const svgWidth = Math.max(380, containerSize.width);
-  const svgHeight = Math.max(260, containerSize.height);
+  const svgWidth = Math.max(280, containerSize.width);
+  const svgHeight = Math.max(220, containerSize.height);
 
   // Responsive margins
-  const paddingX = Math.max(40, Math.min(80, svgWidth * 0.08));
-  const bottomPadding = Math.max(50, Math.min(75, svgHeight * 0.14));
-  const topPadding = Math.max(50, Math.min(75, svgHeight * 0.14));
+  const paddingX =
+    svgWidth < 480
+      ? Math.max(20, svgWidth * 0.06)
+      : Math.max(40, Math.min(80, svgWidth * 0.08));
+  const bottomPadding = Math.max(46, Math.min(75, svgHeight * 0.14));
+  const topPadding = Math.max(42, Math.min(75, svgHeight * 0.14));
 
   const contentWidth = svgWidth - paddingX * 2;
   const contentHeight = svgHeight - bottomPadding - topPadding;
@@ -442,7 +445,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   // Complete marquee drag even if pointer leaves SVG bounds
   useEffect(() => {
     if (!zoomSelection) return;
-    const handleWindowMouseMove = (e: MouseEvent) => {
+    const handleWindowPointerMove = (e: PointerEvent) => {
       const svgP = clientToSvg(e.clientX, e.clientY);
       if (!svgP) return;
       setZoomSelection((prev) =>
@@ -455,7 +458,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           : null
       );
     };
-    const handleWindowMouseUp = () => {
+    const handleWindowPointerUp = () => {
       setZoomSelection((prev) => {
         if (prev) {
           commitRegionZoom(prev);
@@ -463,11 +466,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         return null;
       });
     };
-    window.addEventListener('mousemove', handleWindowMouseMove);
-    window.addEventListener('mouseup', handleWindowMouseUp);
+    window.addEventListener('pointermove', handleWindowPointerMove);
+    window.addEventListener('pointerup', handleWindowPointerUp);
+    window.addEventListener('pointercancel', handleWindowPointerUp);
     return () => {
-      window.removeEventListener('mousemove', handleWindowMouseMove);
-      window.removeEventListener('mouseup', handleWindowMouseUp);
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', handleWindowPointerUp);
+      window.removeEventListener('pointercancel', handleWindowPointerUp);
     };
   }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight]);
 
@@ -480,9 +485,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     }
   };
 
-  // Mouse pan / caliper / region zoom handlers
-  const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (e.button !== 0) return;
+  // Unified pointer pan / caliper / region zoom handlers (mouse + touch)
+  const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
     const svgP = clientToSvg(e.clientX, e.clientY);
 
     if (regionZoomMode && svgP) {
@@ -508,11 +513,16 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       return;
     }
 
+    try {
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
     setIsPanning(true);
     setPanStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
   };
 
-  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+  const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
 
@@ -529,7 +539,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     }
   };
 
-  const handleMouseUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    try {
+      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
     setIsPanning(false);
   };
 
@@ -564,12 +579,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       ref={cardRef}
       className="relative flex flex-col h-full bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl select-none"
     >
-      {/* Top CAD Control Bar - Truly responsive layout */}
-      <div className="flex items-center justify-between px-3 py-2 bg-slate-900 border-b border-slate-800 text-xs gap-2 min-w-0">
+      {/* Top CAD Control Bar - Responsive layout */}
+      <div className="flex flex-wrap items-center justify-between px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-900 border-b border-slate-800 text-xs gap-1.5 sm:gap-2 min-w-0">
         {/* Left: Status & Active Step Title */}
-        <div className="flex items-center gap-2 min-w-0 flex-1 truncate">
-          <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0 animate-pulse" />
-          <span className="font-semibold text-slate-200 truncate text-xs">
+        <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 truncate">
+          <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-emerald-400 shrink-0 animate-pulse" />
+          <span className="font-semibold text-slate-200 truncate text-xs hidden sm:inline">
             {title || 'Wafer Cross-Section'}
           </span>
           {stepNumber !== undefined && (
@@ -578,26 +593,26 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             </span>
           )}
           {activeStepTitle && (
-            <span className="text-sky-400 font-medium truncate text-[11px] hidden xl:inline">
+            <span className="text-sky-400 font-medium truncate text-[11px] sm:hidden xl:inline">
               · {activeStepTitle}
             </span>
           )}
           {activeStepSide === 'back' && (
             <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-semibold shrink-0">
-              Backside (-Z)
+              Back (-Z)
             </span>
           )}
           {activeStepSide === 'both' && (
             <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[10px] font-semibold shrink-0">
-              Both Sides (±Z)
+              ±Z
             </span>
           )}
         </div>
 
-        {/* Right: Viewport Controls with GUARANTEED Visible Fit Button */}
-        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-          {/* PRIMARY: Zoom & Resize to Screen (Fit) Controls - Always preserved! */}
-          <div className="flex items-center gap-0.5 bg-slate-800/90 border border-slate-700/80 rounded-lg p-0.5 shrink-0 shadow-sm">
+        {/* Right: Viewport Controls */}
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0 ml-auto">
+          {/* Zoom Controls (hidden on <sm because Floating Bottom-Right HUD covers it cleanly) */}
+          <div className="hidden sm:flex items-center gap-0.5 bg-slate-800/90 border border-slate-700/80 rounded-lg p-0.5 shrink-0 shadow-sm">
             <button
               onClick={() => zoomAroundPoint(zoom * 0.85, svgWidth / 2, svgHeight / 2)}
               className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
@@ -755,10 +770,11 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         <svg
           ref={svgRef}
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-          className="w-full h-full block"
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
+          className="w-full h-full block touch-none"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
         >
           <SvgPatterns materials={materials} />
 

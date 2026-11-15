@@ -5,6 +5,7 @@
 
 import React, { useRef, useState, useEffect } from 'react';
 import { MaskWindow, ProcessStep } from '../types/microfab';
+import { resolveResistMaterialId } from '../lib/materials';
 import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown } from 'lucide-react';
 
 interface MaskEditorProps {
@@ -281,6 +282,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       lithography: {
         ...litho,
         polarity: newPol,
+        resistMaterialId: resolveResistMaterialId(newPol, litho.resistMaterialId),
       },
     });
   };
@@ -424,9 +426,9 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   }
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-slate-200">
-      <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800">
-        <div className="flex items-center gap-2">
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 sm:p-3 text-slate-200">
+      <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2 border-b border-slate-800">
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
           <span className="text-xs font-semibold tracking-wider uppercase text-sky-400">
             Photomask Aperture Track
           </span>
@@ -457,7 +459,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   }
                 }}
                 placeholder="Mask name..."
-                className="px-2 py-0.5 rounded bg-slate-950 border border-sky-500 text-xs text-white font-mono focus:outline-none w-44"
+                className="px-2 py-0.5 rounded bg-slate-950 border border-sky-500 text-xs text-white font-mono focus:outline-none w-36 sm:w-44"
               />
               <button
                 type="button"
@@ -481,17 +483,17 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
               className="group/maskname flex items-center gap-1.5 text-xs text-slate-300 hover:text-white font-mono px-1.5 py-0.5 rounded hover:bg-slate-800/80 border border-transparent hover:border-slate-700 transition-colors"
               title="Click to rename assigned mask"
             >
-              <span>{litho.maskName || 'Photomask Layer'}</span>
-              <Edit2 className="w-3 h-3 text-slate-500 group-hover/maskname:text-sky-400 transition-colors" />
+              <span className="truncate max-w-[140px] sm:max-w-none">{litho.maskName || 'Photomask Layer'}</span>
+              <Edit2 className="w-3 h-3 text-slate-500 group-hover/maskname:text-sky-400 transition-colors shrink-0" />
             </button>
           )}
-          <span className="text-xs text-slate-500">·</span>
-          <span className="text-[11px] text-slate-400">
+          <span className="hidden md:inline text-xs text-slate-500">·</span>
+          <span className="hidden md:inline text-[11px] text-slate-400">
             Drag center to move · Drag left/right borders to resize
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
           <button
             onClick={togglePolarity}
             className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
@@ -556,7 +558,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className="relative h-11 w-full bg-slate-950 border border-slate-700 rounded-lg overflow-hidden shadow-inner select-none"
+          className="relative h-11 w-full bg-slate-950 border border-slate-700 rounded-lg overflow-hidden shadow-inner select-none touch-none"
         >
           {/* Default mask field: dark chrome or quartz background */}
           <div className="absolute inset-0 bg-slate-800/80 opacity-40 pattern-crosshatch" />

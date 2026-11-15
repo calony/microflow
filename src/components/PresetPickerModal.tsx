@@ -34,49 +34,36 @@ export const PresetPickerModal: React.FC<PresetPickerModalProps> = ({
         },
       ],
       materials: [...PRESET_PROCESS_FLOWS[0].materials],
-      steps: [
-        {
-          id: `step_${Date.now()}`,
-          title: 'Substrate Thermal Oxide',
-          type: 'deposition',
-          enabled: true,
-          materialId: 'mat_sio2_thermal',
-          thickness: 200,
-          deposition: {
-            method: 'Thermal Oxidation',
-            depositionType: 'conformal',
-            thickness: 200,
-          },
-        },
-      ],
+      blocks: [],
+      steps: [],
     };
     onSelectPreset(blank);
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
-      <div className="relative w-full max-w-4xl max-h-[85vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col text-slate-200 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-2 sm:p-4">
+      <div className="relative w-full max-w-4xl max-h-[94dvh] sm:max-h-[85vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col text-slate-200 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900">
-          <div>
-            <h2 className="text-base font-bold text-white">
+        <div className="flex items-center justify-between gap-2 px-4 py-3 sm:px-6 sm:py-4 border-b border-slate-800 bg-slate-900 shrink-0">
+          <div className="min-w-0">
+            <h2 className="text-sm sm:text-base font-bold text-white truncate">
               Microfabrication Process Flow Templates
             </h2>
-            <p className="text-xs text-slate-400">
+            <p className="hidden sm:block text-xs text-slate-400">
               Load established semiconductor, MEMS, and photonics cleanroom recipes
             </p>
           </div>
 
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors shrink-0"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Preset Cards Grid */}
-        <div className="flex-1 overflow-y-auto p-6 grid grid-cols-2 gap-4 bg-slate-950/40">
+        <div className="flex-1 overflow-y-auto p-3 sm:p-6 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4 bg-slate-950/40">
           {PRESET_PROCESS_FLOWS.map((preset) => (
             <div
               key={preset.id}

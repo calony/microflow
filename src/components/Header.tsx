@@ -3,17 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ProcessFlow } from '../types/microfab';
 import { ThicknessUnit } from '../lib/units';
 import {
   Layers,
-  Play,
-  Pause,
-  SkipBack,
-  SkipForward,
-  ChevronLeft,
-  ChevronRight,
   FolderOpen,
   Download,
   Upload,
@@ -23,18 +17,14 @@ import {
   PanelLeft,
   PanelRight,
   Scan,
+  Menu,
+  X,
 } from 'lucide-react';
 
 interface HeaderProps {
   flow: ProcessFlow;
-  activeStepIndex: number;
-  isPlaying: boolean;
-  playSpeed: number;
-  onChangePlaySpeed: (speed: number) => void;
   thicknessUnit: ThicknessUnit;
   onChangeThicknessUnit: (unit: ThicknessUnit) => void;
-  onTogglePlay: () => void;
-  onStepChange: (index: number) => void;
   onUpdateTitle: (title: string) => void;
   onOpenPresets: () => void;
   onOpenMaterials: () => void;
@@ -51,14 +41,8 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({
   flow,
-  activeStepIndex,
-  isPlaying,
-  playSpeed,
-  onChangePlaySpeed,
   thicknessUnit,
   onChangeThicknessUnit,
-  onTogglePlay,
-  onStepChange,
   onUpdateTitle,
   onOpenPresets,
   onOpenMaterials,
@@ -74,10 +58,23 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
   const [titleInput, setTitleInput] = useState<string>(flow.title);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setTitleInput(flow.title);
   }, [flow.title]);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMobileMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [mobileMenuOpen]);
 
   const handleTitleSubmit = () => {
     setIsEditingTitle(false);
@@ -103,19 +100,21 @@ export const Header: React.FC<HeaderProps> = ({
       }
     };
     reader.readAsText(file);
+    e.target.value = '';
+    setMobileMenuOpen(false);
   };
 
   return (
-    <header className="flex items-center justify-between px-4 py-2.5 bg-slate-900 border-b border-slate-800 text-slate-200 shadow-md select-none">
+    <header className="flex flex-wrap items-center justify-between gap-2 px-2.5 sm:px-4 py-2 bg-slate-900 border-b border-slate-800 text-slate-200 shadow-md select-none shrink-0 z-30">
       {/* Brand & Process Title */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 xl:flex-initial">
         {onToggleLeftSidebar && (
           <button
             onClick={onToggleLeftSidebar}
-            className={`p-1.5 rounded-lg border transition-colors ${
+            className={`p-1.5 rounded-lg border transition-colors shrink-0 ${
               leftSidebarOpen
                 ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
-                : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
+                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
             }`}
             title={leftSidebarOpen ? 'Hide Flow Timeline' : 'Show Flow Timeline'}
           >
@@ -123,11 +122,11 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         )}
 
-        <div className="flex items-center gap-2">
-          <span className="w-8 h-8 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-500 flex items-center justify-center text-white shadow-md shadow-sky-950/50">
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="w-7 h-7 sm:w-8 sm:h-8 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-500 flex items-center justify-center text-white shadow-md shadow-sky-950/50">
             <Layers className="w-4 h-4" />
           </span>
-          <div>
+          <div className="hidden sm:block">
             <div className="flex items-center gap-1.5">
               <span className="font-extrabold text-sm text-white tracking-wide">
                 MicroFlow
@@ -136,13 +135,13 @@ export const Header: React.FC<HeaderProps> = ({
                 CAD
               </span>
             </div>
-            <span className="text-[10px] text-slate-400 block -mt-0.5">
+            <span className="text-[10px] text-slate-400 hidden md:block -mt-0.5">
               Microfab Process Designer
             </span>
           </div>
         </div>
 
-        <span className="text-slate-700">|</span>
+        <span className="text-slate-700 hidden sm:inline">|</span>
 
         {/* Process Title (Click to edit) */}
         {isEditingTitle ? (
@@ -153,130 +152,38 @@ export const Header: React.FC<HeaderProps> = ({
             onBlur={handleTitleSubmit}
             onKeyDown={(e) => e.key === 'Enter' && handleTitleSubmit()}
             autoFocus
-            className="px-2 py-1 rounded bg-slate-950 border border-sky-500 text-sm font-semibold text-white focus:outline-none"
+            className="px-2 py-1 rounded bg-slate-950 border border-sky-500 text-xs sm:text-sm font-semibold text-white focus:outline-none min-w-0 max-w-[160px] sm:max-w-[220px]"
           />
         ) : (
           <div
             onClick={() => setIsEditingTitle(true)}
-            className="group flex items-center gap-1.5 px-2 py-1 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors"
+            className="group flex items-center gap-1 px-1.5 sm:px-2 py-1 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors min-w-0"
             title="Click to rename process"
           >
-            <span className="text-sm font-semibold text-slate-100 group-hover:text-sky-300 transition-colors">
+            <span className="text-xs sm:text-sm font-semibold text-slate-100 group-hover:text-sky-300 transition-colors truncate max-w-[130px] sm:max-w-[200px] lg:max-w-[240px]">
               {flow.title}
             </span>
-            <span className="text-[10px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">
+            <span className="text-[10px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
               ✎
             </span>
           </div>
         )}
       </div>
 
-      {/* Step Playback Controller */}
-      <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 rounded-xl px-2.5 py-1 text-xs">
-        <button
-          disabled={flow.steps.length === 0 || activeStepIndex === 0}
-          onClick={() => onStepChange(flow.steps.length > 0 ? 0 : -1)}
-          className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 transition-colors"
-          title="First Process Step (Step 1)"
-        >
-          <SkipBack className="w-3.5 h-3.5" />
-        </button>
-
-        <button
-          disabled={activeStepIndex <= -1}
-          onClick={() => onStepChange(activeStepIndex - 1)}
-          className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 transition-colors"
-          title="Previous Step"
-        >
-          <ChevronLeft className="w-3.5 h-3.5" />
-        </button>
-
-        <button
-          onClick={onTogglePlay}
-          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors ${
-            isPlaying
-              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-              : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sm'
-          }`}
-          title={isPlaying ? 'Pause Playback' : 'Play Process Sequence'}
-        >
-          {isPlaying ? (
-            <>
-              <Pause className="w-3 h-3 fill-current" />
-              <span>Pause</span>
-            </>
-          ) : (
-            <>
-              <Play className="w-3 h-3 fill-current" />
-              <span>Play Flow</span>
-            </>
-          )}
-        </button>
-
-        <button
-          disabled={activeStepIndex >= flow.steps.length - 1}
-          onClick={() => onStepChange(activeStepIndex + 1)}
-          className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 transition-colors"
-          title="Next Step"
-        >
-          <ChevronRight className="w-3.5 h-3.5" />
-        </button>
-
-        <button
-          disabled={flow.steps.length === 0 || activeStepIndex >= flow.steps.length - 1}
-          onClick={() => onStepChange(flow.steps.length - 1)}
-          className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 transition-colors"
-          title={`Last Process Step (Step ${flow.steps.length})`}
-        >
-          <SkipForward className="w-3.5 h-3.5" />
-        </button>
-
-        <span className="text-slate-700">|</span>
-
-        {/* Playback Speed Selector */}
-        <div
-          className="flex items-center gap-1 px-1.5 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300"
-          title="Playback Speed"
-        >
-          <span className="text-[10px] text-slate-500 font-mono">Speed</span>
-          <select
-            value={playSpeed}
-            onChange={(e) => onChangePlaySpeed(parseFloat(e.target.value))}
-            aria-label="Playback Speed"
-            className="bg-transparent text-sky-400 font-mono font-semibold text-[11px] focus:outline-none cursor-pointer"
-          >
-            <option value="0.5" className="bg-slate-900 text-slate-200">0.5×</option>
-            <option value="1" className="bg-slate-900 text-slate-200">1×</option>
-            <option value="1.5" className="bg-slate-900 text-slate-200">1.5×</option>
-            <option value="2" className="bg-slate-900 text-slate-200">2×</option>
-            <option value="3" className="bg-slate-900 text-slate-200">3×</option>
-            <option value="5" className="bg-slate-900 text-slate-200">5×</option>
-          </select>
-        </div>
-
-        <span className="text-slate-700">|</span>
-
-        <span className="font-mono text-slate-300 text-[11px] whitespace-nowrap">
-          {activeStepIndex === -1
-            ? `Substrate (0/${flow.steps.length})`
-            : `Step ${activeStepIndex + 1}/${flow.steps.length}`}
-        </span>
-      </div>
-
       {/* Primary Actions & Modals */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
         {/* Base Thickness Unit Switcher */}
         <div
           className="flex items-center bg-slate-950/90 border border-slate-700/80 rounded-lg p-0.5 text-[11px]"
           title="Base Unit for Thicknesses (nm or µm)"
         >
-          <span className="px-1.5 text-[10px] text-slate-400 font-mono hidden xl:inline">
+          <span className="px-1.5 text-[10px] text-slate-400 font-mono hidden 2xl:inline">
             Unit:
           </span>
           <button
             type="button"
             onClick={() => onChangeThicknessUnit('nm')}
-            className={`px-2 py-1 rounded-md font-mono font-semibold transition-colors ${
+            className={`px-1.5 sm:px-2 py-1 rounded-md font-mono font-semibold transition-colors ${
               thicknessUnit === 'nm'
                 ? 'bg-sky-600 text-white shadow-sm'
                 : 'text-slate-400 hover:text-slate-200'
@@ -287,7 +194,7 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             type="button"
             onClick={() => onChangeThicknessUnit('um')}
-            className={`px-2 py-1 rounded-md font-mono font-semibold transition-colors ${
+            className={`px-1.5 sm:px-2 py-1 rounded-md font-mono font-semibold transition-colors ${
               thicknessUnit === 'um'
                 ? 'bg-sky-600 text-white shadow-sm'
                 : 'text-slate-400 hover:text-slate-200'
@@ -296,77 +203,192 @@ export const Header: React.FC<HeaderProps> = ({
             µm
           </button>
         </div>
-        <button
-          onClick={onOpenPresets}
-          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-        >
-          <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
-          <span>Presets</span>
-        </button>
 
-        <button
-          onClick={onOpenMaterials}
-          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-        >
-          <Sliders className="w-3.5 h-3.5 text-emerald-400" />
-          <span>Materials</span>
-        </button>
-
+        {/* Tablet quick shortcut for Masks (hidden on phone and desktop xl+) */}
         <button
           onClick={onOpenMaskLevels}
-          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-          title="Photolithography Mask Levels & Apertures"
+          className="hidden sm:flex xl:hidden items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+          title="Photolithography Mask Levels & 2D GDS"
         >
           <Scan className="w-3.5 h-3.5 text-sky-400" />
-          <span>Mask Levels</span>
+          <span>Masks</span>
         </button>
 
-        <button
-          onClick={onOpenRunSheet}
-          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-        >
-          <FileText className="w-3.5 h-3.5 text-amber-400" />
-          <span>Run Sheet SOP</span>
-        </button>
-
-        <button
-          onClick={onOpenMultiStepView}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-md transition-all"
-        >
-          <LayoutGrid className="w-3.5 h-3.5" />
-          <span>Publication Figure</span>
-        </button>
-
-        {/* JSON Import / Export */}
-        <div className="flex items-center gap-1 ml-1 bg-slate-800 p-0.5 rounded-lg border border-slate-700">
-          <label
-            className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 cursor-pointer transition-colors"
-            title="Import Recipe JSON"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            <input
-              type="file"
-              accept=".json"
-              onChange={handleFileInputChange}
-              className="hidden"
-            />
-          </label>
+        {/* Full Desktop Action Bar (xl+) */}
+        <div className="hidden xl:flex items-center gap-1.5">
           <button
-            onClick={onExportJson}
-            className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
-            title="Export Recipe JSON"
+            onClick={onOpenPresets}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
           >
-            <Download className="w-3.5 h-3.5" />
+            <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
+            <span>Presets</span>
           </button>
+
+          <button
+            onClick={onOpenMaterials}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+          >
+            <Sliders className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Materials</span>
+          </button>
+
+          <button
+            onClick={onOpenMaskLevels}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+            title="Photolithography Mask Levels & Apertures"
+          >
+            <Scan className="w-3.5 h-3.5 text-sky-400" />
+            <span>Mask Levels</span>
+          </button>
+
+          <button
+            onClick={onOpenRunSheet}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+          >
+            <FileText className="w-3.5 h-3.5 text-amber-400" />
+            <span>Run Sheet SOP</span>
+          </button>
+
+          <button
+            onClick={onOpenMultiStepView}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-md transition-all"
+          >
+            <LayoutGrid className="w-3.5 h-3.5" />
+            <span>Publication Figure</span>
+          </button>
+
+          {/* JSON Import / Export */}
+          <div className="flex items-center gap-1 ml-1 bg-slate-800 p-0.5 rounded-lg border border-slate-700">
+            <label
+              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 cursor-pointer transition-colors"
+              title="Import Recipe JSON"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <input
+                type="file"
+                accept=".json"
+                onChange={handleFileInputChange}
+                className="hidden"
+              />
+            </label>
+            <button
+              onClick={onExportJson}
+              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
+              title="Export Recipe JSON"
+            >
+              <Download className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Mobile & Tablet Tools Dropdown (< xl) */}
+        <div className="relative xl:hidden" ref={menuRef}>
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen((v) => !v)}
+            className={`flex items-center gap-1 px-2 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+              mobileMenuOpen
+                ? 'bg-sky-600 border-sky-500 text-white'
+                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+            }`}
+            title="Tools, Masks, Presets & Export"
+          >
+            {mobileMenuOpen ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
+            <span className="hidden sm:inline">Tools</span>
+          </button>
+
+          {mobileMenuOpen && (
+            <div className="absolute right-0 mt-1.5 w-56 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl py-1.5 z-50 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenPresets();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <FolderOpen className="w-4 h-4 text-sky-400" />
+                <span>Process Presets</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenMaterials();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <Sliders className="w-4 h-4 text-emerald-400" />
+                <span>Materials Library</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenMaskLevels();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <Scan className="w-4 h-4 text-sky-400" />
+                <span>Mask Levels &amp; 2D GDS</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenRunSheet();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <FileText className="w-4 h-4 text-amber-400" />
+                <span>Run Sheet SOP</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenMultiStepView();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-sky-300 font-semibold hover:bg-slate-800"
+              >
+                <LayoutGrid className="w-4 h-4 text-indigo-400" />
+                <span>Publication Figure</span>
+              </button>
+
+              <div className="my-1 border-t border-slate-800" />
+
+              <label className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-300 hover:bg-slate-800 cursor-pointer">
+                <Upload className="w-4 h-4 text-slate-400" />
+                <span>Import Recipe JSON</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  onChange={handleFileInputChange}
+                  className="hidden"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onExportJson();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-300 hover:bg-slate-800"
+              >
+                <Download className="w-4 h-4 text-slate-400" />
+                <span>Export Recipe JSON</span>
+              </button>
+            </div>
+          )}
         </div>
 
         {onToggleRightSidebar && (
           <button
             onClick={onToggleRightSidebar}
-            className={`p-1.5 rounded-lg border transition-colors ml-1 ${
+            className={`p-1.5 rounded-lg border transition-colors ${
               rightSidebarOpen
                 ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
-                : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
+                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
             }`}
             title={rightSidebarOpen ? 'Hide Parameters Panel' : 'Show Parameters Panel'}
           >

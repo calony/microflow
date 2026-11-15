@@ -200,6 +200,18 @@ export const DEFAULT_MATERIALS: Material[] = [
     notes: 'Diazoquinone (DNQ) positive tone resist; UV exposed areas dissolve in developer',
   },
   {
+    id: 'mat_pr_neg',
+    name: 'Negative Photoresist',
+    formula: 'AZ nLOF / NR9',
+    color: '#f59e0b', // Amber 500
+    strokeColor: '#b45309',
+    pattern: 'diagonal-left',
+    category: 'photoresist',
+    density: 1.15,
+    refractiveIndex: 1.61,
+    notes: 'Negative tone photoresist; UV exposed areas crosslink and remain after development',
+  },
+  {
     id: 'mat_pr_su8',
     name: 'SU-8 Negative Resist',
     formula: 'SU-8 Epoxy',
@@ -224,6 +236,20 @@ export const DEFAULT_MATERIALS: Material[] = [
     notes: 'Polydimethylsiloxane elastomer for microfluidic channels and soft lithography',
   },
 ];
+
+export function resolveResistMaterialId(
+  polarity: 'positive' | 'negative' = 'positive',
+  currentMaterialId?: string
+): string {
+  if (
+    !currentMaterialId ||
+    currentMaterialId === 'mat_pr_pos' ||
+    currentMaterialId === 'mat_pr_neg'
+  ) {
+    return polarity === 'negative' ? 'mat_pr_neg' : 'mat_pr_pos';
+  }
+  return currentMaterialId;
+}
 
 export function getMaterialById(materials: Material[], id: string): Material {
   const found = materials.find((m) => m.id === id);

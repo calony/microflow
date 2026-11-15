@@ -34,6 +34,7 @@ import {
   moveGdsSectionLine,
   moveGdsShape,
   parseGdsFile,
+  rescaleGdsShape,
   resizePointShapeToBounds,
   shapeToPolygons,
   sliceGdsLayoutAlongSection,
@@ -72,6 +73,13 @@ import {
   Layers,
   MoveHorizontal,
   MoveVertical,
+  X,
+  SlidersHorizontal,
+  PanelRight,
+  Lock,
+  Unlock,
+  HelpCircle,
+  Eraser,
 } from 'lucide-react';
 
 function getGdsPatternDefId(color: string, pattern: GdsPatternType): string {
@@ -287,6 +295,7 @@ interface GdsLayoutEditorProps {
 }
 
 type DrawTool = 'select' | 'pan' | 'rect' | 'path' | 'polygon' | 'circle' | 'section';
+type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
 export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   flow,
@@ -322,14 +331,22 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     return mapped?.layer ?? layout.layers[0]?.layer ?? 1;
   });
 
-  // Sync activeLayerNum when user clicks a different mask in the left reticle sidebar
+  // Sync activeLayerNum when user clicks a different mask in the left reticle sidebar,
+  // and ensure activeLayerNum stays valid if layers are deleted or replaced.
+  const prevMaskIdRef = useRef<string | undefined>(selectedMask?.id);
   useEffect(() => {
-    if (!selectedMask) return;
-    const mapped = layout.layers.find((l) => l.assignedMaskId === selectedMask.id);
-    if (mapped) {
-      setActiveLayerNum(mapped.layer);
+    if (selectedMask?.id && selectedMask.id !== prevMaskIdRef.current) {
+      prevMaskIdRef.current = selectedMask.id;
+      const mapped = layout.layers.find((l) => l.assignedMaskId === selectedMask.id);
+      if (mapped) {
+        setActiveLayerNum(mapped.layer);
+        return;
+      }
     }
-  }, [selectedMask?.id, layout.layers]);
+    if (layout.layers.length > 0 && !layout.layers.some((l) => l.layer === activeLayerNum)) {
+      setActiveLayerNum(layout.layers[0].layer);
+    }
+  }, [selectedMask?.id, layout.layers, activeLayerNum]);
 
   // Selected shape / multi-click draft state
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
@@ -341,6 +358,15 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [draggingConcatId, setDraggingConcatId] = useState<string | null>(null);
   const [draggingLayerIdx, setDraggingLayerIdx] = useState<number | null>(null);
   const [dragOverLayerIdx, setDragOverLayerIdx] = useState<number | null>(null);
+  const [mobileLayersOpen, setMobileLayersOpen] = useState<boolean>(false);
+  const [desktopLayersOpen, setDesktopLayersOpen] = useState<boolean>(true);
+  const [showCutPanel, setShowCutPanel] = useState<boolean>(true);
+  const [scaleXInput, setScaleXInput] = useState<string>('1.5');
+  const [scaleYInput, setScaleYInput] = useState<string>('1.5');
+  const [lockScaleAspect, setLockScaleAspect] = useState<boolean>(true);
+  const [mobileToolsMenuOpen, setMobileToolsMenuOpen] = useState<boolean>(false);
+  const [mobileCutsExpanded, setMobileCutsExpanded] = useState<boolean>(false);
+  const [showMappingHelp, setShowMappingHelp] = useState<boolean>(false);
   const [draftPoints, setDraftPoints] = useState<GdsPoint[]>([]);
   const [dragBox, setDragBox] = useState<{ start: GdsPoint; current: GdsPoint } | null>(null);
   const [cursorWorld, setCursorWorld] = useState<GdsPoint | null>(null);
@@ -427,6 +453,12 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     | null
     | { kind: 'pan'; startClientX: number; startClientY: number; initCx: number; initCy: number }
     | { kind: 'move-shape'; shape: GdsShape; startWorld: GdsPoint }
+    | {
+        kind: 'resize-shape';
+        shape: GdsShape;
+        handle: ResizeHandle;
+        initBounds: { minX: number; minY: number; width: number; height: number };
+      }
     | { kind: 'drag-section-vertex'; initSection: GdsSectionLine; vertexIndex: number }
     | { kind: 'drag-section-move'; initSection: GdsSectionLine; startWorld: GdsPoint }
     | { kind: 'draw-drag'; startWorld: GdsPoint }
@@ -440,16 +472,23 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
   const updateSectionLines = useCallback(
     (nextLines: GdsSectionLine[], nextActiveId?: string) => {
-      const targetId = nextActiveId || activeSectionLine.id;
-      const active = nextLines.find((s) => s.id === targetId) || nextLines[0];
+      const targetId = nextActiveId ?? activeSectionLine?.id;
+      const active =
+        nextLines.length > 0
+          ? nextLines.find((s) => s.id === targetId) || nextLines[0]
+          : undefined;
       updateLayout({
         ...layout,
         sectionLines: nextLines,
         activeSectionId: active?.id,
         sectionLine: active,
+        concat:
+          nextLines.length === 0 && layout.concat
+            ? { ...layout.concat, enabled: false, sectionIds: [] }
+            : layout.concat,
       });
     },
-    [layout, activeSectionLine.id, updateLayout]
+    [layout, activeSectionLine?.id, updateLayout]
   );
 
   const updateSingleSection = useCallback(
@@ -461,6 +500,25 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       updateSectionLines(nextLines, updatedCut.id);
     },
     [sectionLines, updateSectionLines]
+  );
+
+  const createCutWithPoints = useCallback(
+    (pts: GdsPoint[]): GdsSectionLine => {
+      const label = getNextSectionLabel(sectionLines);
+      const color = SECTION_LINE_COLORS[sectionLines.length % SECTION_LINE_COLORS.length];
+      const base: GdsSectionLine = {
+        id: `sec_${Date.now()}`,
+        label,
+        x1: pts[0]?.x ?? 0,
+        y1: pts[0]?.y ?? 0,
+        x2: pts[pts.length - 1]?.x ?? waferWidth,
+        y2: pts[pts.length - 1]?.y ?? 0,
+        color,
+        resizeWaferToCut: false,
+      };
+      return withSectionPoints(base, pts);
+    },
+    [sectionLines, waferWidth]
   );
 
   const handleUpdateShape = useCallback(
@@ -521,7 +579,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
       setSelectedShapeId(newShape.id);
     } else if (tool === 'section' && pts.length >= 2) {
-      updateSingleSection(withSectionPoints(activeSectionLine, pts));
+      const nextCut = activeSectionLine
+        ? withSectionPoints(activeSectionLine, pts)
+        : createCutWithPoints(pts);
+      updateSingleSection(nextCut);
     }
     setDraftPoints([]);
   };
@@ -687,6 +748,85 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       return;
     }
 
+    if (pointerOp.kind === 'resize-shape') {
+      const { shape, handle, initBounds } = pointerOp;
+      const minSize = 20;
+      const origLeft = initBounds.minX;
+      const origRight = initBounds.minX + initBounds.width;
+      const origBottom = initBounds.minY;
+      const origTop = initBounds.minY + initBounds.height;
+
+      let left = origLeft;
+      let right = origRight;
+      let bottom = origBottom;
+      let top = origTop;
+
+      if (handle.includes('w')) {
+        left = Math.min(worldPt.x, origRight - minSize);
+      }
+      if (handle.includes('e')) {
+        right = Math.max(worldPt.x, origLeft + minSize);
+      }
+      if (handle.includes('s')) {
+        bottom = Math.min(worldPt.y, origTop - minSize);
+      }
+      if (handle.includes('n')) {
+        top = Math.max(worldPt.y, origBottom + minSize);
+      }
+
+      const newW = Math.max(minSize, Math.round(right - left));
+      const newH = Math.max(minSize, Math.round(top - bottom));
+      const newX = Math.round(left);
+      const newY = Math.round(bottom);
+
+      let resized: GdsShape = shape;
+      if (shape.type === 'rect') {
+        resized = {
+          ...shape,
+          x: newX,
+          y: newY,
+          width: newW,
+          height: newH,
+        };
+      } else if (shape.type === 'circle') {
+        const initCx = origLeft + initBounds.width * 0.5;
+        const initCy = origBottom + initBounds.height * 0.5;
+        if (handle === 'e' || handle === 'w') {
+          const r = Math.max(10, Math.round(newW * 0.5));
+          resized = {
+            ...shape,
+            radius: r,
+            cx: handle === 'e' ? Math.round(origLeft + r) : Math.round(origRight - r),
+            cy: Math.round(initCy),
+          };
+        } else if (handle === 'n' || handle === 's') {
+          const r = Math.max(10, Math.round(newH * 0.5));
+          resized = {
+            ...shape,
+            radius: r,
+            cx: Math.round(initCx),
+            cy: handle === 'n' ? Math.round(origBottom + r) : Math.round(origTop - r),
+          };
+        } else {
+          const r = Math.max(10, Math.round(Math.max(newW, newH) * 0.5));
+          resized = {
+            ...shape,
+            radius: r,
+            cx: handle.includes('e') ? Math.round(origLeft + r) : Math.round(origRight - r),
+            cy: handle.includes('n') ? Math.round(origBottom + r) : Math.round(origTop - r),
+          };
+        }
+      } else {
+        resized = resizePointShapeToBounds(shape, newX, newY, newW, newH);
+      }
+
+      updateLayout({
+        ...layout,
+        shapes: layout.shapes.map((s) => (s.id === resized.id ? resized : s)),
+      });
+      return;
+    }
+
     if (pointerOp.kind === 'drag-section-vertex') {
       const nextPts = getSectionPoints(pointerOp.initSection).map((p, idx) =>
         idx === pointerOp.vertexIndex ? worldPt : p
@@ -747,9 +887,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         const dist = Math.hypot(current.x - start.x, current.y - start.y);
         if (pxDist >= 8 && dist >= 50) {
           // Quick 2-point drag cut
-          updateSingleSection(
-            withSectionPoints(activeSectionLine, [start, current])
-          );
+          const nextCut = activeSectionLine
+            ? withSectionPoints(activeSectionLine, [start, current])
+            : createCutWithPoints([start, current]);
+          updateSingleSection(nextCut);
         } else {
           // Click started a multi-point polyline cut
           setDraftPoints([start]);
@@ -830,17 +971,20 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     const midX = Math.round((b.minX + b.maxX) * 0.5);
     const midY = Math.round((b.minY + b.maxY) * 0.5);
-
-    const nextSection: GdsSectionLine =
+    const pts: GdsPoint[] =
       orientation === 'horizontal'
-        ? withSectionPoints(activeSectionLine, [
+        ? [
             { x: Math.round(b.minX - padX), y: midY },
             { x: Math.round(b.maxX + padX), y: midY },
-          ])
-        : withSectionPoints(activeSectionLine, [
+          ]
+        : [
             { x: midX, y: Math.round(b.minY - padY) },
             { x: midX, y: Math.round(b.maxY + padY) },
-          ]);
+          ];
+
+    const nextSection: GdsSectionLine = activeSectionLine
+      ? withSectionPoints(activeSectionLine, pts)
+      : createCutWithPoints(pts);
 
     updateSingleSection(nextSection);
   };
@@ -869,7 +1013,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           x2: midX,
           y2: Math.round(b.maxY + padY),
           color,
-          resizeWaferToCut: activeSectionLine.resizeWaferToCut ?? false,
+          resizeWaferToCut: activeSectionLine?.resizeWaferToCut ?? false,
         }
       : {
           id: `sec_${Date.now()}`,
@@ -879,7 +1023,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           x2: Math.round(b.maxX + padX),
           y2: midY,
           color,
-          resizeWaferToCut: activeSectionLine.resizeWaferToCut ?? false,
+          resizeWaferToCut: activeSectionLine?.resizeWaferToCut ?? false,
         };
 
     updateSectionLines([...sectionLines, newCut], newCut.id);
@@ -888,10 +1032,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
   const handleDeleteSectionCut = (cutId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (sectionLines.length <= 1) return;
     const remaining = sectionLines.filter((s) => s.id !== cutId);
     const nextActive =
-      activeSectionLine.id === cutId ? remaining[0]?.id : activeSectionLine.id;
+      remaining.length > 0
+        ? activeSectionLine?.id === cutId
+          ? remaining[0].id
+          : activeSectionLine?.id
+        : undefined;
     updateSectionLines(remaining, nextActive);
   };
 
@@ -912,6 +1059,74 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       layers: [...layout.layers, newLayer],
     });
     setActiveLayerNum(nextNum);
+  };
+
+  const handleDeleteLayer = (layerIdx: number) => {
+    if (layout.layers.length <= 1) {
+      onNotify?.('At least one GDS layer is required.', 'warn');
+      return;
+    }
+    const target = layout.layers[layerIdx];
+    if (!target) return;
+
+    const nextLayers = layout.layers.filter((_, i) => i !== layerIdx);
+    const sameLayerNumExists = nextLayers.some((l) => l.layer === target.layer);
+    const removedShapesCount = sameLayerNumExists
+      ? 0
+      : layout.shapes.filter((s) => s.layer === target.layer).length;
+    const nextShapes = sameLayerNumExists
+      ? layout.shapes
+      : layout.shapes.filter((s) => s.layer !== target.layer);
+
+    if (selectedShapeId) {
+      const sel = layout.shapes.find((s) => s.id === selectedShapeId);
+      if (sel && !sameLayerNumExists && sel.layer === target.layer) {
+        setSelectedShapeId(null);
+        setShowArrayTool(false);
+      }
+    }
+
+    if (activeLayerNum === target.layer && !sameLayerNumExists && nextLayers.length > 0) {
+      setActiveLayerNum(nextLayers[0].layer);
+    }
+
+    updateLayout({
+      ...layout,
+      layers: nextLayers,
+      shapes: nextShapes,
+    });
+
+    onNotify?.(
+      removedShapesCount > 0
+        ? `Deleted layer L${target.layer}/${target.datatype} and ${removedShapesCount} shape(s).`
+        : `Deleted layer L${target.layer}/${target.datatype}.`,
+      'success'
+    );
+  };
+
+  const handleClearLayerObjects = (targetLayer: GdsLayerInfo) => {
+    const removedCount = layout.shapes.filter((s) => s.layer === targetLayer.layer).length;
+    if (removedCount === 0) return;
+
+    const nextShapes = layout.shapes.filter((s) => s.layer !== targetLayer.layer);
+
+    if (selectedShapeId) {
+      const sel = layout.shapes.find((s) => s.id === selectedShapeId);
+      if (sel && sel.layer === targetLayer.layer) {
+        setSelectedShapeId(null);
+        setShowArrayTool(false);
+      }
+    }
+
+    updateLayout({
+      ...layout,
+      shapes: nextShapes,
+    });
+
+    onNotify?.(
+      `Cleared ${removedCount} object(s) from layer L${targetLayer.layer}/${targetLayer.datatype}.`,
+      'success'
+    );
   };
 
   // Current active section line & concatenation config
@@ -1002,10 +1217,19 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   };
 
   const activeLayerCut = useMemo(() => {
+    if (!sectionLine) return { cutLength: 0, intervals: [] };
     return computeRawSectionIntervals(layout.shapes, activeLayerNum, sectionLine);
   }, [layout.shapes, activeLayerNum, sectionLine]);
 
   const previewSlice = useMemo(() => {
+    if (!sectionLine) {
+      return {
+        windows: [],
+        cutLength: 0,
+        segments: [],
+        isConcat: false,
+      };
+    }
     if (concatConfig.enabled && orderedConcatSections.length > 0) {
       const res = sliceGdsLayoutConcatenated(
         layout.shapes,
@@ -1051,8 +1275,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     const { windows, cutLength, isConcat } = previewSlice;
 
-    if (cutLength <= 10) {
-      onNotify?.('Draw a section line across the layout first.', 'warn');
+    if (!sectionLine || cutLength <= 10) {
+      onNotify?.('Add or draw a section cut line first.', 'warn');
       return;
     }
 
@@ -1083,6 +1307,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   // Apply cut (or concatenated cuts) across ALL mapped GDS layers -> Reticles simultaneously
   const mappedLayerCount = layout.layers.filter((l) => l.assignedMaskId).length;
   const handleApplyToAllMapped = () => {
+    if (!sectionLine) {
+      onNotify?.('Add or draw a section cut line first.', 'warn');
+      return;
+    }
     const mapped = layout.layers.filter((l) => l.assignedMaskId);
     if (mapped.length === 0) {
       onNotify?.('Map at least one GDS layer to a reticle first.', 'warn');
@@ -1163,7 +1391,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     const useConcat = concatConfig.enabled && orderedConcatSections.length > 0;
 
     for (const gLayer of unmappedWithShapes) {
-      const windows = useConcat
+      const windows = !sectionLine
+        ? []
+        : useConcat
         ? sliceGdsLayoutConcatenated(
             layout.shapes,
             gLayer.layer,
@@ -1339,9 +1569,229 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   };
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-slate-950">
-      {/* Top CAD Toolbar */}
-      <div className="px-4 py-2 bg-slate-900/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 shrink-0">
+    <div className="relative flex-1 flex flex-col overflow-hidden bg-slate-950">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".gds,.gds2,.gdsii,.sf"
+        onChange={handleFileChange}
+        className="hidden"
+      />
+
+      {/* COMPACT MOBILE TOP CAD BAR (< md): single horizontal scrollable rail + Tools popover + Layers trigger */}
+      <div className="md:hidden relative px-2 py-1.5 bg-slate-900/95 border-b border-slate-800 flex items-center gap-1.5 shrink-0">
+        <div className="flex-1 flex items-center gap-1 overflow-x-auto min-w-0">
+          {(
+            [
+              { id: 'select', label: 'Select', icon: MousePointer2 },
+              { id: 'pan', label: 'Pan', icon: Hand },
+              { id: 'rect', label: 'Rect', icon: Square },
+              { id: 'path', label: 'Path', icon: Spline },
+              { id: 'polygon', label: 'Poly', icon: Pentagon },
+              { id: 'circle', label: 'Circle', icon: Circle },
+              { id: 'section', label: `Cut`, icon: Scissors },
+            ] as const
+          ).map((item) => {
+            const Icon = item.icon;
+            const active = tool === item.id;
+            const isSection = item.id === 'section';
+            return (
+              <button
+                key={`mob_${item.id}`}
+                type="button"
+                onClick={() => {
+                  setTool(item.id);
+                  setDraftPoints([]);
+                  setDragBox(null);
+                }}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium border shrink-0 transition-colors ${
+                  active
+                    ? isSection
+                      ? 'bg-amber-500/20 border-amber-500 text-amber-300'
+                      : 'bg-sky-600 border-sky-500 text-white shadow-sm'
+                    : 'bg-slate-950 border-slate-800 text-slate-300'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0 pl-1 border-l border-slate-800">
+          <button
+            type="button"
+            onClick={() => setShowCutPanel((v) => !v)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-medium transition-colors ${
+              showCutPanel
+                ? 'bg-amber-500/20 border-amber-500/60 text-amber-300'
+                : 'bg-slate-800 border-slate-700 text-slate-300'
+            }`}
+            title={showCutPanel ? 'Hide Cut Line panel' : 'Show Cut Line panel'}
+          >
+            <Scissors className="w-3.5 h-3.5" />
+            <span>{sectionLines.length}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileToolsMenuOpen((v) => !v)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-medium transition-colors ${
+              mobileToolsMenuOpen
+                ? 'bg-indigo-600 border-indigo-400 text-white'
+                : 'bg-slate-800 border-slate-700 text-slate-200'
+            }`}
+            title="Import GDS, Grid Snap, Quick Cuts & Clear"
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>Tools</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMobileToolsMenuOpen(false);
+              setMobileLayersOpen(true);
+            }}
+            className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold transition-colors ${
+              selectedShape
+                ? 'bg-sky-600/25 border-sky-500 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-200'
+            }`}
+            title="GDS Layers & Properties"
+          >
+            <Layers className="w-3.5 h-3.5 text-sky-400" />
+            <span>Layers</span>
+          </button>
+        </div>
+
+        {/* Mobile Tools Popover */}
+        {mobileToolsMenuOpen && (
+          <>
+            <div
+              className="fixed inset-0 z-30"
+              onClick={() => setMobileToolsMenuOpen(false)}
+            />
+            <div className="absolute right-2 top-full mt-1.5 z-40 w-64 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl p-3 space-y-2.5 text-xs">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                <span className="font-semibold text-slate-200 text-[11px] uppercase tracking-wider">
+                  GDS Tools &amp; Grid
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileToolsMenuOpen(false)}
+                  className="p-0.5 text-slate-400 hover:text-white"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileToolsMenuOpen(false);
+                    fileInputRef.current?.click();
+                  }}
+                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Import .GDS</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleLoadSample();
+                    setMobileToolsMenuOpen(false);
+                  }}
+                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px]"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Example GDS</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleQuickCut('horizontal');
+                    setMobileToolsMenuOpen(false);
+                  }}
+                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
+                >
+                  <MoveHorizontal className="w-3.5 h-3.5" />
+                  <span>H-Cut Center</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleQuickCut('vertical');
+                    setMobileToolsMenuOpen(false);
+                  }}
+                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
+                >
+                  <MoveVertical className="w-3.5 h-3.5" />
+                  <span>V-Cut Center</span>
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800">
+                <span className="text-[11px] text-slate-400">Grid Snap</span>
+                <select
+                  value={gridSnapNm}
+                  onChange={(e) => setGridSnapNm(parseInt(e.target.value, 10))}
+                  className="px-2 py-1 rounded bg-slate-950 border border-slate-700 text-sky-300 font-mono text-[11px] focus:outline-none"
+                >
+                  <option value={1}>Off</option>
+                  <option value={50}>50 nm</option>
+                  <option value={100}>100 nm</option>
+                  <option value={250}>250 nm</option>
+                  <option value={500}>500 nm</option>
+                  <option value={1000}>1 µm</option>
+                </select>
+              </div>
+
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-slate-400">Path Width</span>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min={20}
+                    max={10000}
+                    step={50}
+                    value={pathWidthNm}
+                    onChange={(e) => setPathWidthNm(Math.max(20, parseInt(e.target.value || '200', 10)))}
+                    className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-slate-100 font-mono text-[11px]"
+                  />
+                  <span className="text-slate-500 font-mono text-[10px]">nm</span>
+                </div>
+              </div>
+
+              {layout.shapes.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    updateLayout({ ...layout, shapes: [] });
+                    setSelectedShapeId(null);
+                    setMobileToolsMenuOpen(false);
+                  }}
+                  className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-[11px] font-medium"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Clear All Shapes ({layout.shapes.length})</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* DESKTOP / TABLET TOP CAD TOOLBAR (>= md) */}
+      <div className="hidden md:flex px-4 py-1.5 bg-slate-900/90 border-b border-slate-800 flex-wrap items-center justify-between gap-2 shrink-0">
         {/* Drawing Tools */}
         <div className="flex items-center gap-1 flex-wrap">
           {(
@@ -1354,7 +1804,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               { id: 'circle', label: 'Circle', icon: Circle, tip: 'Draw Circular Via / Pad' },
               {
                 id: 'section',
-                label: `Cut ${sectionLine.label}`,
+                label: sectionLine ? `Cut ${sectionLine.label}` : 'Add Cut',
                 icon: Scissors,
                 tip: 'Drag for 2-pt cut, or click multiple points & double-click for multi-point cut',
               },
@@ -1373,7 +1823,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   setDragBox(null);
                 }}
                 title={item.tip}
-                className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-medium border transition-colors ${
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
                   active
                     ? isSection
                       ? 'bg-amber-500/20 border-amber-500 text-amber-300'
@@ -1388,7 +1838,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           })}
 
           {tool === 'path' && (
-            <div className="flex items-center gap-1 ml-1 px-2 py-1 rounded-lg bg-slate-950 border border-slate-800 text-[11px]">
+            <div className="flex items-center gap-1 ml-1 px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-[11px]">
               <span className="text-slate-400">W:</span>
               <input
                 type="number"
@@ -1418,17 +1868,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
         {/* File Import & Layout Actions */}
         <div className="flex items-center gap-1.5 flex-wrap">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".gds,.gds2,.gdsii,.sf"
-            onChange={handleFileChange}
-            className="hidden"
-          />
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold transition-colors"
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold transition-colors"
             title="Import binary GDSII layout (.gds / .gds2 / .gdsii)"
           >
             <Upload className="w-3.5 h-3.5" />
@@ -1438,14 +1881,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           <button
             type="button"
             onClick={handleLoadSample}
-            className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] transition-colors"
             title="Load a multi-layer example GDS layout"
           >
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
             <span>Example GDS</span>
           </button>
 
-          <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-950 border border-slate-800 text-[11px]">
+          <div className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-[11px]">
             <span className="text-slate-400">Snap:</span>
             <select
               value={gridSnapNm}
@@ -1464,7 +1907,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           <button
             type="button"
             onClick={() => handleQuickCut('horizontal')}
-            className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
             title="Place horizontal section line across center"
           >
             <MoveHorizontal className="w-3.5 h-3.5" />
@@ -1474,7 +1917,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           <button
             type="button"
             onClick={() => handleQuickCut('vertical')}
-            className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
             title="Place vertical section line across center"
           >
             <MoveVertical className="w-3.5 h-3.5" />
@@ -1494,17 +1937,61 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={() => setShowCutPanel((v) => !v)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              showCutPanel
+                ? 'bg-amber-500/15 border-amber-500/50 text-amber-300 hover:bg-amber-500/25'
+                : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+            }`}
+            title={showCutPanel ? 'Hide bottom Cut Lines panel' : 'Show bottom Cut Lines panel'}
+          >
+            <Scissors className="w-3.5 h-3.5" />
+            <span>{showCutPanel ? `Hide Cuts (${sectionLines.length})` : `Cuts (${sectionLines.length})`}</span>
+          </button>
+
+          {/* Desktop Layers Sidebar Toggle (lg+) */}
+          <button
+            type="button"
+            onClick={() => setDesktopLayersOpen((v) => !v)}
+            className={`hidden lg:flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-semibold transition-colors ${
+              desktopLayersOpen
+                ? 'bg-sky-600/20 border-sky-500/60 text-sky-300 hover:bg-sky-600/30'
+                : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+            }`}
+            title={desktopLayersOpen ? 'Hide GDS Layers list' : 'Show GDS Layers list'}
+          >
+            <PanelRight className="w-3.5 h-3.5 text-sky-400" />
+            <span>{desktopLayersOpen ? 'Hide Layers' : `Layers (${layout.layers.length})`}</span>
+          </button>
+
+          {/* Tablet Layers & Properties Drawer Toggle (md .. lg) */}
+          <button
+            type="button"
+            onClick={() => setMobileLayersOpen(true)}
+            className={`lg:hidden flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-semibold transition-colors ${
+              selectedShape
+                ? 'bg-sky-600/20 border-sky-500/60 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+            }`}
+            title="Open GDS Layers & Selected Shape Properties"
+          >
+            <Layers className="w-3.5 h-3.5 text-sky-400" />
+            <span>Layers &amp; Props</span>
+          </button>
         </div>
       </div>
 
       {/* Main Middle Area: 2D GDS Canvas + GDS Layers Sidebar */}
-      <div className="flex-1 flex min-h-0 overflow-hidden">
+      <div className="relative flex-1 flex min-h-0 overflow-hidden">
         {/* 2D GDS SVG Canvas */}
         <div
           ref={svgContainerRef}
           onWheel={handleWheel}
           onContextMenu={(e) => e.preventDefault()}
-          className={`relative flex-1 bg-[#050811] overflow-hidden select-none ${
+          className={`relative flex-1 bg-[#050811] overflow-hidden select-none touch-none ${
             tool === 'pan' || pointerOp?.kind === 'pan'
               ? 'cursor-grab'
               : tool === 'select'
@@ -1515,10 +2002,11 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           <svg
             width={svgSize.w}
             height={svgSize.h}
-            className="w-full h-full block"
+            className="w-full h-full block touch-none"
             onPointerDown={handleSvgPointerDown}
             onPointerMove={handleSvgPointerMove}
             onPointerUp={handleSvgPointerUp}
+            onPointerCancel={handleSvgPointerUp}
             onDoubleClick={handleSvgDoubleClick}
           >
             <defs>
@@ -1642,6 +2130,84 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               })}
             </g>
 
+            {/* Selected Shape Bounding Box & 8 Interactive Resize Handles */}
+            {selectedShape &&
+              !dragBox &&
+              layerByNum.get(selectedShape.layer)?.visible !== false &&
+              (() => {
+                const b = getGdsShapeBounds(selectedShape);
+                const tl = worldToScreen(b.minX, b.minY + b.height);
+                const br = worldToScreen(b.minX + b.width, b.minY);
+                const boxX = Math.min(tl.x, br.x);
+                const boxY = Math.min(tl.y, br.y);
+                const boxW = Math.max(2, Math.abs(br.x - tl.x));
+                const boxH = Math.max(2, Math.abs(br.y - tl.y));
+                const midX = boxX + boxW * 0.5;
+                const midY = boxY + boxH * 0.5;
+                const hs = svgSize.w < 640 ? 9 : 7;
+                const handles: Array<{
+                  id: ResizeHandle;
+                  x: number;
+                  y: number;
+                  cursor: string;
+                }> = [
+                  { id: 'nw', x: boxX, y: boxY, cursor: 'nwse-resize' },
+                  { id: 'n', x: midX, y: boxY, cursor: 'ns-resize' },
+                  { id: 'ne', x: boxX + boxW, y: boxY, cursor: 'nesw-resize' },
+                  { id: 'e', x: boxX + boxW, y: midY, cursor: 'ew-resize' },
+                  { id: 'se', x: boxX + boxW, y: boxY + boxH, cursor: 'nwse-resize' },
+                  { id: 's', x: midX, y: boxY + boxH, cursor: 'ns-resize' },
+                  { id: 'sw', x: boxX, y: boxY + boxH, cursor: 'nesw-resize' },
+                  { id: 'w', x: boxX, y: midY, cursor: 'ew-resize' },
+                ];
+                return (
+                  <g>
+                    <rect
+                      x={boxX}
+                      y={boxY}
+                      width={boxW}
+                      height={boxH}
+                      fill="none"
+                      stroke="#38bdf8"
+                      strokeWidth="1.2"
+                      strokeDasharray="4 3"
+                      pointerEvents="none"
+                    />
+                    {handles.map((h) => (
+                      <rect
+                        key={`rsz_${h.id}`}
+                        x={h.x - hs * 0.5}
+                        y={h.y - hs * 0.5}
+                        width={hs}
+                        height={hs}
+                        rx="1.5"
+                        fill="#0f172a"
+                        stroke="#38bdf8"
+                        strokeWidth="1.6"
+                        style={{ cursor: h.cursor }}
+                        onPointerDown={(e) => {
+                          if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
+                          e.stopPropagation();
+                          const captureTarget =
+                            (e.currentTarget as SVGGraphicsElement).ownerSVGElement || e.currentTarget;
+                          try {
+                            captureTarget.setPointerCapture(e.pointerId);
+                          } catch {
+                            // ignore
+                          }
+                          setPointerOp({
+                            kind: 'resize-shape',
+                            shape: selectedShape,
+                            handle: h.id,
+                            initBounds: b,
+                          });
+                        }}
+                      />
+                    ))}
+                  </g>
+                );
+              })()}
+
             {/* Rubber-band Draw Preview (Rect / Circle / Section) */}
             {dragBox && tool === 'rect' && (() => {
               const p1 = worldToScreen(dragBox.start.x, dragBox.start.y);
@@ -1710,7 +2276,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 .join(' ');
               const cColor =
                 tool === 'section'
-                  ? sectionLine.color || '#fbbf24'
+                  ? sectionLine?.color || '#fbbf24'
                   : activeLayerInfo?.color || '#38bdf8';
               return (
                 <g>
@@ -1789,7 +2355,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
             {/* MULTI-SECTION POLYLINES (A-A', B-B', C-C'...) + ACTIVE / CONCAT CUT INTERSECTION HIGHLIGHTS */}
             {sectionLines.map((cut, cutIdx) => {
-              const isActiveCut = cut.id === sectionLine.id;
+              const isActiveCut = cut.id === sectionLine?.id;
               const concatOrderIdx = concatConfig.enabled
                 ? concatConfig.sectionIds.indexOf(cut.id)
                 : -1;
@@ -1813,7 +2379,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               const midWorld = getSectionMidpoint(cut);
               const midScr = worldToScreen(midWorld.x, midWorld.y);
               const canDragLineBody = tool !== 'pan' && draftPoints.length === 0;
-              const hitStrokeWidth = tool === 'select' || tool === 'section' ? 16 : 9;
+              const isSmallCanvas = svgSize.w < 640;
+              const hitStrokeWidth = tool === 'select' || tool === 'section' ? (isSmallCanvas ? 24 : 16) : isSmallCanvas ? 16 : 9;
               const showIntervals = isActiveCut || isIncludedInConcat;
               const cutIntervals = showIntervals
                 ? isActiveCut
@@ -1826,7 +2393,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 e.stopPropagation();
                 const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
                 const startWorld = screenToWorld(sx, sy, true);
-                if (cut.id !== activeSectionLine.id) {
+                if (cut.id !== activeSectionLine?.id) {
                   updateSectionLines(sectionLines, cut.id);
                 }
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
@@ -1840,7 +2407,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               const startVertexDrag = (vertexIndex: number, e: React.PointerEvent<Element>) => {
                 if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
                 e.stopPropagation();
-                if (cut.id !== activeSectionLine.id) {
+                if (cut.id !== activeSectionLine?.id) {
                   updateSectionLines(sectionLines, cut.id);
                 }
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
@@ -2028,6 +2595,22 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                     const isFirst = vIdx === 0;
                     const isLast = vIdx === scrPts.length - 1;
                     const isInterior = !isFirst && !isLast;
+                    const isSmallCanvas = svgSize.w < 640;
+                    const vertexR = isInterior
+                      ? isActiveCut
+                        ? isSmallCanvas
+                          ? 7
+                          : 5.5
+                        : isSmallCanvas
+                        ? 5.5
+                        : 4
+                      : isActiveCut
+                      ? isSmallCanvas
+                        ? 9
+                        : 7
+                      : isSmallCanvas
+                      ? 7
+                      : 5.5;
                     return (
                       <g
                         key={`cut_vtx_${cut.id}_${vIdx}`}
@@ -2039,7 +2622,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         <circle
                           cx={sp.x}
                           cy={sp.y}
-                          r={isInterior ? (isActiveCut ? 5.5 : 4) : isActiveCut ? 7 : 5.5}
+                          r={vertexR}
                           fill={isInterior ? '#0f172a' : cutColor}
                           stroke={isInterior ? cutColor : '#0f172a'}
                           strokeWidth="2"
@@ -2047,7 +2630,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         {(isFirst || isLast) && (
                           <text
                             x={sp.x}
-                            y={sp.y - 11}
+                            y={sp.y - (isSmallCanvas ? 13 : 11)}
                             textAnchor="middle"
                             fill={cutColor}
                             fontSize="11"
@@ -2065,8 +2648,26 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             })}
           </svg>
 
+          {/* Top-left Active Drawing Layer Chip on Mobile/Tablet (< lg) */}
+          {activeLayerInfo && (
+            <button
+              type="button"
+              onClick={() => setMobileLayersOpen(true)}
+              className="lg:hidden absolute top-2 left-2 flex items-center gap-1.5 px-2 py-1 rounded-md bg-slate-900/90 border border-slate-800 text-[10px] font-mono text-slate-200 backdrop-blur-sm shadow-sm"
+              title="Tap to switch GDS Layer"
+            >
+              <PatternSwatch
+                color={activeLayerInfo.color}
+                pattern={activeLayerInfo.pattern || 'diagonal-right'}
+                size={11}
+              />
+              <span className="font-bold">L{activeLayerInfo.layer}</span>
+              <span className="text-slate-400 truncate max-w-[80px]">{activeLayerInfo.name}</span>
+            </button>
+          )}
+
           {/* Bottom-left Viewport Zoom & Coordinates HUD */}
-          <div className="absolute bottom-3 left-3 flex items-center gap-1.5 bg-slate-900/90 border border-slate-800 rounded-lg px-2 py-1 text-[10px] font-mono text-slate-300 backdrop-blur-sm">
+          <div className="absolute bottom-2 left-2 sm:bottom-3 sm:left-3 flex items-center gap-1.5 bg-slate-900/90 border border-slate-800 rounded-lg px-2 py-1 text-[10px] font-mono text-slate-300 backdrop-blur-sm">
             <button
               type="button"
               onClick={() => setCamera((c) => ({ ...c, spanX: Math.max(400, c.spanX * 0.75) }))}
@@ -2092,35 +2693,120 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               <Maximize2 className="w-3.5 h-3.5" />
             </button>
             {cursorWorld && (
-              <span className="pl-1.5 border-l border-slate-700 text-sky-300">
+              <span className="hidden sm:inline pl-1.5 border-l border-slate-700 text-sky-300">
                 X: {(cursorWorld.x / 1000).toFixed(2)} µm · Y: {(cursorWorld.y / 1000).toFixed(2)} µm
               </span>
             )}
           </div>
 
-          {layout.shapes.length === 0 && (
-            <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-lg bg-slate-900/85 border border-slate-800 text-[11px] text-slate-300">
+          {/* Floating Touch-Friendly Multi-Point Draft Actions (Polygon / Path / Multi-pt Cut) */}
+          {draftPoints.length > 0 && (
+            <div className="absolute bottom-11 sm:bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-2 py-1 rounded-xl bg-slate-900/95 border border-emerald-500/40 shadow-xl backdrop-blur-sm text-[11px]">
+              {draftPoints.length >= (tool === 'polygon' ? 3 : 2) && (
+                <button
+                  type="button"
+                  onClick={() => finalizeMultiClickShape(draftPoints)}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
+                >
+                  {tool === 'section'
+                    ? `Finish Cut (${draftPoints.length})`
+                    : `Finish (${draftPoints.length})`}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setDraftPoints((prev) => prev.slice(0, -1))}
+                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+              >
+                Undo Pt
+              </button>
+              <button
+                type="button"
+                onClick={() => setDraftPoints([])}
+                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-rose-950/60 text-rose-300 border border-slate-700"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {layout.shapes.length === 0 && draftPoints.length === 0 && (
+            <div className="pointer-events-none hidden sm:block absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-lg bg-slate-900/85 border border-slate-800 text-[11px] text-slate-300 text-center max-w-[92%]">
               Draw shapes on the grid, click <span className="text-indigo-300 font-semibold">Import .GDS</span>, or load the <span className="text-amber-300 font-semibold">Example GDS</span>.
             </div>
           )}
+
+          {/* Quick Inspector Shortcut when Layers panel is hidden or on Mobile/Tablet */}
+          {selectedShape && (!desktopLayersOpen || !mobileLayersOpen) && (
+            <button
+              type="button"
+              onClick={() => {
+                setDesktopLayersOpen(true);
+                setMobileLayersOpen(true);
+              }}
+              className={`${
+                !desktopLayersOpen ? 'flex' : 'lg:hidden flex'
+              } absolute bottom-2 right-2 sm:bottom-3 sm:right-3 items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold shadow-lg`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span className="capitalize">Edit {selectedShape.type}</span>
+            </button>
+          )}
         </div>
 
+        {/* Backdrop for Mobile / Tablet Slide-Over Layers & Inspector Drawer */}
+        {mobileLayersOpen && (
+          <div
+            className="lg:hidden absolute inset-0 z-20 bg-slate-950/70 backdrop-blur-xs"
+            onClick={() => setMobileLayersOpen(false)}
+          />
+        )}
+
         {/* Right Layer, Reticle Mapping & Selected Object Inspector Panel */}
-        <div className="w-64 sm:w-72 border-l border-slate-800 bg-slate-900/60 flex flex-col shrink-0 overflow-hidden">
+        <div
+          className={`${
+            mobileLayersOpen
+              ? 'flex absolute inset-y-0 right-0 z-30 w-72 max-w-[88vw] shadow-2xl bg-slate-900'
+              : desktopLayersOpen
+              ? 'hidden lg:flex w-64 xl:w-72 bg-slate-900/60'
+              : 'hidden'
+          } border-l border-slate-800 flex-col shrink-0 overflow-hidden`}
+        >
           <div className="px-3 py-2 border-b border-slate-800 shrink-0 space-y-0.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-1">
               <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
                 <Layers className="w-3.5 h-3.5 text-sky-400" />
                 <span>GDS Layers ({layout.layers.length})</span>
               </div>
-              <button
-                type="button"
-                onClick={handleAddLayer}
-                className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 text-[10px] font-semibold border border-slate-700"
-              >
-                <Plus className="w-3 h-3" />
-                <span>Layer</span>
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setShowMappingHelp(true)}
+                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 hover:text-amber-200 border border-slate-700 transition-colors"
+                  title="How GDS Layer → Mask Level assignment works"
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAddLayer}
+                  className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 text-[10px] font-semibold border border-slate-700"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Layer</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileLayersOpen(false);
+                    setDesktopLayersOpen(false);
+                  }}
+                  className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800"
+                  title="Hide Layers & Properties panel"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
             <div className="text-[9.5px] text-slate-500">
               Drag or use ↑↓ to reorder stack (top renders in front)
@@ -2221,6 +2907,34 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         title={layer.visible ? 'Hide layer' : 'Show layer'}
                       >
                         {layer.visible ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3 text-slate-600" />}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={shapeCount === 0}
+                        onClick={() => handleClearLayerObjects(layer)}
+                        className="p-0.5 text-slate-400 hover:text-amber-300 disabled:opacity-25 disabled:pointer-events-none transition-colors"
+                        title={
+                          shapeCount === 0
+                            ? `Layer L${layer.layer}/${layer.datatype} has no objects to clear`
+                            : `Clear all ${shapeCount} object(s) from L${layer.layer}/${layer.datatype}`
+                        }
+                      >
+                        <Eraser className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={layout.layers.length <= 1}
+                        onClick={() => handleDeleteLayer(layerIdx)}
+                        className="p-0.5 text-slate-500 hover:text-rose-400 disabled:opacity-25 disabled:pointer-events-none transition-colors"
+                        title={
+                          layout.layers.length <= 1
+                            ? 'At least one GDS layer is required'
+                            : shapeCount > 0
+                            ? `Delete layer L${layer.layer}/${layer.datatype} and its ${shapeCount} shape(s)`
+                            : `Delete layer L${layer.layer}/${layer.datatype}`
+                        }
+                      >
+                        <Trash2 className="w-3 h-3" />
                       </button>
                     </div>
                   </div>
@@ -2477,6 +3191,93 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   </div>
                 );
               })()}
+
+              {/* Rescale Shape (factor X / Y + quick presets) */}
+              <div className="p-2 rounded-lg bg-slate-900/80 border border-slate-800 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-semibold text-slate-300">Rescale Shape</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !lockScaleAspect;
+                      setLockScaleAspect(next);
+                      if (next) setScaleYInput(scaleXInput);
+                    }}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium border ${
+                      lockScaleAspect
+                        ? 'bg-sky-950/60 border-sky-500/40 text-sky-300'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                    title={lockScaleAspect ? 'Uniform X/Y aspect locked' : 'Independent X/Y scaling'}
+                  >
+                    {lockScaleAspect ? <Lock className="w-2.5 h-2.5" /> : <Unlock className="w-2.5 h-2.5" />}
+                    <span>{lockScaleAspect ? 'Uniform' : 'Free X/Y'}</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1 flex-wrap">
+                  {[0.5, 0.75, 1.25, 1.5, 2].map((mult) => (
+                    <button
+                      key={`sc_${mult}`}
+                      type="button"
+                      onClick={() => {
+                        setScaleXInput(String(mult));
+                        setScaleYInput(String(mult));
+                        handleUpdateShape(rescaleGdsShape(selectedShape, mult, mult, true));
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600/30 border border-slate-700 hover:border-sky-500/60 text-[10px] font-mono text-slate-200 transition-colors"
+                    >
+                      {mult}×
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1">
+                  <label className="flex-1 flex items-center gap-1 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5">
+                    <span className="text-[9px] text-slate-500 font-mono">X</span>
+                    <input
+                      type="number"
+                      min={0.05}
+                      max={100}
+                      step={0.1}
+                      value={scaleXInput}
+                      onChange={(e) => {
+                        setScaleXInput(e.target.value);
+                        if (lockScaleAspect) setScaleYInput(e.target.value);
+                      }}
+                      className="w-full bg-transparent text-[10px] font-mono text-sky-300 focus:outline-none"
+                    />
+                  </label>
+                  <label className="flex-1 flex items-center gap-1 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5">
+                    <span className="text-[9px] text-slate-500 font-mono">Y</span>
+                    <input
+                      type="number"
+                      min={0.05}
+                      max={100}
+                      step={0.1}
+                      disabled={lockScaleAspect}
+                      value={lockScaleAspect ? scaleXInput : scaleYInput}
+                      onChange={(e) => setScaleYInput(e.target.value)}
+                      className="w-full bg-transparent text-[10px] font-mono text-sky-300 focus:outline-none disabled:opacity-60"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const sx = parseFloat(scaleXInput);
+                      const sy = lockScaleAspect ? sx : parseFloat(scaleYInput);
+                      if (!Number.isFinite(sx) || sx <= 0 || !Number.isFinite(sy) || sy <= 0) {
+                        onNotify?.('Enter positive scale factors (e.g. 0.5 or 1.5).', 'warn');
+                        return;
+                      }
+                      handleUpdateShape(rescaleGdsShape(selectedShape, sx, sy, true));
+                    }}
+                    className="px-2 py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-semibold shrink-0"
+                  >
+                    Apply
+                  </button>
+                </div>
+              </div>
 
               {/* RECTANGLE PROPERTIES */}
               {selectedShape.type === 'rect' && (
@@ -2735,35 +3536,336 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         </div>
       </div>
 
-      {/* Bottom Section Cut Selector, Concatenation, Preview & Aperture Generator Bar */}
-      <div className="px-4 py-2.5 bg-slate-900/90 border-t border-slate-800 space-y-2 shrink-0">
-        {/* Multi-Cut Tabs Strip (A-A', B-B', C-C'...) + Concatenate Toggle */}
-        <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-800/80">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1 mr-1">
-              <Scissors className="w-3.5 h-3.5 text-amber-400" />
-              <span>Section Cuts:</span>
-            </span>
+      {/* MOBILE COLLAPSIBLE BOTTOM CUT & APERTURE BAR (< md) */}
+      {showCutPanel && (
+        <div className="md:hidden bg-slate-900/95 border-t border-slate-800 shrink-0">
+          {mobileCutsExpanded && (
+            <div className="max-h-[44dvh] overflow-y-auto px-2.5 py-2 border-b border-slate-800 bg-slate-950/90 space-y-2 text-[11px]">
+              {/* Section Cut Chips + Add Cut + Concat Toggle */}
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1 flex-wrap">
+                  {sectionLines.map((cut, idx) => {
+                    const active = cut.id === sectionLine?.id;
+                    const color = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
+                    return (
+                      <div
+                        key={`mob_cut_${cut.id}`}
+                        onClick={() => updateSectionLines(sectionLines, cut.id)}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded-md border font-mono cursor-pointer ${
+                          active
+                            ? 'bg-slate-800 border-slate-500 text-white'
+                            : 'bg-slate-900 border-slate-800 text-slate-400'
+                        }`}
+                      >
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: color }}
+                        />
+                        <span className="font-semibold">{cut.label}</span>
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteSectionCut(cut.id, e)}
+                          className="ml-0.5 text-slate-500 hover:text-rose-400 leading-none"
+                          title={`Delete cut ${cut.label}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
 
-            {sectionLines.map((cut, idx) => {
-              const active = cut.id === sectionLine.id;
-              const color = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
-              return (
-                <div
-                  key={cut.id}
-                  onClick={() => updateSectionLines(sectionLines, cut.id)}
-                  className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[11px] font-mono cursor-pointer transition-colors ${
-                    active
-                      ? 'bg-slate-800 border-slate-500 text-white shadow-sm'
-                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                  <button
+                    type="button"
+                    onClick={handleAddSectionCut}
+                    className="flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-300 font-semibold"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>{getNextSectionLabel(sectionLines)}</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={sectionLines.length === 0}
+                  onClick={handleToggleConcat}
+                  className={`flex items-center gap-1 px-2 py-0.5 rounded-md border font-semibold disabled:opacity-40 disabled:pointer-events-none ${
+                    concatConfig.enabled
+                      ? 'bg-indigo-600 border-indigo-400 text-white'
+                      : 'bg-slate-900 border-slate-700 text-slate-300'
                   }`}
                 >
-                  <span
-                    className="w-2 h-2 rounded-full shrink-0"
-                    style={{ backgroundColor: color }}
+                  <Link2 className="w-3 h-3" />
+                  <span>Concat</span>
+                </button>
+              </div>
+
+              {/* Concatenation Order & Separation Gap */}
+              {concatConfig.enabled && sectionLines.length > 0 && (
+                <div className="p-2 rounded-lg bg-indigo-950/30 border border-indigo-500/35 space-y-1.5">
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <span className="text-[10px] uppercase font-semibold text-indigo-300 mr-1">
+                      Order:
+                    </span>
+                    {orderedConcatSections.map((cut, idx) => {
+                      const cutColor = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
+                      return (
+                        <div
+                          key={`mcat_${cut.id}`}
+                          className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono"
+                        >
+                          <span
+                            className="w-2 h-2 rounded-full"
+                            style={{ backgroundColor: cutColor }}
+                          />
+                          <span>{cut.label}</span>
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => handleMoveConcatOrder(cut.id, -1)}
+                            className="text-slate-400 hover:text-white disabled:opacity-25"
+                          >
+                            <ChevronLeft className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === orderedConcatSections.length - 1}
+                            onClick={() => handleMoveConcatOrder(cut.id, 1)}
+                            className="text-slate-400 hover:text-white disabled:opacity-25"
+                          >
+                            <ChevronRight className="w-3 h-3" />
+                          </button>
+                          {orderedConcatSections.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateConcatConfig({
+                                  ...concatConfig,
+                                  sectionIds: concatConfig.sectionIds.filter((x) => x !== cut.id),
+                                })
+                              }
+                              className="text-slate-500 hover:text-rose-400 pl-0.5 leading-none"
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {excludedConcatSections.map((cut) => (
+                      <button
+                        key={`madd_${cut.id}`}
+                        type="button"
+                        onClick={() =>
+                          updateConcatConfig({
+                            ...concatConfig,
+                            sectionIds: [...concatConfig.sectionIds, cut.id],
+                          })
+                        }
+                        className="flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-dashed border-slate-700 text-slate-400 font-mono text-[10px]"
+                      >
+                        <Plus className="w-2.5 h-2.5" />
+                        <span>{cut.label}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] text-slate-400">Separation Gap (nm):</span>
+                    <NmNumberInput
+                      value={concatConfig.gapNm}
+                      min={0}
+                      max={500000}
+                      step={100}
+                      onChange={(gapNm) =>
+                        updateConcatConfig({
+                          ...concatConfig,
+                          gapNm: Math.max(0, gapNm),
+                        })
+                      }
+                      className="w-24 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-indigo-300"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* 1:1 Scale & Single-Layer Target (for Generate) & Apply All Mapped */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                <label className="flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={!sectionLine}
+                    checked={Boolean(sectionLine?.resizeWaferToCut)}
+                    onChange={(e) =>
+                      sectionLine &&
+                      updateSingleSection({
+                        ...sectionLine,
+                        resizeWaferToCut: e.target.checked,
+                      })
+                    }
+                    className="rounded bg-slate-800 border-slate-700 text-amber-500 focus:ring-0 disabled:opacity-40"
                   />
-                  <span className="font-semibold">{cut.label}</span>
-                  {sectionLines.length > 1 && (
+                  <span>1:1 Scale</span>
+                </label>
+
+                <button
+                  type="button"
+                  onClick={() => setShowMappingHelp(true)}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-amber-300 text-[10px] font-medium"
+                >
+                  <HelpCircle className="w-3 h-3" />
+                  <span>Mapping Help</span>
+                </button>
+              </div>
+
+              <div className="p-1.5 rounded-lg bg-slate-900/90 border border-sky-500/35 flex items-center justify-between gap-1.5">
+                <span className="font-mono text-[10px] text-sky-300 shrink-0">
+                  L{activeLayerNum} Target (Generate):
+                </span>
+                <select
+                  value={targetMaskId}
+                  onChange={(e) => setTargetMaskId(e.target.value)}
+                  disabled={masks.length === 0}
+                  className="min-w-0 flex-1 px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-200 font-mono text-[11px] truncate"
+                >
+                  {masks.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.layerCode || 'LVL'} · {m.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {mappedLayerCount > 0 && (
+                <button
+                  type="button"
+                  disabled={!sectionLine}
+                  onClick={() => {
+                    handleApplyToAllMapped();
+                    setMobileCutsExpanded(false);
+                  }}
+                  className="w-full flex items-center justify-center gap-1 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 disabled:pointer-events-none text-white font-semibold"
+                >
+                  <ArrowRight className="w-3.5 h-3.5" />
+                  <span>Apply All Mapped ({mappedLayerCount} · per-layer links)</span>
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Compact Collapsed Cut Bar (~52px total) */}
+          <div className="px-2.5 py-1.5 space-y-1.5">
+            <div className="flex items-center justify-between gap-1.5">
+              <button
+                type="button"
+                onClick={() => setMobileCutsExpanded((v) => !v)}
+                className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950 border border-slate-700 text-[11px] text-slate-200 min-w-0"
+              >
+                <Scissors className="w-3 h-3 text-amber-400 shrink-0" />
+                <span className="font-mono font-semibold truncate">
+                  {!sectionLine
+                    ? 'No Cut'
+                    : previewSlice.isConcat
+                    ? `Concat (${orderedConcatSections.map((s) => s.label).join('+')})`
+                    : sectionLine.label}
+                </span>
+                <span className="text-[10px] font-mono text-sky-300 shrink-0">
+                  · {previewSlice.windows.length} ap.
+                </span>
+                {mobileCutsExpanded ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                ) : (
+                  <ChevronUp className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                )}
+              </button>
+
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  disabled={!sectionLine}
+                  onClick={handleApplyToSingleMask}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:pointer-events-none text-white text-[11px] font-semibold shadow-sm"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Generate</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowCutPanel(false)}
+                  className="p-1 rounded-lg bg-slate-800 text-slate-400 hover:text-white"
+                  title="Hide Cut panel"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Slim 1D Live Cut Aperture Strip Preview */}
+            <div className="relative h-3.5 w-full rounded bg-slate-950 border border-slate-800 overflow-hidden">
+              <div
+                className="absolute inset-0 opacity-35"
+                style={{
+                  backgroundImage:
+                    'repeating-linear-gradient(45deg, #1e293b 0, #1e293b 6px, #0f172a 6px, #0f172a 12px)',
+                }}
+              />
+              {previewSlice.windows.map((w, idx) => {
+                const totalSpan = sectionLine?.resizeWaferToCut
+                  ? Math.max(1, previewSlice.cutLength)
+                  : waferWidth;
+                const leftPct = (w.xStart / totalSpan) * 100;
+                const widthPct = ((w.xEnd - w.xStart) / totalSpan) * 100;
+                return (
+                  <div
+                    key={`mprev_${idx}`}
+                    className="absolute top-0.5 bottom-0.5 rounded-xs"
+                    style={{
+                      left: `${leftPct}%`,
+                      width: `${Math.max(1, widthPct)}%`,
+                      backgroundColor: activeLayerInfo?.color || '#38bdf8',
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DESKTOP & TABLET BOTTOM SECTION CUT BAR (>= md) */}
+      {showCutPanel && (
+        <div className="hidden md:block px-4 py-2 bg-slate-900/90 border-t border-slate-800 space-y-1.5 shrink-0">
+          {/* Multi-Cut Tabs Strip (A-A', B-B', C-C'...) + Concatenate Toggle */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-800/80">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1 mr-1">
+                <Scissors className="w-3.5 h-3.5 text-amber-400" />
+                <span>Section Cuts:</span>
+              </span>
+
+              {sectionLines.length === 0 && (
+                <span className="text-[11px] text-slate-500 italic mr-1">
+                  None defined
+                </span>
+              )}
+
+              {sectionLines.map((cut, idx) => {
+                const active = cut.id === sectionLine?.id;
+                const color = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
+                return (
+                  <div
+                    key={cut.id}
+                    onClick={() => updateSectionLines(sectionLines, cut.id)}
+                    className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[11px] font-mono cursor-pointer transition-colors ${
+                      active
+                        ? 'bg-slate-800 border-slate-500 text-white shadow-sm'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                    }`}
+                  >
+                    <span
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: color }}
+                    />
+                    <span className="font-semibold">{cut.label}</span>
                     <button
                       type="button"
                       onClick={(e) => handleDeleteSectionCut(cut.id, e)}
@@ -2772,289 +3874,418 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                     >
                       ×
                     </button>
-                  )}
-                </div>
-              );
-            })}
-
-            <button
-              type="button"
-              onClick={handleAddSectionCut}
-              className="flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-[11px] font-semibold transition-colors"
-              title="Add another section cut line (B-B', C-C', ...)"
-            >
-              <Plus className="w-3 h-3" />
-              <span>Add Cut ({getNextSectionLabel(sectionLines)})</span>
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleToggleConcat}
-              className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md border text-[11px] font-semibold transition-colors ${
-                concatConfig.enabled
-                  ? 'bg-indigo-600 border-indigo-400 text-white shadow-sm'
-                  : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500'
-              }`}
-              title="Concatenate multiple section cuts into a single combined mask aperture"
-            >
-              <Link2 className="w-3 h-3" />
-              <span>Concatenate Cuts</span>
-            </button>
-            <span className="hidden lg:inline text-[10px] text-slate-500">
-              Drag any cut line or endpoint on the canvas
-            </span>
-          </div>
-        </div>
-
-        {/* Concatenation Order & Separation Bar (visible when Concatenate Cuts is ON) */}
-        {concatConfig.enabled && (
-          <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-indigo-950/30 border border-indigo-500/35 text-[11px]">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-[10px] uppercase tracking-wider font-semibold text-indigo-300 mr-1">
-                Order:
-              </span>
-
-              {orderedConcatSections.map((cut, idx) => {
-                const cutColor = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
-                return (
-                  <React.Fragment key={`cat_${cut.id}`}>
-                    <div
-                      draggable
-                      onDragStart={() => setDraggingConcatId(cut.id)}
-                      onDragOver={(e) => e.preventDefault()}
-                      onDrop={() => handleReorderConcatDrop(cut.id)}
-                      onDragEnd={() => setDraggingConcatId(null)}
-                      className={`flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border font-mono text-[11px] cursor-grab active:cursor-grabbing ${
-                        draggingConcatId === cut.id
-                          ? 'border-indigo-400 opacity-60'
-                          : 'border-slate-700 text-slate-200'
-                      }`}
-                      title="Drag or use arrows to change concatenation order"
-                    >
-                      <span className="text-[9px] text-slate-500">{idx + 1}.</span>
-                      <span
-                        className="w-2 h-2 rounded-full shrink-0"
-                        style={{ backgroundColor: cutColor }}
-                      />
-                      <span className="font-semibold">{cut.label}</span>
-                      <button
-                        type="button"
-                        disabled={idx === 0}
-                        onClick={() => handleMoveConcatOrder(cut.id, -1)}
-                        className="p-0.5 text-slate-400 hover:text-white disabled:opacity-25"
-                        title="Move earlier"
-                      >
-                        <ChevronLeft className="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={idx === orderedConcatSections.length - 1}
-                        onClick={() => handleMoveConcatOrder(cut.id, 1)}
-                        className="p-0.5 text-slate-400 hover:text-white disabled:opacity-25"
-                        title="Move later"
-                      >
-                        <ChevronRight className="w-3 h-3" />
-                      </button>
-                      {orderedConcatSections.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateConcatConfig({
-                              ...concatConfig,
-                              sectionIds: concatConfig.sectionIds.filter((x) => x !== cut.id),
-                            })
-                          }
-                          className="text-slate-500 hover:text-rose-400 pl-0.5 leading-none"
-                          title={`Exclude ${cut.label}`}
-                        >
-                          ×
-                        </button>
-                      )}
-                    </div>
-                    {idx < orderedConcatSections.length - 1 && (
-                      <span className="text-[10px] font-mono text-indigo-400/80">→</span>
-                    )}
-                  </React.Fragment>
+                  </div>
                 );
               })}
 
-              {excludedConcatSections.map((cut) => (
-                <button
-                  key={`add_cat_${cut.id}`}
-                  type="button"
-                  onClick={() =>
-                    updateConcatConfig({
-                      ...concatConfig,
-                      sectionIds: [...concatConfig.sectionIds, cut.id],
-                    })
-                  }
-                  className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-dashed border-slate-700 hover:border-indigo-400 text-slate-400 hover:text-indigo-300 font-mono text-[10px] transition-colors"
-                  title={`Include ${cut.label} in concatenation`}
-                >
-                  <Plus className="w-2.5 h-2.5" />
-                  <span>{cut.label}</span>
-                </button>
-              ))}
-            </div>
-
-            {/* Separation Space between cuts */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-400 text-[10px]">Separation Gap:</span>
-              <NmNumberInput
-                value={concatConfig.gapNm}
-                min={0}
-                max={500000}
-                step={100}
-                onChange={(gapNm) =>
-                  updateConcatConfig({
-                    ...concatConfig,
-                    gapNm: Math.max(0, gapNm),
-                  })
-                }
-                className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-indigo-300 focus:outline-none focus:border-indigo-400"
-              />
-              <span className="text-slate-500 font-mono text-[10px]">
-                nm ({(concatConfig.gapNm / 1000).toFixed(2)} µm)
-              </span>
-            </div>
-          </div>
-        )}
-
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span
-              className="font-semibold flex items-center gap-1"
-              style={{
-                color: previewSlice.isConcat
-                  ? '#a5b4fc'
-                  : sectionLine.color || '#fbbf24',
-              }}
-            >
-              <span>
-                {previewSlice.isConcat
-                  ? `Concat (${orderedConcatSections.map((s) => s.label).join(' + ')})`
-                  : `Active Cut ${sectionLine.label}`}
-              </span>
-            </span>
-            <span className="text-[11px] font-mono text-slate-400">
-              {previewSlice.isConcat ? 'Total:' : 'Length:'}{' '}
-              {(previewSlice.cutLength / 1000).toFixed(2)} µm
-            </span>
-            <span className="text-[11px] font-mono text-sky-300">
-              · Layer {activeLayerNum}: {previewSlice.windows.length} aperture(s)
-            </span>
-
-            <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer ml-2">
-              <input
-                type="checkbox"
-                checked={Boolean(sectionLine.resizeWaferToCut)}
-                onChange={(e) =>
-                  updateSingleSection({
-                    ...sectionLine,
-                    resizeWaferToCut: e.target.checked,
-                  })
-                }
-                className="rounded bg-slate-800 border-slate-700 text-amber-500 focus:ring-0"
-              />
-              <span>
-                1:1 Scale (Resize wafer width to {previewSlice.isConcat ? 'total' : 'cut'} length)
-              </span>
-            </label>
-          </div>
-
-          <div className="flex items-center gap-2 flex-wrap">
-            <div className="flex items-center gap-1.5 text-[11px]">
-              <span className="text-slate-400">Target:</span>
-              <select
-                value={targetMaskId}
-                onChange={(e) => setTargetMaskId(e.target.value)}
-                className="px-2 py-1 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
-              >
-                {masks.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.layerCode || 'LVL'} · {m.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <button
-              type="button"
-              onClick={handleApplyToSingleMask}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors shadow-sm"
-            >
-              <Check className="w-3.5 h-3.5" />
-              <span>Generate Mask Apertures</span>
-            </button>
-
-            {mappedLayerCount > 0 && (
               <button
                 type="button"
-                onClick={handleApplyToAllMapped}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition-colors shadow-sm"
-                title="Generate apertures for every reticle linked to a GDS layer"
+                onClick={handleAddSectionCut}
+                className="flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-[11px] font-semibold transition-colors"
+                title="Add another section cut line (A-A', B-B', C-C', ...)"
               >
-                <ArrowRight className="w-3.5 h-3.5" />
-                <span>Apply All Mapped ({mappedLayerCount})</span>
+                <Plus className="w-3 h-3" />
+                <span>Add Cut ({getNextSectionLabel(sectionLines)})</span>
               </button>
-            )}
-          </div>
-        </div>
+            </div>
 
-        {/* 1D Live Cut Aperture Strip Preview */}
-        <div className="relative h-6 w-full rounded-lg bg-slate-950 border border-slate-800 overflow-hidden">
-          <div
-            className="absolute inset-0 opacity-35"
-            style={{
-              backgroundImage:
-                'repeating-linear-gradient(45deg, #1e293b 0, #1e293b 6px, #0f172a 6px, #0f172a 12px)',
-            }}
-          />
-          {/* Segmented cut bands when Concatenated */}
-          {previewSlice.isConcat &&
-            previewSlice.segments.map((seg, sIdx) => (
-              <div
-                key={`seg_band_${seg.section.id}_${sIdx}`}
-                className="absolute top-0 bottom-0 border-x border-slate-700/80 pointer-events-none flex items-start px-1"
-                style={{
-                  left: `${seg.startPct}%`,
-                  width: `${seg.widthPct}%`,
-                  backgroundColor: `${seg.section.color || '#fbbf24'}12`,
-                }}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={sectionLines.length === 0}
+                onClick={handleToggleConcat}
+                className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md border text-[11px] font-semibold transition-colors disabled:opacity-40 disabled:pointer-events-none ${
+                  concatConfig.enabled
+                    ? 'bg-indigo-600 border-indigo-400 text-white shadow-sm'
+                    : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500'
+                }`}
+                title="Concatenate multiple section cuts into a single combined mask aperture"
               >
-                <span
-                  className="text-[8px] font-mono font-bold leading-tight opacity-85"
-                  style={{ color: seg.section.color || '#fbbf24' }}
-                >
-                  {seg.section.label}
+                <Link2 className="w-3 h-3" />
+                <span>Concatenate Cuts</span>
+              </button>
+              <span className="hidden lg:inline text-[10px] text-slate-500">
+                Drag any cut line or endpoint on the canvas
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowCutPanel(false)}
+                className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition-colors"
+                title="Hide Section Cuts panel"
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Concatenation Order & Separation Bar (visible when Concatenate Cuts is ON) */}
+          {concatConfig.enabled && sectionLines.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-indigo-950/30 border border-indigo-500/35 text-[11px]">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[10px] uppercase tracking-wider font-semibold text-indigo-300 mr-1">
+                  Order:
+                </span>
+
+                {orderedConcatSections.map((cut, idx) => {
+                  const cutColor = cut.color || SECTION_LINE_COLORS[idx % SECTION_LINE_COLORS.length];
+                  return (
+                    <React.Fragment key={`cat_${cut.id}`}>
+                      <div
+                        draggable
+                        onDragStart={() => setDraggingConcatId(cut.id)}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={() => handleReorderConcatDrop(cut.id)}
+                        onDragEnd={() => setDraggingConcatId(null)}
+                        className={`flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border font-mono text-[11px] cursor-grab active:cursor-grabbing ${
+                          draggingConcatId === cut.id
+                            ? 'border-indigo-400 opacity-60'
+                            : 'border-slate-700 text-slate-200'
+                        }`}
+                        title="Drag or use arrows to change concatenation order"
+                      >
+                        <span className="text-[9px] text-slate-500">{idx + 1}.</span>
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: cutColor }}
+                        />
+                        <span className="font-semibold">{cut.label}</span>
+                        <button
+                          type="button"
+                          disabled={idx === 0}
+                          onClick={() => handleMoveConcatOrder(cut.id, -1)}
+                          className="p-0.5 text-slate-400 hover:text-white disabled:opacity-25"
+                          title="Move earlier"
+                        >
+                          <ChevronLeft className="w-3 h-3" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={idx === orderedConcatSections.length - 1}
+                          onClick={() => handleMoveConcatOrder(cut.id, 1)}
+                          className="p-0.5 text-slate-400 hover:text-white disabled:opacity-25"
+                          title="Move later"
+                        >
+                          <ChevronRight className="w-3 h-3" />
+                        </button>
+                        {orderedConcatSections.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateConcatConfig({
+                                ...concatConfig,
+                                sectionIds: concatConfig.sectionIds.filter((x) => x !== cut.id),
+                              })
+                            }
+                            className="text-slate-500 hover:text-rose-400 pl-0.5 leading-none"
+                            title={`Exclude ${cut.label}`}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      {idx < orderedConcatSections.length - 1 && (
+                        <span className="text-[10px] font-mono text-indigo-400/80">→</span>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+
+                {excludedConcatSections.map((cut) => (
+                  <button
+                    key={`add_cat_${cut.id}`}
+                    type="button"
+                    onClick={() =>
+                      updateConcatConfig({
+                        ...concatConfig,
+                        sectionIds: [...concatConfig.sectionIds, cut.id],
+                      })
+                    }
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-dashed border-slate-700 hover:border-indigo-400 text-slate-400 hover:text-indigo-300 font-mono text-[10px] transition-colors"
+                    title={`Include ${cut.label} in concatenation`}
+                  >
+                    <Plus className="w-2.5 h-2.5" />
+                    <span>{cut.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Separation Space between cuts */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-400 text-[10px]">Separation Gap:</span>
+                <NmNumberInput
+                  value={concatConfig.gapNm}
+                  min={0}
+                  max={500000}
+                  step={100}
+                  onChange={(gapNm) =>
+                    updateConcatConfig({
+                      ...concatConfig,
+                      gapNm: Math.max(0, gapNm),
+                    })
+                  }
+                  className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-indigo-300 focus:outline-none focus:border-indigo-400"
+                />
+                <span className="text-slate-500 font-mono text-[10px]">
+                  nm ({(concatConfig.gapNm / 1000).toFixed(2)} µm)
                 </span>
               </div>
-            ))}
+            </div>
+          )}
 
-          {previewSlice.windows.map((w, idx) => {
-            const totalSpan = sectionLine.resizeWaferToCut
-              ? Math.max(1, previewSlice.cutLength)
-              : waferWidth;
-            const leftPct = (w.xStart / totalSpan) * 100;
-            const widthPct = ((w.xEnd - w.xStart) / totalSpan) * 100;
-            return (
-              <div
-                key={`prev_${idx}`}
-                className="absolute top-1 bottom-0.5 rounded flex items-center justify-center text-[9px] font-mono font-bold text-white"
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span
+                className="font-semibold flex items-center gap-1"
                 style={{
-                  left: `${leftPct}%`,
-                  width: `${Math.max(0.8, widthPct)}%`,
-                  backgroundColor: activeLayerInfo?.color || '#38bdf8',
+                  color: !sectionLine
+                    ? '#64748b'
+                    : previewSlice.isConcat
+                    ? '#a5b4fc'
+                    : sectionLine.color || '#fbbf24',
                 }}
               >
-                {widthPct > 8 ? `${((w.xEnd - w.xStart) / 1000).toFixed(2)}µm` : ''}
+                <span>
+                  {!sectionLine
+                    ? 'No Active Cut'
+                    : previewSlice.isConcat
+                    ? `Concat (${orderedConcatSections.map((s) => s.label).join(' + ')})`
+                    : `Active Cut ${sectionLine.label}`}
+                </span>
+              </span>
+              <span className="text-[11px] font-mono text-slate-400">
+                {previewSlice.isConcat ? 'Total:' : 'Length:'}{' '}
+                {(previewSlice.cutLength / 1000).toFixed(2)} µm
+              </span>
+              <span className="text-[11px] font-mono text-sky-300">
+                · Layer {activeLayerNum}: {previewSlice.windows.length} aperture(s)
+              </span>
+
+              <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer ml-2">
+                <input
+                  type="checkbox"
+                  disabled={!sectionLine}
+                  checked={Boolean(sectionLine?.resizeWaferToCut)}
+                  onChange={(e) =>
+                    sectionLine &&
+                    updateSingleSection({
+                      ...sectionLine,
+                      resizeWaferToCut: e.target.checked,
+                    })
+                  }
+                  className="rounded bg-slate-800 border-slate-700 text-amber-500 focus:ring-0 disabled:opacity-40"
+                />
+                <span>
+                  1:1 Scale (Resize wafer width to {previewSlice.isConcat ? 'total' : 'cut'} length)
+                </span>
+              </label>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Single-layer Target + Generate Mask Apertures grouped together */}
+              <div
+                className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950/90 border border-sky-500/35 text-[11px]"
+                title={`Target reticle applies ONLY to Generate Mask Apertures (slices active GDS Layer ${activeLayerNum})`}
+              >
+                <span className="font-mono text-sky-300 font-semibold shrink-0">
+                  L{activeLayerNum} Target:
+                </span>
+                <select
+                  value={targetMaskId}
+                  onChange={(e) => setTargetMaskId(e.target.value)}
+                  disabled={masks.length === 0}
+                  className="max-w-[165px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500 truncate"
+                >
+                  {masks.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.layerCode || 'LVL'} · {m.name}
+                    </option>
+                  ))}
+                </select>
+
+                <button
+                  type="button"
+                  disabled={!sectionLine || masks.length === 0}
+                  onClick={handleApplyToSingleMask}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:pointer-events-none text-white text-xs font-semibold transition-colors shadow-sm shrink-0"
+                  title={`Slice active GDS Layer ${activeLayerNum} into the selected Target mask`}
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Generate Mask Apertures</span>
+                </button>
               </div>
-            );
-          })}
+
+              {mappedLayerCount > 0 && (
+                <button
+                  type="button"
+                  disabled={!sectionLine}
+                  onClick={handleApplyToAllMapped}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 disabled:pointer-events-none text-white text-xs font-semibold transition-colors shadow-sm"
+                  title="Batch-slice every GDS layer using its assigned → Reticle in the GDS Layers panel (ignores single-layer Target)"
+                >
+                  <ArrowRight className="w-3.5 h-3.5" />
+                  <span>Apply All Mapped ({mappedLayerCount})</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setShowMappingHelp(true)}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 hover:text-amber-200 border border-slate-700 transition-colors"
+                title="How GDS Layer → Mask Level assignment & Target work"
+              >
+                <HelpCircle className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* 1D Live Cut Aperture Strip Preview */}
+          <div className="relative h-5 w-full rounded-lg bg-slate-950 border border-slate-800 overflow-hidden">
+            <div
+              className="absolute inset-0 opacity-35"
+              style={{
+                backgroundImage:
+                  'repeating-linear-gradient(45deg, #1e293b 0, #1e293b 6px, #0f172a 6px, #0f172a 12px)',
+              }}
+            />
+            {/* Segmented cut bands when Concatenated */}
+            {previewSlice.isConcat &&
+              previewSlice.segments.map((seg, sIdx) => (
+                <div
+                  key={`seg_band_${seg.section.id}_${sIdx}`}
+                  className="absolute top-0 bottom-0 border-x border-slate-700/80 pointer-events-none flex items-start px-1"
+                  style={{
+                    left: `${seg.startPct}%`,
+                    width: `${seg.widthPct}%`,
+                    backgroundColor: `${seg.section.color || '#fbbf24'}12`,
+                  }}
+                >
+                  <span
+                    className="text-[8px] font-mono font-bold leading-tight opacity-85"
+                    style={{ color: seg.section.color || '#fbbf24' }}
+                  >
+                    {seg.section.label}
+                  </span>
+                </div>
+              ))}
+
+            {previewSlice.windows.map((w, idx) => {
+              const totalSpan = sectionLine?.resizeWaferToCut
+                ? Math.max(1, previewSlice.cutLength)
+                : waferWidth;
+              const leftPct = (w.xStart / totalSpan) * 100;
+              const widthPct = ((w.xEnd - w.xStart) / totalSpan) * 100;
+              return (
+                <div
+                  key={`prev_${idx}`}
+                  className="absolute top-1 bottom-0.5 rounded flex items-center justify-center text-[9px] font-mono font-bold text-white"
+                  style={{
+                    left: `${leftPct}%`,
+                    width: `${Math.max(0.8, widthPct)}%`,
+                    backgroundColor: activeLayerInfo?.color || '#38bdf8',
+                  }}
+                >
+                  {widthPct > 8 ? `${((w.xEnd - w.xStart) / 1000).toFixed(2)}µm` : ''}
+                </div>
+              );
+            })}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* GDS Layer -> Mask Level Assignment Help Modal */}
+      {showMappingHelp && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/75 backdrop-blur-xs"
+          onClick={() => setShowMappingHelp(false)}
+        >
+          <div
+            className="w-full max-w-lg rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl overflow-hidden text-slate-200"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <HelpCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                <h3 className="text-sm font-bold text-white">
+                  GDS Layer → Mask Level Assignment Guide
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMappingHelp(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                title="Close Help"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 text-xs leading-relaxed max-h-[75dvh] overflow-y-auto">
+              <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1">
+                <div className="font-semibold text-white flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-sky-400" />
+                  <span>1. Linking GDS Layers to Reticles</span>
+                </div>
+                <p className="text-slate-300">
+                  In the <strong className="text-slate-100">GDS Layers</strong> panel, each layer card has a{' '}
+                  <span className="font-mono text-sky-300">→ Reticle</span> dropdown linking that 2D layer to a
+                  photomask level in your process flow.
+                </p>
+                <ul className="list-disc pl-4 text-slate-400 space-y-0.5">
+                  <li>
+                    <strong className="text-slate-200">Import .GDS / Example GDS:</strong> Layers are automatically paired in order with existing masks.
+                  </li>
+                  <li>
+                    <strong className="text-slate-200">Auto-Create Reticles:</strong> If unmapped layers contain shapes, click{' '}
+                    <span className="text-indigo-300 font-medium">+ Auto-Create Reticle(s)</span> below the layer list to create and link new reticles automatically.
+                  </li>
+                </ul>
+              </div>
+
+              <div className="p-3 rounded-xl bg-sky-950/25 border border-sky-500/35 space-y-1">
+                <div className="font-semibold text-sky-300 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>2. Single-Layer Mode: L{activeLayerNum} Target + Generate Mask Apertures</span>
+                </div>
+                <p className="text-slate-300">
+                  The <strong className="text-sky-200">L{activeLayerNum} Target</strong> dropdown applies{' '}
+                  <strong className="text-white">only</strong> to <strong className="text-sky-200">Generate Mask Apertures</strong>.
+                  It slices only the currently selected GDS layer along the active section cut (or concatenated cuts) and writes
+                  the apertures to that chosen Target reticle — even if the layer is unmapped.
+                </p>
+              </div>
+
+              <div className="p-3 rounded-xl bg-amber-950/25 border border-amber-500/35 space-y-1">
+                <div className="font-semibold text-amber-300 flex items-center gap-1.5">
+                  <ArrowRight className="w-3.5 h-3.5" />
+                  <span>3. Batch Mode: Apply All Mapped ({mappedLayerCount})</span>
+                </div>
+                <p className="text-slate-300">
+                  <strong className="text-amber-200">Apply All Mapped</strong> ignores the single-layer{' '}
+                  <span className="font-mono text-slate-200">Target</span> dropdown. Instead, it slices{' '}
+                  <strong className="text-white">every GDS layer that has a → Reticle assignment</strong> in the GDS Layers
+                  panel and updates all linked masks simultaneously.
+                </p>
+              </div>
+
+              <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400">
+                <strong className="text-slate-200">Tip — 1:1 Scale:</strong> Check{' '}
+                <strong className="text-slate-200">1:1 Scale</strong> to preserve exact cut distances in nanometers (resizing the
+                wafer width to match the cut length). Leave it unchecked to scale the cut span to your current wafer width.
+              </div>
+            </div>
+
+            <div className="px-4 py-2.5 bg-slate-950/80 border-t border-slate-800 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowMappingHelp(false)}
+                className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold"
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
