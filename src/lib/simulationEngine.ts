@@ -12,8 +12,11 @@ import {
   RenderedPolygon,
   MaterialSegment,
   ScallopWall,
+  MountedTapeFrame,
+  EtchRecipe,
 } from '../types/microfab';
-import { getMaterialById, resolveResistMaterialId } from './materials';
+import { getMaterialById, resolveResistMaterialId, CARRIER_TAPE_IDS } from './materials';
+import { getEtchRecipeById, getEtchRateNmMin } from './etchRates';
 
 const DEFAULT_SAMPLE_COLUMNS = 300;
 
@@ -81,6 +84,7 @@ function simulateCrossSectionInternal(
 
   const stepSummaries: { stepId: string; stepIndex: number; title: string }[] = [];
   const scallopWalls: ScallopWall[] = [];
+  const activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[] = [];
 
   for (let idx = 0; idx <= maxIdx; idx++) {
     const step = enabledSteps[idx];
@@ -89,7 +93,42 @@ function simulateCrossSectionInternal(
       stepIndex: idx,
       title: step.title,
     });
-    applyStep(columns, step, flow.materials, width, recursionDepth, scallopWalls);
+    applyStep(
+      columns,
+      step,
+      flow.materials,
+      width,
+      recursionDepth,
+      scallopWalls,
+      activeFrames,
+      flow.etchLibrary
+    );
+  }
+
+  // Resolve surviving mounted tape frame edge geometry for canvas bracket rendering
+  const mountedFrames: MountedTapeFrame[] = [];
+  if (columns.length > 0 && activeFrames.length > 0) {
+    const leftSegs = columns[0].segments;
+    const rightSegs = columns[columns.length - 1].segments;
+    for (const frame of activeFrames) {
+      const matchLeft =
+        frame.side === 'back'
+          ? leftSegs.find((s) => s.materialId === frame.materialId)
+          : [...leftSegs].reverse().find((s) => s.materialId === frame.materialId);
+      const matchRight =
+        frame.side === 'back'
+          ? rightSegs.find((s) => s.materialId === frame.materialId)
+          : [...rightSegs].reverse().find((s) => s.materialId === frame.materialId);
+      const refSeg = matchLeft || matchRight;
+      if (refSeg) {
+        mountedFrames.push({
+          side: frame.side,
+          yBottom: refSeg.yBottom,
+          yTop: refSeg.yTop,
+          materialId: frame.materialId,
+        });
+      }
+    }
   }
 
   // Calculate bounding box from actual remaining geometry
@@ -113,6 +152,7 @@ function simulateCrossSectionInternal(
     columns,
     stepSummaries,
     scallopWalls,
+    mountedFrames: mountedFrames.length > 0 ? mountedFrames : undefined,
   };
 }
 
@@ -125,7 +165,9 @@ function applyStep(
   materials: Material[],
   totalWidth: number,
   recursionDepth: number = 0,
-  scallopWalls: ScallopWall[] = []
+  scallopWalls: ScallopWall[] = [],
+  activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[] = [],
+  etchLibrary?: EtchRecipe[]
 ): void {
   const side = step.side || 'front';
 
@@ -150,10 +192,10 @@ function applyStep(
 
     case 'deposition': {
       if (side === 'front' || side === 'both') {
-        applyDepositionSide(columns, step, totalWidth, 'front');
+        applyDepositionSide(columns, step, materials, totalWidth, 'front');
       }
       if (side === 'back' || side === 'both') {
-        applyDepositionSide(columns, step, totalWidth, 'back');
+        applyDepositionSide(columns, step, materials, totalWidth, 'back');
       }
       break;
     }
@@ -170,10 +212,10 @@ function applyStep(
 
     case 'etch': {
       if (side === 'front' || side === 'both') {
-        applyEtchSide(columns, step, materials, totalWidth, 'front', scallopWalls);
+        applyEtchSide(columns, step, materials, totalWidth, 'front', scallopWalls, etchLibrary);
       }
       if (side === 'back' || side === 'both') {
-        applyEtchSide(columns, step, materials, totalWidth, 'back', scallopWalls);
+        applyEtchSide(columns, step, materials, totalWidth, 'back', scallopWalls, etchLibrary);
       }
       break;
     }
@@ -203,16 +245,32 @@ function applyStep(
       applyBonding(columns, step, totalWidth, recursionDepth);
       break;
     }
+
+    case 'dicing': {
+      if (side === 'front' || side === 'both') {
+        applyDicingSide(columns, step, totalWidth, 'front');
+      }
+      if (side === 'back' || side === 'both') {
+        applyDicingSide(columns, step, totalWidth, 'back');
+      }
+      break;
+    }
+
+    case 'tape-frame': {
+      applyTapeFrame(columns, step, totalWidth, activeFrames);
+      break;
+    }
   }
 }
 
 /**
  * Handles layer deposition on either the frontside (top) or backside (bottom):
- * Conformal, Directional, Semi-conformal, Spin-coat
+ * Conformal, Directional, Semi-conformal, Spin-coat, and Bottom-up / Selective Plating
  */
 function applyDepositionSide(
   columns: ColumnProfile[],
   step: ProcessStep,
+  materials: Material[],
   totalWidth: number,
   targetSide: 'front' | 'back'
 ): void {
@@ -223,24 +281,83 @@ function applyDepositionSide(
 
   if (thickness <= 0) return;
 
-  if (targetSide === 'front') {
-    if (depType === 'spin-coat') {
-      let maxTop = -Infinity;
-      for (const col of columns) {
-        if (col.segments.length === 0) continue;
-        const top = getTopY(col);
-        if (top > maxTop) maxTop = top;
-      }
-      if (maxTop === -Infinity) return;
-      const targetTop = maxTop + thickness;
+  const isPlatingMethod =
+    cfg?.method === 'Electroplating' || cfg?.method === 'Electroless Plating';
+  const selectivePlating = Boolean(cfg?.platingSelective) && isPlatingMethod;
+  const seedScope = cfg?.platingSeedScope ?? 'conductive';
+  const matCategoryById = new Map(materials.map((m) => [m.id, m.category]));
 
+  const isSeedColumn = (col: ColumnProfile): boolean => {
+    if (col.segments.length === 0) return false;
+    if (!selectivePlating) return true;
+    const exposedSeg =
+      targetSide === 'front' ? col.segments[col.segments.length - 1] : col.segments[0];
+    const cat = matCategoryById.get(exposedSeg.materialId);
+    if (!cat) return false;
+    if (seedScope === 'metal-only') {
+      return cat === 'metal';
+    }
+    return cat === 'metal' || cat === 'semiconductor' || cat === 'substrate';
+  };
+
+  if (targetSide === 'front') {
+    if (depType === 'bottom-up') {
       for (const col of columns) {
-        if (col.segments.length === 0) continue;
+        if (!isSeedColumn(col)) continue;
         const currentTop = getTopY(col);
-        if (targetTop > currentTop) {
+        col.segments.push({
+          yBottom: currentTop,
+          yTop: currentTop + thickness,
+          materialId: matId,
+          stepId: step.id,
+          side: 'front',
+        });
+      }
+      return;
+    }
+
+    if (depType === 'dry-film') {
+      const sag = cfg?.laminationSag ?? 0;
+      const { yBottom, yTop } = computeDryFilmProfile(
+        columns,
+        totalWidth,
+        'front',
+        thickness,
+        sag
+      );
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        if (col.segments.length === 0) continue;
+        if (yTop[i] > yBottom[i]) {
+          col.segments.push({
+            yBottom: yBottom[i],
+            yTop: yTop[i],
+            materialId: matId,
+            stepId: step.id,
+            side: 'front',
+          });
+        }
+      }
+      return;
+    }
+
+    if (depType === 'spin-coat') {
+      const planarization = cfg?.planarization ?? 100;
+      const targetTops = computeSpinCoatSurface(
+        columns,
+        totalWidth,
+        'front',
+        thickness,
+        planarization
+      );
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        if (!isSeedColumn(col)) continue;
+        const currentTop = getTopY(col);
+        if (targetTops[i] > currentTop) {
           col.segments.push({
             yBottom: currentTop,
-            yTop: targetTop,
+            yTop: targetTops[i],
             materialId: matId,
             stepId: step.id,
             side: 'front',
@@ -365,7 +482,7 @@ function applyDepositionSide(
       }
 
       for (let i = 0; i < n; i++) {
-        if (!hasCol[i]) continue;
+        if (!hasCol[i] || !isSeedColumn(columns[i])) continue;
         if (newBottoms[i] < Infinity && newTops[i] > newBottoms[i]) {
           columns[i].segments.push({
             yBottom: newBottoms[i],
@@ -395,11 +512,17 @@ function applyDepositionSide(
     const baseTops = new Float64Array(columns.length);
     const newTops = new Float64Array(columns.length);
 
+    const isSeed = columns.map((col) => isSeedColumn(col));
     for (let i = 0; i < columns.length; i++) {
       const col = columns[i];
       if (col.segments.length === 0) continue;
       const topY = getTopY(col);
       baseTops[i] = topY;
+
+      if (!isSeed[i]) {
+        newTops[i] = topY;
+        continue;
+      }
 
       const cFactor = cornerFactors ? cornerFactors[i] : 0;
       const verticalThick = thickness * (1 + cornerBoostStrength * cFactor);
@@ -410,7 +533,7 @@ function applyDepositionSide(
     // Top surface stays at 100% vertical thickness; sidewall step coverage scales ONLY lateral thickness (Tx).
     if (stepCoverage > 0) {
       for (let i = 0; i < columns.length; i++) {
-        if (columns[i].segments.length === 0) continue;
+        if (columns[i].segments.length === 0 || !isSeed[i]) continue;
         const cFactor = cornerFactors ? cornerFactors[i] : 0;
         const tz = thickness * (1 + cornerBoostStrength * cFactor);
         const tx = tz * stepCoverage;
@@ -421,7 +544,7 @@ function applyDepositionSide(
         const endJ = Math.min(columns.length - 1, i + colRadius);
 
         for (let j = startJ; j <= endJ; j++) {
-          if (j === i || columns[j].segments.length === 0) continue;
+          if (j === i || columns[j].segments.length === 0 || !isSeed[j]) continue;
           // Only dilate laterally across step sidewalls where neighbor surface is lower
           if (baseTops[j] >= baseTops[i]) continue;
 
@@ -463,22 +586,62 @@ function applyDepositionSide(
   }
 
   // Backside deposition (grows downward from yBottom of lowest segment)
-  if (depType === 'spin-coat') {
-    let minBottom = Infinity;
+  if (depType === 'bottom-up') {
     for (const col of columns) {
-      if (col.segments.length === 0) continue;
-      const bot = getBottomY(col);
-      if (bot < minBottom) minBottom = bot;
-    }
-    if (minBottom === Infinity) return;
-    const targetBottom = minBottom - thickness;
-
-    for (const col of columns) {
-      if (col.segments.length === 0) continue;
+      if (!isSeedColumn(col)) continue;
       const currentBottom = getBottomY(col);
-      if (targetBottom < currentBottom) {
+      col.segments.unshift({
+        yBottom: currentBottom - thickness,
+        yTop: currentBottom,
+        materialId: matId,
+        stepId: step.id,
+        side: 'back',
+      });
+    }
+    return;
+  }
+
+  if (depType === 'dry-film') {
+    const sag = cfg?.laminationSag ?? 0;
+    const { yBottom, yTop } = computeDryFilmProfile(
+      columns,
+      totalWidth,
+      'back',
+      thickness,
+      sag
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (col.segments.length === 0) continue;
+      if (yTop[i] > yBottom[i]) {
         col.segments.unshift({
-          yBottom: targetBottom,
+          yBottom: yBottom[i],
+          yTop: yTop[i],
+          materialId: matId,
+          stepId: step.id,
+          side: 'back',
+        });
+      }
+    }
+    return;
+  }
+
+  if (depType === 'spin-coat') {
+    const planarization = cfg?.planarization ?? 100;
+    const targetBottoms = computeSpinCoatSurface(
+      columns,
+      totalWidth,
+      'back',
+      thickness,
+      planarization
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (!isSeedColumn(col)) continue;
+      const currentBottom = getBottomY(col);
+      if (targetBottoms[i] < currentBottom) {
+        col.segments.unshift({
+          yBottom: targetBottoms[i],
           yTop: currentBottom,
           materialId: matId,
           stepId: step.id,
@@ -601,7 +764,7 @@ function applyDepositionSide(
     }
 
     for (let i = 0; i < n; i++) {
-      if (!hasCol[i]) continue;
+      if (!hasCol[i] || !isSeedColumn(columns[i])) continue;
       if (newTops[i] > -Infinity && newTops[i] > newBottoms[i]) {
         columns[i].segments.unshift({
           yBottom: newBottoms[i],
@@ -631,11 +794,17 @@ function applyDepositionSide(
   const baseBottoms = new Float64Array(columns.length);
   const newBottoms = new Float64Array(columns.length);
 
+  const isSeedBack = columns.map((col) => isSeedColumn(col));
   for (let i = 0; i < columns.length; i++) {
     const col = columns[i];
     if (col.segments.length === 0) continue;
     const bottomY = getBottomY(col);
     baseBottoms[i] = bottomY;
+
+    if (!isSeedBack[i]) {
+      newBottoms[i] = bottomY;
+      continue;
+    }
 
     const cFactor = cornerFactors ? cornerFactors[i] : 0;
     const verticalThick = thickness * (1 + cornerBoostStrength * cFactor);
@@ -644,7 +813,7 @@ function applyDepositionSide(
 
   if (stepCoverage > 0) {
     for (let i = 0; i < columns.length; i++) {
-      if (columns[i].segments.length === 0) continue;
+      if (columns[i].segments.length === 0 || !isSeedBack[i]) continue;
       const cFactor = cornerFactors ? cornerFactors[i] : 0;
       const tz = thickness * (1 + cornerBoostStrength * cFactor);
       const tx = tz * stepCoverage;
@@ -655,7 +824,7 @@ function applyDepositionSide(
       const endJ = Math.min(columns.length - 1, i + colRadius);
 
       for (let j = startJ; j <= endJ; j++) {
-        if (j === i || columns[j].segments.length === 0) continue;
+        if (j === i || columns[j].segments.length === 0 || !isSeedBack[j]) continue;
         if (baseBottoms[j] <= baseBottoms[i]) continue;
 
         const distX = (Math.abs(j - i) - 0.5) * dx;
@@ -710,48 +879,79 @@ function applyLithographySide(
   const windows = cfg?.windows ?? [];
   const sidewallAngle = cfg?.sidewallAngle ?? 90;
 
-  // 1. Spin-coat resist
-  if (targetSide === 'front') {
-    let maxTop = -Infinity;
-    for (const col of columns) {
-      if (col.segments.length === 0) continue;
-      const top = getTopY(col);
-      if (top > maxTop) maxTop = top;
-    }
-    if (maxTop === -Infinity) return;
-    const resistTop = maxTop + resistThickness;
+  const coatMethod = cfg?.coatMethod ?? 'spin-coat';
 
-    for (const col of columns) {
+  // 1. Apply photoresist (Spin-coat planarizing fill OR Dry Film Lamination tenting sheet)
+  if (coatMethod === 'dry-film') {
+    const sag = cfg?.laminationSag ?? 0;
+    const { yBottom, yTop } = computeDryFilmProfile(
+      columns,
+      _totalWidth,
+      targetSide,
+      resistThickness,
+      sag
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (col.segments.length === 0 || yTop[i] <= yBottom[i]) continue;
+      const seg: MaterialSegment = {
+        yBottom: yBottom[i],
+        yTop: yTop[i],
+        materialId: resistMatId,
+        stepId: step.id,
+        side: targetSide,
+      };
+      if (targetSide === 'front') {
+        col.segments.push(seg);
+      } else {
+        col.segments.unshift(seg);
+      }
+    }
+  } else if (targetSide === 'front') {
+    const planarization = cfg?.planarization ?? 100;
+    const resistTops = computeSpinCoatSurface(
+      columns,
+      _totalWidth,
+      'front',
+      resistThickness,
+      planarization
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
       if (col.segments.length === 0) continue;
       const currentTop = getTopY(col);
-      col.segments.push({
-        yBottom: currentTop,
-        yTop: resistTop,
-        materialId: resistMatId,
-        stepId: step.id,
-        side: 'front',
-      });
+      if (resistTops[i] > currentTop) {
+        col.segments.push({
+          yBottom: currentTop,
+          yTop: resistTops[i],
+          materialId: resistMatId,
+          stepId: step.id,
+          side: 'front',
+        });
+      }
     }
   } else {
-    let minBottom = Infinity;
-    for (const col of columns) {
-      if (col.segments.length === 0) continue;
-      const bot = getBottomY(col);
-      if (bot < minBottom) minBottom = bot;
-    }
-    if (minBottom === Infinity) return;
-    const resistBottom = minBottom - resistThickness;
-
-    for (const col of columns) {
+    const planarization = cfg?.planarization ?? 100;
+    const resistBottoms = computeSpinCoatSurface(
+      columns,
+      _totalWidth,
+      'back',
+      resistThickness,
+      planarization
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
       if (col.segments.length === 0) continue;
       const currentBottom = getBottomY(col);
-      col.segments.unshift({
-        yBottom: resistBottom,
-        yTop: currentBottom,
-        materialId: resistMatId,
-        stepId: step.id,
-        side: 'back',
-      });
+      if (resistBottoms[i] < currentBottom) {
+        col.segments.unshift({
+          yBottom: resistBottoms[i],
+          yTop: currentBottom,
+          materialId: resistMatId,
+          stepId: step.id,
+          side: 'back',
+        });
+      }
     }
   }
 
@@ -907,9 +1107,17 @@ function applyEtchSide(
   materials: Material[],
   totalWidth: number,
   targetSide: 'front' | 'back',
-  scallopWalls?: ScallopWall[]
+  scallopWalls?: ScallopWall[],
+  etchLibrary?: EtchRecipe[]
 ): void {
   const cfg = step.etch;
+  const linkedRecipe = cfg?.etchRecipeId
+    ? getEtchRecipeById(etchLibrary, cfg.etchRecipeId)
+    : undefined;
+  const activeRecipe =
+    cfg?.rateMode === 'time-rate' && linkedRecipe ? linkedRecipe : undefined;
+  const isRateDriven = Boolean(activeRecipe);
+  const etchTimeMin = Math.max(0.001, (cfg?.etchTimeSec ?? 60) / 60);
   const depth = cfg?.depth ?? step.thickness ?? 200;
   const targetMatId = cfg?.targetMaterialId ?? 'all';
   const isotropy =
@@ -918,10 +1126,21 @@ function applyEtchSide(
   const sidewallAngle = cfg?.sidewallAngle ?? 90;
   const dx = totalWidth / columns.length;
 
-  if (depth <= 0) return;
+  if (!isRateDriven && depth <= 0) return;
+  if (isRateDriven && etchTimeMin <= 0) return;
+
+  const maskEtchTimeMin = (() => {
+    if (!linkedRecipe) return 0;
+    if (isRateDriven) return etchTimeMin;
+    const refMatId =
+      targetMatId !== 'all' ? targetMatId : linkedRecipe.primaryMaterialId;
+    const refRate = getEtchRateNmMin(linkedRecipe, refMatId);
+    return refRate > 0 ? depth / refRate : 0;
+  })();
 
   // 1. Identify which columns have exposed target material at the active surface
   const isColumnExposed: boolean[] = new Array(columns.length).fill(false);
+  const wasProtectedResistCol = new Uint8Array(columns.length);
 
   for (let i = 0; i < columns.length; i++) {
     const col = columns[i];
@@ -932,19 +1151,85 @@ function applyEtchSide(
         : col.segments[0];
 
     const mat = getMaterialById(materials, surfaceSeg.materialId);
-    if (mat.category === 'photoresist' && cfg?.etchType !== 'ashing') {
+    const isProtectedResist =
+      mat.category === 'photoresist' &&
+      cfg?.etchType !== 'ashing' &&
+      targetMatId !== surfaceSeg.materialId;
+
+    if (isProtectedResist) {
       isColumnExposed[i] = false;
+      wasProtectedResistCol[i] = 1;
     } else if (targetMatId === 'all' || surfaceSeg.materialId === targetMatId) {
-      isColumnExposed[i] = true;
+      if (activeRecipe) {
+        isColumnExposed[i] =
+          getEtchRateNmMin(activeRecipe, surfaceSeg.materialId) > 0;
+      } else {
+        isColumnExposed[i] = true;
+      }
     }
   }
 
-  // 2. Nominal vertical etch depth per column (optionally modulated by ARDE / RIE Lag)
+  // 2. Nominal vertical etch depth per column (time-and-rate integrated when recipe-driven)
   const baseDepthPerCol = new Float64Array(columns.length);
+  let maxBaseDepth = 0;
   for (let i = 0; i < columns.length; i++) {
-    if (isColumnExposed[i]) {
+    if (!isColumnExposed[i]) continue;
+    if (!activeRecipe) {
       baseDepthPerCol[i] = depth;
+      if (depth > maxBaseDepth) maxBaseDepth = depth;
+      continue;
     }
+
+    const col = columns[i];
+    const orderedSegs =
+      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+    let remTime = etchTimeMin;
+    let accumDepth = 0;
+    for (const seg of orderedSegs) {
+      const mat = getMaterialById(materials, seg.materialId);
+      if (
+        mat.category === 'photoresist' &&
+        cfg?.etchType !== 'ashing' &&
+        targetMatId !== seg.materialId
+      ) {
+        break;
+      }
+      if (stopLayerId && seg.materialId === stopLayerId) break;
+      if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
+
+      const rate = getEtchRateNmMin(activeRecipe, seg.materialId);
+      if (rate <= 0) break;
+
+      const segH = seg.yTop - seg.yBottom;
+      const timeNeeded = segH / rate;
+      if (remTime >= timeNeeded) {
+        remTime -= timeNeeded;
+        accumDepth += segH;
+      } else {
+        accumDepth += remTime * rate;
+        remTime = 0;
+        break;
+      }
+    }
+    baseDepthPerCol[i] = accumDepth;
+    if (accumDepth > maxBaseDepth) maxBaseDepth = accumDepth;
+  }
+
+  const refDepthForScale = isRateDriven ? maxBaseDepth : depth;
+  if (refDepthForScale <= 0) {
+    if (linkedRecipe && maskEtchTimeMin > 0) {
+      applyPhotoresistMaskConsumption(
+        columns,
+        wasProtectedResistCol,
+        materials,
+        linkedRecipe,
+        maskEtchTimeMin,
+        targetSide,
+        targetMatId,
+        stopLayerId
+      );
+    }
+    return;
   }
 
   const isDryEtch = ['rie', 'drie-bosch', 'ion-beam', 'ashing'].includes(
@@ -1011,9 +1296,11 @@ function applyEtchSide(
           ? Math.max(0, avgShoulderY - avgFloorY)
           : Math.max(0, avgFloorY - avgShoulderY);
 
-      // Open-field dose needed for this feature to reach full requested etch `depth`
+      // Open-field dose needed for this feature to reach full reference etch depth
       const requiredDose =
-        depth + (kLag / effectiveWidth) * (preDepth * depth + (depth * depth) / 2);
+        refDepthForScale +
+        (kLag / effectiveWidth) *
+          (preDepth * refDepthForScale + (refDepthForScale * refDepthForScale) / 2);
 
       openings.push({
         runStart,
@@ -1025,7 +1312,7 @@ function applyEtchSide(
     }
 
     if (openings.length > 0) {
-      // Calibrate etch time/dose to the widest/deepest feature so it always reaches exact `depth`
+      // Calibrate etch time/dose to the widest/deepest feature so it always reaches exact `refDepthForScale`
       const calibratedDose = Math.min(...openings.map((o) => o.requiredDose));
 
       for (const op of openings) {
@@ -1033,9 +1320,12 @@ function applyEtchSide(
         const b = 1 + (kLag * op.preDepth) / op.effectiveWidth;
         const laggedDepth =
           (2 * calibratedDose) / (b + Math.sqrt(b * b + 4 * a * calibratedDose));
+        const lagRatio = Math.min(1, laggedDepth / Math.max(1e-6, refDepthForScale));
 
         for (let c = op.runStart; c <= op.runEnd; c++) {
-          baseDepthPerCol[c] = laggedDepth;
+          baseDepthPerCol[c] = isRateDriven
+            ? baseDepthPerCol[c] * lagRatio
+            : laggedDepth;
         }
       }
     }
@@ -1049,7 +1339,7 @@ function applyEtchSide(
       columns,
       totalWidth,
       targetSide,
-      depth
+      refDepthForScale
     );
     for (let i = 0; i < columns.length; i++) {
       if (isColumnExposed[i] && cornerFactors[i] > 0) {
@@ -1121,9 +1411,16 @@ function applyEtchSide(
 
     for (const seg of orderedSegments) {
       const mat = getMaterialById(materials, seg.materialId);
-      if (mat.category === 'photoresist' && cfg?.etchType !== 'ashing') break;
+      if (
+        mat.category === 'photoresist' &&
+        cfg?.etchType !== 'ashing' &&
+        targetMatId !== seg.materialId
+      ) {
+        break;
+      }
       if (stopLayerId && seg.materialId === stopLayerId) break;
       if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
+      if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) break;
 
       const segHeight = seg.yTop - seg.yBottom;
       if (remaining >= segHeight) {
@@ -1184,9 +1481,16 @@ function applyEtchSide(
       let maxReachedY = yAirI;
       for (const seg of orderedSegsI) {
         const mat = getMaterialById(materials, seg.materialId);
-        if (mat.category === 'photoresist' && cfg?.etchType !== 'ashing') break;
+        if (
+          mat.category === 'photoresist' &&
+          cfg?.etchType !== 'ashing' &&
+          targetMatId !== seg.materialId
+        ) {
+          break;
+        }
         if (stopLayerId && seg.materialId === stopLayerId) break;
         if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
+        if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) break;
         const h = seg.yTop - seg.yBottom;
         if (rem >= h) {
           rem -= h;
@@ -1316,7 +1620,7 @@ function applyEtchSide(
       const yAirI = targetSide === 'front' ? getTopY(colI) : getBottomY(colI);
       const vReachI = verticalEtchFloor[i];
       const localRz = Math.max(baseDepthPerCol[i], etchDepthPerCol[i]);
-      const effectiveRz = localRz > 0 ? localRz : depth;
+      const effectiveRz = localRz > 0 ? localRz : refDepthForScale;
       const effectiveRx = effectiveRz * isotropy;
       if (effectiveRx <= 0) continue;
 
@@ -1407,8 +1711,12 @@ function applyEtchSide(
     for (const seg of orderedSegments) {
       const mat = getMaterialById(materials, seg.materialId);
 
-      // Protect photoresist mask unless O2 plasma ashing
-      if (mat.category === 'photoresist' && cfg?.etchType !== 'ashing') {
+      // Protect photoresist mask unless O2 plasma ashing or explicitly targeting resist
+      if (
+        mat.category === 'photoresist' &&
+        cfg?.etchType !== 'ashing' &&
+        targetMatId !== seg.materialId
+      ) {
         processedSegments.push(seg);
         continue;
       }
@@ -1419,6 +1727,12 @@ function applyEtchSide(
           : seg.yBottom < ambientReach;
 
       if (stopLayerId && seg.materialId === stopLayerId) {
+        blockedBelow = true;
+        processedSegments.push(seg);
+        continue;
+      }
+
+      if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) {
         blockedBelow = true;
         processedSegments.push(seg);
         continue;
@@ -1715,6 +2029,113 @@ function applyEtchSide(
         }
       }
     }
+  }
+
+  // 7. Photoresist mask consumption (and optional burn-through) from linked Etch Rate Library recipe
+  if (linkedRecipe && maskEtchTimeMin > 0) {
+    applyPhotoresistMaskConsumption(
+      columns,
+      wasProtectedResistCol,
+      materials,
+      linkedRecipe,
+      maskEtchTimeMin,
+      targetSide,
+      targetMatId,
+      stopLayerId
+    );
+  }
+}
+
+function applyPhotoresistMaskConsumption(
+  columns: ColumnProfile[],
+  wasProtectedResistCol: Uint8Array,
+  materials: Material[],
+  recipe: EtchRecipe,
+  maskEtchTimeMin: number,
+  targetSide: 'front' | 'back',
+  targetMatId: string,
+  stopLayerId?: string
+): void {
+  if (maskEtchTimeMin <= 0) return;
+
+  for (let j = 0; j < columns.length; j++) {
+    if (!wasProtectedResistCol[j]) continue;
+    const col = columns[j];
+    if (col.segments.length === 0) continue;
+
+    const orderedSegments =
+      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+    const remainingSegments: MaterialSegment[] = [];
+    let remTime = maskEtchTimeMin;
+    let maskDepleted = false;
+
+    for (const seg of orderedSegments) {
+      if (remTime <= 0) {
+        remainingSegments.push(seg);
+        continue;
+      }
+
+      const mat = getMaterialById(materials, seg.materialId);
+      const isResist = mat.category === 'photoresist';
+
+      if (!maskDepleted && !isResist) {
+        remTime = 0;
+        remainingSegments.push(seg);
+        continue;
+      }
+
+      if (maskDepleted) {
+        if (stopLayerId && seg.materialId === stopLayerId) {
+          remTime = 0;
+          remainingSegments.push(seg);
+          continue;
+        }
+        if (targetMatId !== 'all' && seg.materialId !== targetMatId) {
+          remTime = 0;
+          remainingSegments.push(seg);
+          continue;
+        }
+      }
+
+      const rate = getEtchRateNmMin(recipe, seg.materialId);
+      if (rate <= 0) {
+        remTime = 0;
+        remainingSegments.push(seg);
+        continue;
+      }
+
+      const segH = seg.yTop - seg.yBottom;
+      if (segH <= 0) continue;
+      const timeToClear = segH / rate;
+
+      if (remTime >= timeToClear) {
+        remTime -= timeToClear;
+        if (isResist) {
+          maskDepleted = true;
+        }
+      } else {
+        const loss = remTime * rate;
+        remTime = 0;
+        if (targetSide === 'front') {
+          if (seg.yTop - loss > seg.yBottom + 0.5) {
+            remainingSegments.push({
+              ...seg,
+              yTop: seg.yTop - loss,
+            });
+          }
+        } else {
+          if (seg.yBottom + loss < seg.yTop - 0.5) {
+            remainingSegments.push({
+              ...seg,
+              yBottom: seg.yBottom + loss,
+            });
+          }
+        }
+      }
+    }
+
+    col.segments =
+      targetSide === 'front' ? remainingSegments.reverse() : remainingSegments;
   }
 }
 
@@ -2110,6 +2531,246 @@ function applyBonding(
       addedSegs.push(...topDownSegs.reverse());
       if (ifaceSeg) addedSegs.push(ifaceSeg);
       col.segments = [...addedSegs, ...col.segments];
+    }
+  }
+}
+
+/**
+ * Handles Tape & Frame mounting and UV-release / demounting.
+ */
+function applyTapeFrame(
+  columns: ColumnProfile[],
+  step: ProcessStep,
+  totalWidth: number,
+  activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[]
+): void {
+  const cfg = step.tapeFrame;
+  const action = cfg?.action ?? 'mount';
+  const rawSide = step.side || 'back';
+  const targetSide: 'front' | 'back' = rawSide === 'front' ? 'front' : 'back';
+  const matId = cfg?.tapeMaterialId || 'mat_dicing_tape';
+
+  if (action === 'demount') {
+    for (const col of columns) {
+      col.segments = col.segments.filter((seg) => {
+        const isTapeMat = CARRIER_TAPE_IDS.has(seg.materialId) || seg.materialId === matId;
+        if (!isTapeMat) return true;
+        if (rawSide === 'both') return false;
+        if (targetSide === 'front') return seg.side !== 'front';
+        return seg.side !== 'back';
+      });
+    }
+    for (let k = activeFrames.length - 1; k >= 0; k--) {
+      if (rawSide === 'both' || activeFrames[k].side === targetSide) {
+        activeFrames.splice(k, 1);
+      }
+    }
+    return;
+  }
+
+  // Mount tape onto substrate (with optional ring frame clamps)
+  const thickness = Math.max(10, cfg?.thickness ?? step.thickness ?? 600);
+  const conformality = cfg?.conformality ?? 'flat';
+
+  if (conformality === 'conformal') {
+    const { yBottom, yTop } = computeDryFilmProfile(
+      columns,
+      totalWidth,
+      targetSide,
+      thickness,
+      70
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (col.segments.length === 0 || yTop[i] <= yBottom[i]) continue;
+      const seg: MaterialSegment = {
+        yBottom: yBottom[i],
+        yTop: yTop[i],
+        materialId: matId,
+        stepId: step.id,
+        side: targetSide,
+      };
+      if (targetSide === 'front') col.segments.push(seg);
+      else col.segments.unshift(seg);
+    }
+  } else {
+    // Flat tensioned dicing frame tape: attaches across full width (bridging kerfs/cavities)
+    if (targetSide === 'back') {
+      let minBottom = Infinity;
+      for (const col of columns) {
+        if (col.segments.length === 0) continue;
+        const b = getBottomY(col);
+        if (b < minBottom) minBottom = b;
+      }
+      if (minBottom === Infinity) minBottom = 0;
+      for (const col of columns) {
+        col.segments.unshift({
+          yBottom: minBottom - thickness,
+          yTop: minBottom,
+          materialId: matId,
+          stepId: step.id,
+          side: 'back',
+        });
+      }
+    } else {
+      let maxTop = -Infinity;
+      for (const col of columns) {
+        if (col.segments.length === 0) continue;
+        const t = getTopY(col);
+        if (t > maxTop) maxTop = t;
+      }
+      if (maxTop === -Infinity) maxTop = 0;
+      for (const col of columns) {
+        col.segments.push({
+          yBottom: maxTop,
+          yTop: maxTop + thickness,
+          materialId: matId,
+          stepId: step.id,
+          side: 'front',
+        });
+      }
+    }
+  }
+
+  if (cfg?.showFrame !== false) {
+    // Replace any existing frame reference on the same side
+    for (let k = activeFrames.length - 1; k >= 0; k--) {
+      if (activeFrames[k].side === targetSide) activeFrames.splice(k, 1);
+    }
+    activeFrames.push({ stepId: step.id, side: targetSide, materialId: matId });
+  }
+}
+
+/**
+ * Handles Wafer Dicing (Blade Saw, Laser Ablation, Stealth, Plasma):
+ * - 'through-wafer': Cuts through all wafer/device/DAF layers, scoring into mounted carrier tape (or full cut if no tape)
+ * - 'partial-depth': Precision partial kerf cut / pre-groove (e.g. DBG / low-k laser grooving)
+ */
+function applyDicingSide(
+  columns: ColumnProfile[],
+  step: ProcessStep,
+  totalWidth: number,
+  targetSide: 'front' | 'back'
+): void {
+  const cfg = step.dicing;
+  const kerfWidth = Math.max(10, cfg?.kerfWidth ?? 400);
+  const halfKerf = kerfWidth / 2;
+  const cutMode = cfg?.cutMode ?? 'through-wafer';
+  const cutDepth = Math.max(10, cfg?.cutDepth ?? step.thickness ?? 1500);
+  const sidewallAngle = Math.max(55, Math.min(90, cfg?.sidewallAngle ?? 90));
+  const tapeOvercut = Math.max(0, cfg?.tapeOvercut ?? 120);
+  const streets =
+    cfg?.streets && cfg.streets.length > 0
+      ? cfg.streets
+      : [{ id: 'st_default', xCenter: totalWidth * 0.5 }];
+
+  const tanAngle =
+    sidewallAngle < 89.5 ? Math.tan((sidewallAngle * Math.PI) / 180) : Infinity;
+
+  const trimSegmentsFromTop = (col: ColumnProfile, cutPlaneY: number) => {
+    const nextSegs: MaterialSegment[] = [];
+    for (const seg of col.segments) {
+      if (seg.yBottom >= cutPlaneY) continue;
+      if (seg.yTop > cutPlaneY) {
+        nextSegs.push({ ...seg, yTop: cutPlaneY });
+      } else {
+        nextSegs.push(seg);
+      }
+    }
+    col.segments = nextSegs;
+  };
+
+  const trimSegmentsFromBottom = (col: ColumnProfile, cutPlaneY: number) => {
+    const nextSegs: MaterialSegment[] = [];
+    for (const seg of col.segments) {
+      if (seg.yTop <= cutPlaneY) continue;
+      if (seg.yBottom < cutPlaneY) {
+        nextSegs.push({ ...seg, yBottom: cutPlaneY });
+      } else {
+        nextSegs.push(seg);
+      }
+    }
+    col.segments = nextSegs;
+  };
+
+  for (const col of columns) {
+    if (col.segments.length === 0) continue;
+
+    let minDist = Infinity;
+    for (const st of streets) {
+      const d = Math.abs(col.x - st.xCenter);
+      if (d < minDist) minDist = d;
+    }
+    if (minDist > halfKerf) continue;
+
+    const lateralInset = Math.max(0, halfKerf - minDist);
+    const taperMaxDepth =
+      tanAngle < Infinity ? lateralInset * tanAngle : Infinity;
+
+    const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
+
+    if (cutMode === 'partial-depth') {
+      const effectiveDepth = Math.min(cutDepth, taperMaxDepth);
+      if (effectiveDepth <= 0) continue;
+      if (targetSide === 'front') {
+        trimSegmentsFromTop(col, surfaceY - effectiveDepth);
+      } else {
+        trimSegmentsFromBottom(col, surfaceY + effectiveDepth);
+      }
+      continue;
+    }
+
+    // Through-wafer cut: check for carrier dicing tape at the opposite side
+    if (targetSide === 'front') {
+      let tapeCount = 0;
+      for (let i = 0; i < col.segments.length; i++) {
+        if (CARRIER_TAPE_IDS.has(col.segments[i].materialId)) {
+          tapeCount++;
+        } else {
+          break;
+        }
+      }
+
+      if (tapeCount > 0) {
+        const topTapeSeg = col.segments[tapeCount - 1];
+        const tapeHeight = topTapeSeg.yTop - col.segments[0].yBottom;
+        const safeOvercut = Math.min(tapeOvercut, tapeHeight * 0.65);
+        const targetPlaneY = topTapeSeg.yTop - safeOvercut;
+        const finalPlaneY =
+          taperMaxDepth < Infinity
+            ? Math.max(targetPlaneY, surfaceY - taperMaxDepth)
+            : targetPlaneY;
+        trimSegmentsFromTop(col, finalPlaneY);
+      } else if (taperMaxDepth < Infinity) {
+        trimSegmentsFromTop(col, surfaceY - taperMaxDepth);
+      } else {
+        col.segments = [];
+      }
+    } else {
+      let tapeCount = 0;
+      for (let i = col.segments.length - 1; i >= 0; i--) {
+        if (CARRIER_TAPE_IDS.has(col.segments[i].materialId)) {
+          tapeCount++;
+        } else {
+          break;
+        }
+      }
+
+      if (tapeCount > 0) {
+        const botTapeSeg = col.segments[col.segments.length - tapeCount];
+        const tapeHeight = col.segments[col.segments.length - 1].yTop - botTapeSeg.yBottom;
+        const safeOvercut = Math.min(tapeOvercut, tapeHeight * 0.65);
+        const targetPlaneY = botTapeSeg.yBottom + safeOvercut;
+        const finalPlaneY =
+          taperMaxDepth < Infinity
+            ? Math.min(targetPlaneY, surfaceY + taperMaxDepth)
+            : targetPlaneY;
+        trimSegmentsFromBottom(col, finalPlaneY);
+      } else if (taperMaxDepth < Infinity) {
+        trimSegmentsFromBottom(col, surfaceY + taperMaxDepth);
+      } else {
+        col.segments = [];
+      }
     }
   }
 }
@@ -2522,6 +3183,281 @@ function getTopY(col: ColumnProfile): number {
 function getBottomY(col: ColumnProfile): number {
   if (col.segments.length === 0) return 0;
   return col.segments[0].yBottom;
+}
+
+/**
+ * Computes laminated dry-film top/bottom elevation per column:
+ * - laminationSag = 0: rigid tenting sheet resting on highest peaks (bridges all cavities flat)
+ * - laminationSag > 0: morphological closing + smooth cosine S-curve drape onto wide terraces
+ *   and clamped-beam sin² arch bowing across bridged cavities, preserving uniform thickness.
+ */
+function computeDryFilmProfile(
+  columns: ColumnProfile[],
+  totalWidth: number,
+  targetSide: 'front' | 'back',
+  thickness: number,
+  laminationSag: number = 0
+): { yBottom: Float64Array; yTop: Float64Array } {
+  const n = columns.length;
+  const yBottom = new Float64Array(n);
+  const yTop = new Float64Array(n);
+  if (n === 0 || thickness <= 0) return { yBottom, yTop };
+
+  const dx = totalWidth / Math.max(1, n);
+  const s = Math.max(0, Math.min(1, laminationSag / 100));
+
+  const heights = new Float64Array(n);
+  const hasCol = new Uint8Array(n);
+  let maxH = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (columns[i].segments.length === 0) continue;
+    hasCol[i] = 1;
+    const h = targetSide === 'front' ? getTopY(columns[i]) : -getBottomY(columns[i]);
+    heights[i] = h;
+    if (h > maxH) maxH = h;
+  }
+  if (maxH === -Infinity) return { yBottom, yTop };
+
+  const env = new Float64Array(n);
+  if (s <= 0.005) {
+    env.fill(maxH);
+  } else {
+    // 1. Morphological closing: bridges trenches narrower than 2*bridgeRadius
+    const bridgeRadius = Math.max(thickness * 0.6, (1 - s) * totalWidth * 0.42);
+    const bridgeCols = Math.max(1, Math.round(bridgeRadius / dx));
+
+    const dilated = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      let localMax = -Infinity;
+      const start = Math.max(0, i - bridgeCols);
+      const end = Math.min(n - 1, i + bridgeCols);
+      for (let j = start; j <= end; j++) {
+        if (hasCol[j] && heights[j] > localMax) localMax = heights[j];
+      }
+      dilated[i] = localMax > -Infinity ? localMax : maxH;
+    }
+
+    const closed = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      let localMin = Infinity;
+      const start = Math.max(0, i - bridgeCols);
+      const end = Math.min(n - 1, i + bridgeCols);
+      for (let j = start; j <= end; j++) {
+        if (dilated[j] < localMin) localMin = dilated[j];
+      }
+      closed[i] = Math.max(heights[i], localMin < Infinity ? localMin : maxH);
+    }
+
+    // 2. Smooth cosine S-curve drape across step-downs onto wider lower terraces
+    const drapeLength = Math.max(thickness * 1.5, (0.38 - 0.22 * s) * totalWidth);
+    const drapeCols = Math.max(2, Math.round(drapeLength / dx));
+
+    for (let i = 0; i < n; i++) {
+      const baseH = closed[i];
+      let best = baseH;
+      const start = Math.max(0, i - drapeCols);
+      const end = Math.min(n - 1, i + drapeCols);
+      for (let j = start; j <= end; j++) {
+        const diff = closed[j] - baseH;
+        if (diff <= 0) continue;
+        const dist = Math.abs(i - j) * dx;
+        if (dist >= drapeLength) continue;
+        const w = 0.5 * (1 + Math.cos((Math.PI * dist) / drapeLength));
+        const candidate = baseH + diff * w;
+        if (candidate > best) best = candidate;
+      }
+      env[i] = Math.max(heights[i], best);
+    }
+
+    // 3. Curved clamped-beam arch sag (sin²(πu)) across bridged cavities bounded on both sides
+    const envBeforeSag = new Float64Array(env);
+    let idx = 0;
+    while (idx < n) {
+      if (!hasCol[idx] || envBeforeSag[idx] <= heights[idx] + 1) {
+        idx++;
+        continue;
+      }
+      const spanStart = idx;
+      while (idx < n && hasCol[idx] && envBeforeSag[idx] > heights[idx] + 1) {
+        idx++;
+      }
+      const spanEnd = idx - 1;
+      const boundedLeft = spanStart > 0 && hasCol[spanStart - 1];
+      const boundedRight = spanEnd < n - 1 && hasCol[spanEnd + 1];
+      if (!boundedLeft || !boundedRight) continue;
+
+      const spanCount = spanEnd - spanStart + 1;
+      if (spanCount < 3) continue;
+
+      const leftAnchorY = envBeforeSag[spanStart - 1];
+      const rightAnchorY = envBeforeSag[spanEnd + 1];
+      let minFloorInSpan = Infinity;
+      for (let k = spanStart; k <= spanEnd; k++) {
+        if (heights[k] < minFloorInSpan) minFloorInSpan = heights[k];
+      }
+      // Only bow spans suspended between two raised shoulders (not one-sided step-down ramps)
+      if (leftAnchorY <= minFloorInSpan + 5 || rightAnchorY <= minFloorInSpan + 5) {
+        continue;
+      }
+
+      const spanWidth = spanCount * dx;
+      let maxClearance = 0;
+      for (let k = spanStart; k <= spanEnd; k++) {
+        const t = (k - spanStart + 0.5) / spanCount;
+        const lineY = leftAnchorY + (rightAnchorY - leftAnchorY) * t;
+        const clear = Math.max(0, Math.min(envBeforeSag[k], lineY) - heights[k]);
+        if (clear > maxClearance) maxClearance = clear;
+      }
+      if (maxClearance <= 1) continue;
+
+      const sagScaleRef = Math.max(thickness * 1.5, totalWidth * 0.25);
+      const spanRatio = Math.min(1.4, spanWidth / sagScaleRef);
+      const sagFraction = Math.min(1, s * (0.45 + 0.75 * Math.pow(spanRatio, 1.15)));
+      const sagDepth = maxClearance * sagFraction;
+
+      for (let k = spanStart; k <= spanEnd; k++) {
+        const u = (k - spanStart + 0.5) / spanCount;
+        const arch = Math.pow(Math.sin(Math.PI * u), 2);
+        const sagged = envBeforeSag[k] - sagDepth * arch;
+        env[k] = Math.max(heights[k], sagged);
+      }
+    }
+
+    // 4. Light C² flexural smoothing on suspended/curved sections while preserving surface contact
+    const smoothPasses = Math.max(2, Math.round(4 * s + 2));
+    const tmp = new Float64Array(n);
+    for (let pass = 0; pass < smoothPasses; pass++) {
+      tmp.set(env);
+      for (let i = 1; i < n - 1; i++) {
+        if (!hasCol[i] || env[i] <= heights[i] + 0.5) continue;
+        const blended = 0.25 * env[i - 1] + 0.5 * env[i] + 0.25 * env[i + 1];
+        tmp[i] = Math.max(heights[i], blended);
+      }
+      env.set(tmp);
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (!hasCol[i]) continue;
+    if (targetSide === 'front') {
+      yBottom[i] = env[i];
+      yTop[i] = env[i] + thickness;
+    } else {
+      yTop[i] = -env[i];
+      yBottom[i] = -env[i] - thickness;
+    }
+  }
+
+  return { yBottom, yTop };
+}
+
+/**
+ * 1D Gaussian smooth with symmetric boundary reflection for liquid meniscus leveling.
+ */
+function gaussianReflectSmooth(
+  values: Float64Array,
+  hasCol: Uint8Array,
+  dx: number,
+  sigma: number
+): Float64Array {
+  const n = values.length;
+  const out = new Float64Array(n);
+  if (n === 0) return out;
+
+  const radiusCols = Math.max(1, Math.min(n - 1, Math.ceil((2.5 * sigma) / Math.max(1e-5, dx))));
+  const invTwoSigmaSq = 1 / Math.max(1e-5, 2 * sigma * sigma);
+  const kernel = new Float64Array(radiusCols + 1);
+  for (let d = 0; d <= radiusCols; d++) {
+    const dist = d * dx;
+    kernel[d] = Math.exp(-(dist * dist) * invTwoSigmaSq);
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (!hasCol[i]) continue;
+    let sumW = 0;
+    let sumV = 0;
+    for (let offset = -radiusCols; offset <= radiusCols; offset++) {
+      let j = i + offset;
+      if (j < 0) j = -j;
+      else if (j >= n) j = 2 * n - 2 - j;
+      j = Math.max(0, Math.min(n - 1, j));
+      if (!hasCol[j]) continue;
+      const w = kernel[Math.abs(offset)];
+      sumW += w;
+      sumV += w * values[j];
+    }
+    out[i] = sumW > 0 ? sumV / sumW : values[i];
+  }
+  return out;
+}
+
+/**
+ * Computes spin-coated surface elevation per column modeling viscosity vs topography:
+ * - planarization = 100%: ideal flat leveling at peak + thickness
+ * - planarization < 100%: capillary leveling length shrinks with higher viscosity,
+ *   filling narrow trenches flat while following wider valleys with rounded menisci.
+ */
+function computeSpinCoatSurface(
+  columns: ColumnProfile[],
+  totalWidth: number,
+  targetSide: 'front' | 'back',
+  thickness: number,
+  planarizationPct: number = 100
+): Float64Array {
+  const n = columns.length;
+  const result = new Float64Array(n);
+  if (n === 0 || thickness <= 0) return result;
+
+  const p = Math.max(0, Math.min(1, planarizationPct / 100));
+  const dx = totalWidth / Math.max(1, n);
+
+  const heights = new Float64Array(n);
+  const hasCol = new Uint8Array(n);
+  let maxH = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (columns[i].segments.length === 0) continue;
+    hasCol[i] = 1;
+    const h = targetSide === 'front' ? getTopY(columns[i]) : -getBottomY(columns[i]);
+    heights[i] = h;
+    if (h > maxH) maxH = h;
+  }
+  if (maxH === -Infinity) return result;
+
+  if (p >= 0.995) {
+    for (let i = 0; i < n; i++) {
+      if (!hasCol[i]) continue;
+      result[i] = targetSide === 'front' ? maxH + thickness : -(maxH + thickness);
+    }
+    return result;
+  }
+
+  // Capillary leveling length grows as viscosity decreases (higher planarization p)
+  const sigma = Math.max(dx * 1.2, thickness * 0.3) + Math.pow(p, 1.35) * totalWidth * 0.22;
+  const smoothedH = gaussianReflectSmooth(heights, hasCol, dx, sigma);
+
+  // Narrow trenches fill via meniscus leveling while wide steps follow topography
+  const globalBlend = Math.pow(p, 1.65);
+  const rawTop = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    if (!hasCol[i]) continue;
+    const meniscusBase = Math.max(heights[i], smoothedH[i]);
+    const leveledBase = meniscusBase + (maxH - meniscusBase) * globalBlend;
+    rawTop[i] = leveledBase + thickness;
+  }
+
+  // Surface-tension rounding of the liquid upper air interface
+  const topSigma = Math.max(dx * 1.4, thickness * 0.35 + p * totalWidth * 0.04);
+  const smoothTop = gaussianReflectSmooth(rawTop, hasCol, dx, topSigma);
+
+  // Keep raised peaks wetted while permitting slight ridge thinning at moderate/high leveling
+  const minPeakThick = thickness * (1 - 0.35 * p);
+  for (let i = 0; i < n; i++) {
+    if (!hasCol[i]) continue;
+    const finalH = Math.max(heights[i] + minPeakThick, smoothTop[i]);
+    result[i] = targetSide === 'front' ? finalH : -finalH;
+  }
+
+  return result;
 }
 
 /**

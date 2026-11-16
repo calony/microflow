@@ -15,10 +15,10 @@ import {
   FileText,
   Sliders,
   PanelLeft,
-  PanelRight,
   Scan,
   Menu,
   X,
+  FlaskConical,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -28,6 +28,7 @@ interface HeaderProps {
   onUpdateTitle: (title: string) => void;
   onOpenPresets: () => void;
   onOpenMaterials: () => void;
+  onOpenEtchLibrary: () => void;
   onOpenMaskLevels: () => void;
   onOpenRunSheet: () => void;
   onOpenMultiStepView: () => void;
@@ -46,6 +47,7 @@ export const Header: React.FC<HeaderProps> = ({
   onUpdateTitle,
   onOpenPresets,
   onOpenMaterials,
+  onOpenEtchLibrary,
   onOpenMaskLevels,
   onOpenRunSheet,
   onOpenMultiStepView,
@@ -108,18 +110,35 @@ export const Header: React.FC<HeaderProps> = ({
     <header className="flex flex-wrap items-center justify-between gap-2 px-2.5 sm:px-4 py-2 bg-slate-900 border-b border-slate-800 text-slate-200 shadow-md select-none shrink-0 z-30">
       {/* Brand & Process Title */}
       <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 xl:flex-initial">
-        {onToggleLeftSidebar && (
-          <button
-            onClick={onToggleLeftSidebar}
-            className={`p-1.5 rounded-lg border transition-colors shrink-0 ${
-              leftSidebarOpen
-                ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
-                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
-            }`}
-            title={leftSidebarOpen ? 'Hide Flow Timeline' : 'Show Flow Timeline'}
-          >
-            <PanelLeft className="w-4 h-4" />
-          </button>
+        {(onToggleLeftSidebar || onToggleRightSidebar) && (
+          <div className="flex items-center gap-1 shrink-0">
+            {onToggleLeftSidebar && (
+              <button
+                onClick={onToggleLeftSidebar}
+                className={`p-1.5 rounded-lg border transition-colors shrink-0 ${
+                  leftSidebarOpen
+                    ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
+                    : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                }`}
+                title={leftSidebarOpen ? 'Hide Flow Timeline' : 'Show Flow Timeline'}
+              >
+                <PanelLeft className="w-4 h-4" />
+              </button>
+            )}
+            {onToggleRightSidebar && (
+              <button
+                onClick={onToggleRightSidebar}
+                className={`p-1.5 rounded-lg border transition-colors shrink-0 ${
+                  rightSidebarOpen
+                    ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
+                    : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                }`}
+                title={rightSidebarOpen ? 'Hide Parameters Panel' : 'Show Parameters Panel'}
+              >
+                <Sliders className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         )}
 
         <div className="flex items-center gap-2 shrink-0">
@@ -233,6 +252,15 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           <button
+            onClick={onOpenEtchLibrary}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+            title="Etch Rate & Chemistry Library"
+          >
+            <FlaskConical className="w-3.5 h-3.5 text-amber-400" />
+            <span>Etch Rates</span>
+          </button>
+
+          <button
             onClick={onOpenMaskLevels}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
             title="Photolithography Mask Levels & Apertures"
@@ -325,6 +353,17 @@ export const Header: React.FC<HeaderProps> = ({
                 type="button"
                 onClick={() => {
                   setMobileMenuOpen(false);
+                  onOpenEtchLibrary();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <FlaskConical className="w-4 h-4 text-amber-400" />
+                <span>Etch Rate Library</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
                   onOpenMaskLevels();
                 }}
                 className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
@@ -382,19 +421,6 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </div>
 
-        {onToggleRightSidebar && (
-          <button
-            onClick={onToggleRightSidebar}
-            className={`p-1.5 rounded-lg border transition-colors ${
-              rightSidebarOpen
-                ? 'bg-slate-800 text-sky-400 border-slate-700 hover:bg-slate-700'
-                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
-            }`}
-            title={rightSidebarOpen ? 'Hide Parameters Panel' : 'Show Parameters Panel'}
-          >
-            <PanelRight className="w-4 h-4" />
-          </button>
-        )}
       </div>
     </header>
   );

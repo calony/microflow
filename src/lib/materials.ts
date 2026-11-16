@@ -224,6 +224,30 @@ export const DEFAULT_MATERIALS: Material[] = [
     notes: 'High-aspect-ratio negative epoxy photoresist for microfluidics and MEMS molds',
   },
   {
+    id: 'mat_dfr',
+    name: 'Dry Film Photoresist',
+    formula: 'DFR / Ordyl',
+    color: '#ec4899', // Pink 500
+    strokeColor: '#be185d',
+    pattern: 'horizontal',
+    category: 'photoresist',
+    density: 1.18,
+    refractiveIndex: 1.56,
+    notes: 'Laminated dry film photoresist sheet that tents across cavities and channels for 3D microfluidics and plating molds',
+  },
+  {
+    id: 'mat_polyimide',
+    name: 'Polyimide Dry Film',
+    formula: 'PI (Kapton)',
+    color: '#fbbf24', // Amber 400
+    strokeColor: '#b45309',
+    pattern: 'stipple',
+    category: 'polymer',
+    density: 1.42,
+    refractiveIndex: 1.7,
+    notes: 'Laminated permanent polyimide dielectric/capping film for MEMS sealing and flexible substrates',
+  },
+  {
     id: 'mat_pdms',
     name: 'PDMS Silicone',
     formula: '(C₂H₆OSi)ₙ',
@@ -235,7 +259,59 @@ export const DEFAULT_MATERIALS: Material[] = [
     refractiveIndex: 1.41,
     notes: 'Polydimethylsiloxane elastomer for microfluidic channels and soft lithography',
   },
+
+  // Dicing Tapes, Carrier Films & Packaging Adhesives
+  {
+    id: 'mat_dicing_tape',
+    name: 'Blue Dicing Tape (PVC/PO)',
+    formula: 'Dicing Tape',
+    color: '#0284c7', // Sky 600
+    strokeColor: '#0369a1',
+    pattern: 'diagonal-left',
+    category: 'polymer',
+    density: 1.15,
+    notes: 'Standard cleanroom pressure-sensitive dicing carrier tape mounted on stainless steel ring frame',
+  },
+  {
+    id: 'mat_uv_tape',
+    name: 'UV-Release Dicing Tape',
+    formula: 'UV Tape',
+    color: '#6366f1', // Indigo 500
+    strokeColor: '#4338ca',
+    pattern: 'horizontal',
+    category: 'polymer',
+    density: 1.12,
+    notes: 'High-tack acrylic adhesive tape whose tack drops sharply upon UV irradiation for easy die pick-up / demount',
+  },
+  {
+    id: 'mat_bg_tape',
+    name: 'Backgrind (BG) Tape',
+    formula: 'BG Tape',
+    color: '#2dd4bf', // Teal 400
+    strokeColor: '#0d9488',
+    pattern: 'stipple',
+    category: 'polymer',
+    density: 1.1,
+    notes: 'Frontside protective lamination tape used during backside wafer grinding and DBG thinning',
+  },
+  {
+    id: 'mat_daf',
+    name: 'Die Attach Film (DAF)',
+    formula: 'DAF Epoxy',
+    color: '#a78bfa', // Violet 400
+    strokeColor: '#7c3aed',
+    pattern: 'dots',
+    category: 'polymer',
+    density: 1.25,
+    notes: 'B-stage epoxy adhesive film laminated to wafer backside and diced together with individual dies',
+  },
 ];
+
+export const CARRIER_TAPE_IDS = new Set([
+  'mat_dicing_tape',
+  'mat_uv_tape',
+  'mat_bg_tape',
+]);
 
 export function resolveResistMaterialId(
   polarity: 'positive' | 'negative' = 'positive',

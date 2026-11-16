@@ -12,7 +12,9 @@ export type ProcessStepType =
   | 'liftoff'
   | 'cmp'
   | 'anneal'
-  | 'bonding';
+  | 'bonding'
+  | 'dicing'
+  | 'tape-frame';
 
 export type ProcessSide = 'front' | 'back' | 'both';
 
@@ -57,19 +59,36 @@ export interface MaskWindow {
 }
 
 export interface DepositionConfig {
-  depositionType: 'conformal' | 'directional' | 'semi-conformal' | 'spin-coat';
-  method: 'PECVD' | 'LPCVD' | 'ALD' | 'Sputter' | 'E-Beam Evaporation' | 'Thermal Oxidation' | 'Spin Coat' | 'Electroplating';
+  depositionType: 'conformal' | 'directional' | 'semi-conformal' | 'spin-coat' | 'bottom-up' | 'dry-film';
+  method:
+    | 'PECVD'
+    | 'LPCVD'
+    | 'ALD'
+    | 'Sputter'
+    | 'E-Beam Evaporation'
+    | 'Thermal Oxidation'
+    | 'Spin Coat'
+    | 'Electroplating'
+    | 'Electroless Plating'
+    | 'Dry Film Lamination';
   thickness: number; // nm
   stepCoverage?: number; // 0 - 100%
   tiltAngle?: number; // Substrate tilt in degrees (-75 to +75, 0 = normal incidence)
   convexCornerEffect?: boolean; // Faster deposition around convex corners (bread-loafing)
   convexCornerStrength?: number; // 0.2 - 1.5 (default 0.6 = +60% at sharp 90° convex corners)
+  platingSelective?: boolean; // Grow selectively on exposed conductive / seed surfaces
+  platingSeedScope?: 'conductive' | 'metal-only'; // Conductive (metals + Si) vs metal seed only
+  laminationSag?: number; // 0 - 100% (0 = rigid flat tenting, >0 = vacuum/roller drape into wide features)
+  planarization?: number; // 0 - 100% (100 = ideal flat planarization, <100 = viscous non-ideal spin coat)
 }
 
 export interface LithographyConfig {
   resistMaterialId: string;
   resistThickness: number; // nm
   polarity: 'positive' | 'negative';
+  coatMethod?: 'spin-coat' | 'dry-film'; // Spin Coat (planarizing) vs Dry Film Lamination (tenting)
+  laminationSag?: number; // 0 - 100% when coatMethod === 'dry-film'
+  planarization?: number; // 0 - 100% when coatMethod === 'spin-coat' (default 100)
   windows: MaskWindow[];
   sidewallAngle: number; // degrees (e.g. 90 = vertical, >90 = retrograde/undercut for liftoff, <90 = tapered)
   exposureMethod: 'UV Contact (365nm)' | 'DUV Stepper (248nm)' | 'E-Beam Litho' | 'Direct Write Laser';
@@ -105,6 +124,41 @@ export interface EtchConfig {
   ardeStrength?: number; // Lag factor k (0.1 = mild to 1.0 = strong, default 0.5)
   convexCornerEffect?: boolean; // Faster isotropic etching around convex corners
   convexCornerStrength?: number; // 0.2 - 1.5 (default 0.6 = +60% at sharp 90° convex corners)
+  etchRecipeId?: string; // Linked recipe from Etch Rate Library
+  rateMode?: 'manual' | 'time-rate'; // 'manual' = fixed depth budget; 'time-rate' = duration * material etch rates
+  etchTimeSec?: number; // Etch duration in seconds when rateMode === 'time-rate'
+}
+
+export type EtchRateCategory =
+  | 'dry-rie'
+  | 'drie-vapor'
+  | 'wet-chemical'
+  | 'physical-ash'
+  | 'custom';
+
+export interface EtchRecipe {
+  id: string;
+  name: string;
+  chemistry: string;
+  category: EtchRateCategory;
+  etchType: EtchConfig['etchType'];
+  isotropy: number; // 0 - 1
+  sidewallAngle: number; // degrees
+  scallopEffect?: boolean;
+  scallopDepth?: number;
+  scallopPitch?: number;
+  ardeEnabled?: boolean;
+  ardeStrength?: number;
+  primaryMaterialId: string;
+  rates: Record<string, number>; // nm/min keyed by materialId (0 = immune / etch stop)
+  defaultRateNmMin?: number; // fallback rate for materials not explicitly listed
+  toolName?: string;
+  gases?: string;
+  power?: string;
+  pressure?: string;
+  temperature?: string;
+  notes?: string;
+  isCustom?: boolean;
 }
 
 export interface StripConfig {
@@ -134,6 +188,36 @@ export interface BondingConfig {
     materialId: string;
     thickness: number; // nm
   };
+}
+
+export interface DicingStreet {
+  id: string;
+  xCenter: number; // nm
+}
+
+export interface DicingConfig {
+  method: 'blade' | 'laser-ablation' | 'stealth' | 'plasma';
+  cutMode: 'through-wafer' | 'partial-depth';
+  kerfWidth: number; // nm
+  cutDepth?: number; // nm (when cutMode === 'partial-depth')
+  sidewallAngle?: number; // degrees (90 = vertical, <90 = V-taper)
+  tapeOvercut?: number; // nm cut depth into carrier dicing tape on through-wafer cut
+  streets: DicingStreet[];
+}
+
+export interface TapeFrameConfig {
+  action: 'mount' | 'demount';
+  tapeMaterialId: string;
+  thickness: number; // nm
+  conformality: 'flat' | 'conformal';
+  showFrame: boolean;
+}
+
+export interface MountedTapeFrame {
+  side: 'front' | 'back';
+  yBottom: number;
+  yTop: number;
+  materialId: string;
 }
 
 export interface ToolRecipe {
@@ -174,6 +258,8 @@ export interface ProcessStep {
   strip?: StripConfig;
   cmp?: CmpConfig;
   bonding?: BondingConfig;
+  dicing?: DicingConfig;
+  tapeFrame?: TapeFrameConfig;
   toolRecipe?: ToolRecipe;
 }
 
@@ -262,6 +348,7 @@ export interface ProcessFlow {
   masks?: PhotomaskLevel[]; // Central mask set library
   blocks?: ProcessBlock[]; // Fabrication blocks / modules hierarchy
   gdsLayout?: GdsLayoutData; // Optional 2D GDS-style layout & section cut line
+  etchLibrary?: EtchRecipe[]; // Custom & saved etch rate recipes
 }
 
 /**
@@ -309,6 +396,7 @@ export interface CrossSectionMesh {
     title: string;
   }[];
   scallopWalls?: ScallopWall[];
+  mountedFrames?: MountedTapeFrame[];
 }
 
 export interface RenderedPolygon {

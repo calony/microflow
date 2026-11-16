@@ -27,6 +27,7 @@ import {
   normalizeFlowBlocksOrder,
   BLOCK_PALETTE,
 } from '../lib/blockUtils';
+import { getEtchRecipeById, formatDurationCompact } from '../lib/etchRates';
 import { ThicknessUnit, formatThickness } from '../lib/units';
 import {
   Plus,
@@ -57,6 +58,8 @@ import {
   SkipForward,
   Search,
   X,
+  Frame,
+  Slice,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -70,6 +73,7 @@ interface ProcessFlowSidebarProps {
   onSelectStepIndex: (index: number) => void;
   onUpdateFlow: (updated: ProcessFlow) => void;
   onOpenPresets: () => void;
+  onOpenParameters?: () => void;
 }
 
 export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
@@ -83,6 +87,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   onSelectStepIndex,
   onUpdateFlow,
   onOpenPresets,
+  onOpenParameters,
 }) => {
   type AddStepPlacement =
     | { mode: 'end' }
@@ -157,11 +162,21 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       step.deposition?.method || '',
       step.lithography?.maskName || '',
       step.lithography?.polarity || '',
+      step.lithography?.coatMethod === 'dry-film' ? 'dry film lamination' : '',
       step.etch?.etchType || '',
+      step.etch?.etchRecipeId
+        ? (() => {
+            const rec = getEtchRecipeById(flow.etchLibrary, step.etch.etchRecipeId);
+            return rec ? `${rec.name} ${rec.chemistry}` : '';
+          })()
+        : '',
       step.strip?.stripType || '',
       step.strip?.solvent || '',
       step.bonding?.bondingMethod || '',
       step.bonding?.importedFlowTitle || '',
+      step.dicing?.method || '',
+      step.dicing ? `dicing kerf ${step.dicing.cutMode}` : '',
+      step.tapeFrame ? `tape frame ${step.tapeFrame.action}` : '',
       block?.name || '',
       block?.description || '',
     ]
@@ -198,6 +213,10 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         return <Disc className="w-4 h-4 text-cyan-400" />;
       case 'bonding':
         return <Link2 className="w-4 h-4 text-indigo-400" />;
+      case 'dicing':
+        return <Slice className="w-4 h-4 text-orange-400" />;
+      case 'tape-frame':
+        return <Frame className="w-4 h-4 text-sky-300" />;
       case 'anneal':
         return <Sliders className="w-4 h-4 text-purple-400" />;
       default:
@@ -327,6 +346,47 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 thickness: 2500,
               },
             ],
+          },
+        };
+        break;
+      case 'dicing':
+        newStep = {
+          id,
+          title: 'Wafer Dicing',
+          type: 'dicing',
+          side: 'front',
+          enabled: true,
+          blockId: blockId || undefined,
+          dicing: {
+            method: 'blade',
+            cutMode: 'through-wafer',
+            kerfWidth: 400,
+            cutDepth: 1500,
+            sidewallAngle: 90,
+            tapeOvercut: 120,
+            streets: [
+              {
+                id: `street_${Date.now()}`,
+                xCenter: Math.round(flow.substrateWidth * 0.5),
+              },
+            ],
+          },
+        };
+        break;
+      case 'tape-frame':
+        newStep = {
+          id,
+          title: 'Mount on Tape & Frame',
+          type: 'tape-frame',
+          side: 'back',
+          enabled: true,
+          blockId: blockId || undefined,
+          tapeFrame: {
+            action: 'mount',
+            tapeMaterialId: 'mat_dicing_tape',
+            thickness: 600,
+            conformality: 'flat',
+            showFrame: true,
           },
         };
         break;
@@ -662,145 +722,195 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           onDrop={handleStepDrop}
           onDragEnd={clearDragState}
           onClick={() => onSelectStepIndex(globalIdx)}
-          className={`group relative flex items-center justify-between p-2 rounded-xl text-xs transition-all cursor-pointer border ${
+          onDoubleClick={() => {
+            onSelectStepIndex(globalIdx);
+            onOpenParameters?.();
+          }}
+          className={`group relative rounded-xl p-2 text-xs transition-all cursor-pointer border ${
             isBeingDragged ? 'opacity-40 scale-[0.98]' : ''
           } ${
             isSelected
-              ? 'bg-sky-950/60 border-sky-500 text-white shadow-md'
+              ? 'bg-sky-950/70 border-sky-500 text-white shadow-md'
               : step.enabled
-              ? 'bg-slate-950/40 border-slate-800/80 hover:bg-slate-800/50 text-slate-300'
-              : 'bg-slate-950/20 border-slate-800/40 opacity-50 text-slate-500'
+              ? 'bg-slate-900/75 border-slate-800/90 hover:bg-slate-800/70 hover:border-slate-700 text-slate-100'
+              : 'bg-slate-950/30 border-slate-800/50 opacity-60 text-slate-400'
           }`}
         >
-          <div className="flex items-center gap-1.5 min-w-0 pr-1 flex-1">
+          <div className="flex items-start gap-1.5 min-w-0">
             {/* Drag handle */}
             {!isSearchActive && (
               <GripVertical
-                className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5"
+                className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5 mt-0.5"
                 aria-label="Drag to reorder step"
               />
             )}
 
             {/* Step global index badge */}
             <span
-              className={`w-5 h-5 rounded-md flex items-center justify-center font-mono text-[10px] font-semibold flex-shrink-0 ${
+              className={`w-5 h-5 rounded-md flex items-center justify-center font-mono text-[10px] font-bold flex-shrink-0 mt-0.5 ${
                 isSelected
                   ? 'bg-sky-500 text-white'
-                  : 'bg-slate-800 text-slate-400'
+                  : 'bg-slate-800 text-slate-300'
               }`}
             >
               {globalIdx + 1}
             </span>
 
-          {/* Step icon */}
-          <div className="flex-shrink-0">{getStepIcon(step.type)}</div>
+            {/* Step icon */}
+            <div className="flex-shrink-0 mt-0.5">{getStepIcon(step.type)}</div>
 
-          {/* Step info */}
-          <div className="min-w-0 flex-1 truncate">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span className="font-medium truncate">{step.title}</span>
-              {step.side === 'back' && (
-                <span className="px-1 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[9px] font-bold shrink-0">
-                  BACK
+            {/* Step info (full available width for readable names) */}
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-1.5 min-w-0">
+                <span
+                  className={`text-[12.5px] font-semibold leading-snug break-words line-clamp-2 ${
+                    isSelected
+                      ? 'text-white'
+                      : step.enabled
+                      ? 'text-slate-100'
+                      : 'text-slate-400'
+                  }`}
+                  title={step.title}
+                >
+                  {step.title}
                 </span>
-              )}
-              {step.side === 'both' && (
-                <span className="px-1 py-0.2 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[9px] font-bold shrink-0">
-                  BOTH
-                </span>
-              )}
-            </div>
-            <div className="text-[10px] text-slate-400 truncate font-mono">
-              {step.type === 'deposition' &&
-                `${step.deposition?.method || 'CVD'} · ${formatThickness(
-                  step.deposition?.thickness || step.thickness || 200,
-                  thicknessUnit
-                )}`}
-              {step.type === 'lithography' &&
-                `${step.lithography?.polarity || 'pos'} · ${
-                  step.lithography?.maskName || `${step.lithography?.windows.length || 0} slits`
-                }`}
-              {step.type === 'etch' &&
-                `${step.etch?.etchType?.toUpperCase() || 'RIE'} · ${formatThickness(
-                  step.etch?.depth || step.thickness || 200,
-                  thicknessUnit
-                )}${
-                  step.etch?.ardeEnabled &&
-                  ['rie', 'drie-bosch', 'ion-beam', 'ashing'].includes(step.etch?.etchType || 'rie')
-                    ? ' · ARDE'
-                    : ''
-                }`}
-              {step.type === 'strip' && `${step.strip?.stripType || 'Resist Strip'}`}
-              {step.type === 'liftoff' && 'Metal Lift-off'}
-              {step.type === 'cmp' && 'Grind/Polish/Planarize'}
-              {step.type === 'bonding' &&
-                `Bond (${step.bonding?.bondingMethod || 'fusion'}) · ${
-                  step.bonding?.sourceType === 'imported-flow'
-                    ? step.bonding?.importedFlowTitle || 'Imported Flow'
-                    : `${step.bonding?.customLayers?.length || 1}L Custom`
-                }`}
-              {step.type === 'anneal' && 'Thermal Anneal'}
+                <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                  {!step.enabled && (
+                    <span className="px-1 py-0.2 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 font-mono text-[9px] font-bold">
+                      OFF
+                    </span>
+                  )}
+                  {step.side === 'back' && (
+                    <span className="px-1 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[9px] font-bold">
+                      BACK
+                    </span>
+                  )}
+                  {step.side === 'both' && (
+                    <span className="px-1 py-0.2 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[9px] font-bold">
+                      BOTH
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="text-[10.5px] text-slate-400 truncate font-mono mt-0.5">
+                {step.type === 'deposition' &&
+                  `${step.deposition?.method || 'CVD'} · ${formatThickness(
+                    step.deposition?.thickness || step.thickness || 200,
+                    thicknessUnit
+                  )}`}
+                {step.type === 'lithography' &&
+                  `${
+                    step.lithography?.coatMethod === 'dry-film' ? 'dry film · ' : ''
+                  }${step.lithography?.polarity || 'pos'} · ${
+                    step.lithography?.maskName || `${step.lithography?.windows.length || 0} slits`
+                  }`}
+                {step.type === 'etch' && (() => {
+                  const rec = step.etch?.etchRecipeId
+                    ? getEtchRecipeById(flow.etchLibrary, step.etch.etchRecipeId)
+                    : undefined;
+                  const ardeTag =
+                    step.etch?.ardeEnabled &&
+                    ['rie', 'drie-bosch', 'ion-beam', 'ashing'].includes(step.etch?.etchType || 'rie')
+                      ? ' · ARDE'
+                      : '';
+                  if (rec && step.etch?.rateMode === 'time-rate') {
+                    return `${step.etch?.etchType?.toUpperCase() || 'RIE'} · ${formatDurationCompact(
+                      step.etch?.etchTimeSec ?? 60
+                    )} · ${rec.chemistry}${ardeTag}`;
+                  }
+                  return `${step.etch?.etchType?.toUpperCase() || 'RIE'} · ${formatThickness(
+                    step.etch?.depth || step.thickness || 200,
+                    thicknessUnit
+                  )}${rec ? ` · ${rec.chemistry}` : ''}${ardeTag}`;
+                })()}
+                {step.type === 'strip' && `${step.strip?.stripType || 'Resist Strip'}`}
+                {step.type === 'liftoff' && 'Metal Lift-off'}
+                {step.type === 'cmp' && 'Grind/Polish/Planarize'}
+                {step.type === 'bonding' &&
+                  `Bond (${step.bonding?.bondingMethod || 'fusion'}) · ${
+                    step.bonding?.sourceType === 'imported-flow'
+                      ? step.bonding?.importedFlowTitle || 'Imported Flow'
+                      : `${step.bonding?.customLayers?.length || 1}L Custom`
+                  }`}
+                {step.type === 'dicing' &&
+                  `Dice (${step.dicing?.method || 'blade'}) · ${
+                    step.dicing?.streets?.length || 1
+                  } cut${(step.dicing?.streets?.length || 1) === 1 ? '' : 's'} · ${formatThickness(
+                    step.dicing?.kerfWidth || 400,
+                    thicknessUnit
+                  )}`}
+                {step.type === 'tape-frame' &&
+                  (step.tapeFrame?.action === 'demount'
+                    ? 'UV Release / Demount Tape'
+                    : `Mount · ${formatThickness(
+                        step.tapeFrame?.thickness || 600,
+                        thicknessUnit
+                      )}`)}
+                {step.type === 'anneal' && 'Thermal Anneal'}
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* Step Quick Actions */}
-        <div
-          className={`flex items-center gap-0.5 flex-shrink-0 ${
-            isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-          } transition-opacity`}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            onClick={() => handleToggleStep(globalIdx)}
-            className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-200 transition-colors"
-            title={step.enabled ? 'Mute Step' : 'Enable Step'}
-          >
-            {step.enabled ? (
-              <Eye className="w-3.5 h-3.5" />
-            ) : (
-              <EyeOff className="w-3.5 h-3.5 text-rose-400" />
-            )}
-          </button>
-          <button
-            disabled={globalIdx === 0 && !step.blockId}
-            onClick={() => handleMoveStep(globalIdx, 'up')}
-            className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-200 disabled:opacity-20 transition-colors"
-            title={
-              step.blockId && (globalIdx === 0 || flow.steps[globalIdx - 1]?.blockId !== step.blockId)
-                ? 'Move Up (Remove from block & place before block)'
-                : 'Move Step Up'
+          {/* Step Quick Actions: docked footer bar on selected card, floating hover bar on unselected */}
+          <div
+            className={
+              isSelected
+                ? 'flex items-center justify-end gap-1 mt-1.5 pt-1 border-t border-sky-500/25'
+                : 'hidden group-hover:flex items-center gap-0.5 absolute right-1.5 top-1.5 z-10 rounded-lg bg-slate-900/95 border border-slate-700/90 px-1 py-0.5 shadow-lg'
             }
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
           >
-            <ArrowUp className="w-3.5 h-3.5" />
-          </button>
-          <button
-            disabled={globalIdx === flow.steps.length - 1 && !step.blockId}
-            onClick={() => handleMoveStep(globalIdx, 'down')}
-            className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-200 disabled:opacity-20 transition-colors"
-            title={
-              step.blockId && (globalIdx === flow.steps.length - 1 || flow.steps[globalIdx + 1]?.blockId !== step.blockId)
-                ? 'Move Down (Remove from block & place after block)'
-                : 'Move Step Down'
-            }
-          >
-            <ArrowDown className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => handleDuplicateStep(globalIdx)}
-            className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-200 transition-colors"
-            title="Duplicate Step"
-          >
-            <Copy className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => handleDeleteStep(globalIdx)}
-            className="p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition-colors"
-            title="Delete Step"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
+            <button
+              onClick={() => handleToggleStep(globalIdx)}
+              className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-100 transition-colors"
+              title={step.enabled ? 'Mute Step' : 'Enable Step'}
+            >
+              {step.enabled ? (
+                <Eye className="w-3.5 h-3.5" />
+              ) : (
+                <EyeOff className="w-3.5 h-3.5 text-rose-400" />
+              )}
+            </button>
+            <button
+              disabled={globalIdx === 0 && !step.blockId}
+              onClick={() => handleMoveStep(globalIdx, 'up')}
+              className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-100 disabled:opacity-20 transition-colors"
+              title={
+                step.blockId && (globalIdx === 0 || flow.steps[globalIdx - 1]?.blockId !== step.blockId)
+                  ? 'Move Up (Remove from block & place before block)'
+                  : 'Move Step Up'
+              }
+            >
+              <ArrowUp className="w-3.5 h-3.5" />
+            </button>
+            <button
+              disabled={globalIdx === flow.steps.length - 1 && !step.blockId}
+              onClick={() => handleMoveStep(globalIdx, 'down')}
+              className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-100 disabled:opacity-20 transition-colors"
+              title={
+                step.blockId && (globalIdx === flow.steps.length - 1 || flow.steps[globalIdx + 1]?.blockId !== step.blockId)
+                  ? 'Move Down (Remove from block & place after block)'
+                  : 'Move Step Down'
+              }
+            >
+              <ArrowDown className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => handleDuplicateStep(globalIdx)}
+              className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-100 transition-colors"
+              title="Duplicate Step"
+            >
+              <Copy className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => handleDeleteStep(globalIdx)}
+              className="p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition-colors"
+              title="Delete Step"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
         {showAfterLine && <DropLine />}
       </div>
@@ -810,63 +920,63 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   return (
     <div className="flex flex-col h-full bg-slate-900 border-r border-slate-800 text-slate-200 select-none">
       {/* Sidebar Top Header */}
-      <div className="p-3 border-b border-slate-800 flex items-center justify-between">
-        <div>
-          <span className="text-xs font-bold text-slate-200 tracking-wider uppercase">
+      <div className="px-2.5 py-1.5 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+        <div className="min-w-0">
+          <span className="text-[11px] font-bold text-slate-200 tracking-wider uppercase leading-tight block truncate">
             Process Traveller
           </span>
-          <span className="text-xs text-slate-500 block font-mono">
-            {blocks.length > 0 ? `${blocks.length} Modules · ` : ''}{flow.steps.length} Steps
+          <span className="text-[10px] text-slate-500 block font-mono leading-tight">
+            {blocks.length > 0 ? `${blocks.length} Mod · ` : ''}{flow.steps.length} Steps
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1 shrink-0">
           <button
             onClick={() => handleOpenCreateBlock(false)}
-            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 transition-colors"
+            className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 transition-colors"
             title="Create New Fabrication Block / Module"
           >
-            <FolderPlus className="w-3.5 h-3.5" />
+            <FolderPlus className="w-3 h-3" />
             <span className="hidden sm:inline">+ Block</span>
           </button>
 
           <button
             onClick={onOpenPresets}
-            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors"
+            className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors"
           >
             <span>Presets</span>
           </button>
         </div>
       </div>
 
-      {/* Play Flow Transport & Playback Options */}
-      <div className="px-3 py-2 border-b border-slate-800 bg-slate-950/70 space-y-1.5 shrink-0">
-        <div className="flex items-center gap-1">
+      {/* Play Flow Transport & Playback Options (Compact Single Row) */}
+      <div className="px-2.5 py-1.5 border-b border-slate-800 bg-slate-950/70 flex items-center justify-between gap-1.5 shrink-0">
+        <div className="flex items-center gap-1 min-w-0 flex-1">
           <button
             type="button"
             disabled={flow.steps.length === 0 || activeStepIndex === 0}
             onClick={() => onSelectStepIndex(flow.steps.length > 0 ? 0 : -1)}
-            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1 rounded-md bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
             title="First Process Step (Step 1)"
           >
-            <SkipBack className="w-3.5 h-3.5" />
+            <SkipBack className="w-3 h-3" />
           </button>
 
           <button
             type="button"
             disabled={activeStepIndex <= -1}
             onClick={() => onSelectStepIndex(activeStepIndex - 1)}
-            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1 rounded-md bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
             title="Previous Step"
           >
-            <ChevronLeft className="w-3.5 h-3.5" />
+            <ChevronLeft className="w-3 h-3" />
           </button>
 
           <button
             type="button"
             disabled={flow.steps.length === 0}
             onClick={onTogglePlay}
-            className={`flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors disabled:opacity-35 disabled:pointer-events-none ${
+            className={`flex-1 min-w-0 flex items-center justify-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold transition-colors disabled:opacity-35 disabled:pointer-events-none ${
               isPlaying
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                 : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sm'
@@ -881,13 +991,13 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           >
             {isPlaying ? (
               <>
-                <Pause className="w-3.5 h-3.5 fill-current" />
-                <span>Pause</span>
+                <Pause className="w-3 h-3 fill-current shrink-0" />
+                <span className="truncate">Pause</span>
               </>
             ) : (
               <>
-                <Play className="w-3.5 h-3.5 fill-current" />
-                <span>Play Flow</span>
+                <Play className="w-3 h-3 fill-current shrink-0" />
+                <span className="truncate">Play</span>
               </>
             )}
           </button>
@@ -896,40 +1006,44 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             type="button"
             disabled={activeStepIndex >= flow.steps.length - 1}
             onClick={() => onSelectStepIndex(activeStepIndex + 1)}
-            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1 rounded-md bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
             title="Next Step"
           >
-            <ChevronRight className="w-3.5 h-3.5" />
+            <ChevronRight className="w-3 h-3" />
           </button>
 
           <button
             type="button"
             disabled={flow.steps.length === 0 || activeStepIndex >= flow.steps.length - 1}
             onClick={() => onSelectStepIndex(flow.steps.length - 1)}
-            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1 rounded-md bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
             title={`Last Process Step (Step ${flow.steps.length})`}
           >
-            <SkipForward className="w-3.5 h-3.5" />
+            <SkipForward className="w-3 h-3" />
           </button>
         </div>
 
-        <div className="flex items-center justify-between text-[11px] gap-2">
-          <span className="font-mono text-slate-300">
-            {activeStepIndex === -1
-              ? `Substrate (0/${flow.steps.length})`
-              : `Step ${activeStepIndex + 1} / ${flow.steps.length}`}
+        <div className="flex items-center gap-1 shrink-0">
+          <span
+            className="text-[10px] font-mono text-slate-400 tabular-nums px-1"
+            title={
+              activeStepIndex === -1
+                ? `Substrate (0/${flow.steps.length})`
+                : `Step ${activeStepIndex + 1} / ${flow.steps.length}`
+            }
+          >
+            {activeStepIndex === -1 ? 0 : activeStepIndex + 1}/{flow.steps.length}
           </span>
 
           <div
-            className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300"
+            className="flex items-center px-1.5 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-slate-300"
             title="Playback Speed"
           >
-            <span className="text-[10px] text-slate-500 font-mono">Speed</span>
             <select
               value={playSpeed}
               onChange={(e) => onChangePlaySpeed(parseFloat(e.target.value))}
               aria-label="Playback Speed"
-              className="bg-transparent text-sky-400 font-mono font-semibold text-[11px] focus:outline-none cursor-pointer"
+              className="bg-transparent text-sky-400 font-mono font-semibold text-[10px] focus:outline-none cursor-pointer"
             >
               <option value="0.5" className="bg-slate-900 text-slate-200">0.5×</option>
               <option value="1" className="bg-slate-900 text-slate-200">1×</option>
@@ -943,9 +1057,9 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       </div>
 
       {/* Step Search Filter */}
-      <div className="px-2.5 py-2 border-b border-slate-800 bg-slate-950/50 shrink-0">
+      <div className="px-2.5 py-1.5 border-b border-slate-800 bg-slate-950/50 shrink-0">
         <div className="relative flex items-center">
-          <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 pointer-events-none" />
+          <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2 pointer-events-none" />
           <input
             type="text"
             value={stepSearchQuery}
@@ -955,13 +1069,13 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 setStepSearchQuery('');
               }
             }}
-            placeholder="Search steps or modules (name, type, #)..."
+            placeholder="Search steps or modules..."
             aria-label="Search process steps or modules"
-            className="w-full pl-8 pr-16 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition-colors"
+            className="w-full pl-7 pr-14 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition-colors"
           />
           {isSearchActive && (
-            <div className="absolute right-1.5 flex items-center gap-1">
-              <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded">
+            <div className="absolute right-1 flex items-center gap-1">
+              <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1 py-0.5 rounded">
                 {matchedStepCount}/{flow.steps.length}
               </span>
               <button
@@ -970,7 +1084,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
                 title="Clear search"
               >
-                <X className="w-3.5 h-3.5" />
+                <X className="w-3 h-3" />
               </button>
             </div>
           )}
@@ -979,70 +1093,70 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
 
       {/* Starting Substrate (Step 0) Item */}
       {substrateMatchesSearch && (
-      <div className="p-2 border-b border-slate-800 bg-slate-950/40">
-        <div
-          onClick={() => onSelectStepIndex(-1)}
-          className={`group p-2.5 rounded-xl cursor-pointer transition-all border ${
-            isSubstrateSelected
-              ? 'bg-emerald-950/50 border-emerald-500 text-white shadow-md'
-              : 'bg-slate-900/80 border-slate-800 hover:border-emerald-500/50 hover:bg-slate-850 text-slate-300'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="flex items-center gap-2">
-              <span
-                className={`w-5 h-5 rounded-md flex items-center justify-center font-mono text-[10px] font-bold ${
-                  isSubstrateSelected
-                    ? 'bg-emerald-500 text-slate-950'
-                    : 'bg-slate-800 text-emerald-400'
-                }`}
-              >
-                0
-              </span>
-              <span className="font-semibold text-xs text-white">
-                Starting Substrate Stack
-              </span>
+        <div className="px-2 py-1.5 border-b border-slate-800 bg-slate-950/40 shrink-0">
+          <div
+            onClick={() => onSelectStepIndex(-1)}
+            onDoubleClick={() => {
+              onSelectStepIndex(-1);
+              onOpenParameters?.();
+            }}
+            className={`group px-2 py-1.5 rounded-lg cursor-pointer transition-all border ${
+              isSubstrateSelected
+                ? 'bg-emerald-950/50 border-emerald-500 text-white shadow-sm'
+                : 'bg-slate-900/80 border-slate-800 hover:border-emerald-500/50 hover:bg-slate-850 text-slate-300'
+            }`}
+            title="Configure starting substrate layers"
+          >
+            <div className="flex items-center justify-between gap-1.5 mb-1">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span
+                  className={`w-4 h-4 rounded flex items-center justify-center font-mono text-[10px] font-bold shrink-0 ${
+                    isSubstrateSelected
+                      ? 'bg-emerald-500 text-slate-950'
+                      : 'bg-slate-800 text-emerald-400'
+                  }`}
+                >
+                  0
+                </span>
+                <span className="font-semibold text-[11px] text-white truncate">
+                  Substrate Stack
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono">
+                <span className="text-slate-400">
+                  {subLayers.length}L · {(flow.substrateWidth / 1000).toFixed(0)}µm
+                </span>
+                <span className="text-emerald-400 font-semibold">
+                  {formatThickness(totalSubThickness, thicknessUnit)}
+                </span>
+              </div>
             </div>
 
-            <span className="text-[10px] font-mono text-emerald-400 font-semibold">
-              {formatThickness(totalSubThickness, thicknessUnit)}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between text-[11px] text-slate-400 mb-2">
-            <span>
-              {subLayers.length} {subLayers.length === 1 ? 'Layer' : 'Layers'} Stack
-            </span>
-            <span className="font-mono text-slate-400">
-              Width: {(flow.substrateWidth / 1000).toFixed(0)} µm
-            </span>
-          </div>
-
-          {/* Mini Multi-Layer Color Preview Strip */}
-          <div className="flex rounded-md overflow-hidden h-2.5 w-full border border-slate-700/80 bg-slate-950">
-            {subLayers.map((l) => {
-              const mat = flow.materials.find((m) => m.id === l.materialId);
-              const widthPct = Math.max(8, (l.thickness / totalSubThickness) * 100);
-              return (
-                <div
-                  key={l.id}
-                  style={{
-                    backgroundColor: mat?.color || '#64748b',
-                    width: `${widthPct}%`,
-                  }}
-                  className="h-full border-r border-black/30 last:border-r-0"
-                  title={`${l.name || mat?.name || 'Layer'}: ${formatThickness(l.thickness, thicknessUnit)}`}
-                />
-              );
-            })}
-          </div>
-
-          <div className="mt-2 flex items-center justify-between text-[10px] text-emerald-400/90 font-medium group-hover:text-emerald-300">
-            <span>Configure starting layers</span>
-            <span>Configure →</span>
+            <div className="flex items-center gap-2">
+              <div className="flex-1 flex rounded overflow-hidden h-1.5 border border-slate-700/80 bg-slate-950">
+                {subLayers.map((l) => {
+                  const mat = flow.materials.find((m) => m.id === l.materialId);
+                  const widthPct = Math.max(8, (l.thickness / totalSubThickness) * 100);
+                  return (
+                    <div
+                      key={l.id}
+                      style={{
+                        backgroundColor: mat?.color || '#64748b',
+                        width: `${widthPct}%`,
+                      }}
+                      className="h-full border-r border-black/30 last:border-r-0"
+                      title={`${l.name || mat?.name || 'Layer'}: ${formatThickness(l.thickness, thicknessUnit)}`}
+                    />
+                  );
+                })}
+              </div>
+              <span className="text-[10px] text-emerald-400/90 font-medium shrink-0 group-hover:text-emerald-300">
+                Edit →
+              </span>
+            </div>
           </div>
         </div>
-      </div>
       )}
 
       {/* FABRICATION STEPS LIST - GROUPED BY BLOCK HIERARCHY */}
@@ -1323,13 +1437,14 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               >
                 {showBlockBefore && <DropLine />}
                 <div
-                  className={`rounded-xl border bg-slate-950/50 overflow-hidden shadow-sm transition-all ${
+                  className={`rounded-xl border border-l-[3px] bg-slate-950/50 overflow-hidden shadow-sm transition-all ${
                     isBlockBeingDragged ? 'opacity-40 scale-[0.99]' : ''
                   } ${
                     isDropIntoBlock
                       ? 'border-sky-400 ring-2 ring-sky-500/60 bg-sky-950/25'
                       : 'border-slate-800'
                   }`}
+                  style={{ borderLeftColor: block.color || '#0ea5e9' }}
                 >
                   {/* Block Header */}
                   <div
@@ -1360,70 +1475,79 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                       commitDrop(target);
                     }}
                     onClick={() => handleToggleBlock(block.id)}
-                    className="flex items-center justify-between px-2.5 py-2 bg-slate-900/90 hover:bg-slate-850 cursor-pointer border-b border-slate-800/80 transition-colors group"
+                    className="px-2.5 py-2 bg-slate-900/95 hover:bg-slate-800/75 cursor-pointer border-b border-slate-800/80 transition-colors group"
                   >
-                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                      {!isEditing && (
-                        <GripVertical
-                          className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-300 cursor-grab active:cursor-grabbing shrink-0 -ml-0.5"
-                          aria-label="Drag to reorder block"
-                        />
-                      )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleToggleBlock(block.id);
-                        }}
-                        className="p-0.5 text-slate-400 hover:text-white"
-                      >
-                        {block.collapsed ? (
-                          <ChevronRight className="w-3.5 h-3.5" />
-                        ) : (
-                          <ChevronDown className="w-3.5 h-3.5" />
-                        )}
-                      </button>
-
-                      <span
-                        className="w-2.5 h-2.5 rounded-full shrink-0"
-                        style={{ backgroundColor: block.color || '#0ea5e9' }}
-                      />
-
-                      {isEditing ? (
-                        <div
-                          className="flex items-center gap-1 flex-1"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <input
-                            type="text"
-                            value={editingBlockName}
-                            onChange={(e) => setEditingBlockName(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && handleSaveBlockName(block.id)}
-                            autoFocus
-                            className="bg-slate-950 border border-sky-500 rounded px-1.5 py-0.5 text-xs text-white flex-1"
+                    <div className="flex items-start justify-between gap-1.5">
+                      <div className="flex items-start gap-1.5 min-w-0 flex-1">
+                        {!isEditing && (
+                          <GripVertical
+                            className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-300 cursor-grab active:cursor-grabbing shrink-0 -ml-0.5 mt-0.5"
+                            aria-label="Drag to reorder block"
                           />
-                          <button
-                            onClick={() => handleSaveBlockName(block.id)}
-                            className="p-1 text-emerald-400 hover:text-emerald-300"
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleBlock(block.id);
+                          }}
+                          className="p-0.5 text-slate-400 hover:text-white shrink-0 mt-0.5"
+                        >
+                          {block.collapsed ? (
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          ) : (
+                            <ChevronDown className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+
+                        <span
+                          className="w-2.5 h-2.5 rounded-full shrink-0 mt-1.5"
+                          style={{ backgroundColor: block.color || '#0ea5e9' }}
+                        />
+
+                        {isEditing ? (
+                          <div
+                            className="flex items-center gap-1 flex-1"
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            <Check className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="font-semibold text-xs text-slate-200 truncate">
-                          {block.name}
-                        </span>
-                      )}
+                            <input
+                              type="text"
+                              value={editingBlockName}
+                              onChange={(e) => setEditingBlockName(e.target.value)}
+                              onKeyDown={(e) => e.key === 'Enter' && handleSaveBlockName(block.id)}
+                              autoFocus
+                              className="bg-slate-950 border border-sky-500 rounded px-1.5 py-0.5 text-xs text-white flex-1"
+                            />
+                            <button
+                              onClick={() => handleSaveBlockName(block.id)}
+                              className="p-1 text-emerald-400 hover:text-emerald-300"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ) : (
+                          <span
+                            className="font-semibold text-[13px] text-white leading-snug break-words line-clamp-2"
+                            title={block.name}
+                          >
+                            {block.name}
+                          </span>
+                        )}
+                      </div>
+
+                      <span className="text-[10px] font-mono text-slate-300 bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 rounded shrink-0 mt-0.5">
+                        {blockStepsWithIndex.length} {blockStepsWithIndex.length === 1 ? 'step' : 'steps'}
+                      </span>
                     </div>
 
                     <div
-                      className="flex items-center gap-0.5 shrink-0 ml-2"
+                      className="mt-1 pl-6 flex items-center justify-between gap-2"
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <span className="text-[10px] font-mono text-slate-500 mr-1">
-                        {blockStepsWithIndex.length} {blockStepsWithIndex.length === 1 ? 'step' : 'steps'}
+                      <span className="text-[10px] text-slate-400 truncate">
+                        {block.description || 'Process Module'}
                       </span>
 
-                      <div className="flex items-center opacity-70 group-hover:opacity-100 transition-opacity">
+                      <div className="flex items-center gap-0.5 shrink-0 opacity-75 group-hover:opacity-100 transition-opacity">
                         <button
                           disabled={timelineIdx === 0}
                           onClick={(e) => handleMoveBlock(block.id, 'up', e)}
@@ -1462,7 +1586,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                         </button>
                         <button
                           onClick={(e) => handleDeleteBlock(block.id, e)}
-                          className="p-1 rounded hover:bg-rose-500/20 text-slate-500 hover:text-rose-400 transition-colors"
+                          className="p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition-colors"
                           title="Delete / Ungroup Block"
                         >
                           <Trash2 className="w-3 h-3" />
@@ -1586,7 +1710,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         </div>
 
         {showAddMenu && (
-          <div className="absolute bottom-16 left-3 right-3 p-2 bg-slate-950 border border-slate-700 rounded-2xl shadow-2xl z-30 space-y-1 animate-in fade-in zoom-in-95 duration-100">
+          <div className="absolute bottom-16 left-3 right-3 max-h-[65vh] overflow-y-auto p-2 bg-slate-950 border border-slate-700 rounded-2xl shadow-2xl z-30 space-y-1 animate-in fade-in zoom-in-95 duration-100">
             <div className="flex items-center justify-between px-2 py-1">
               <span className="text-[10px] uppercase font-bold text-slate-400">
                 {addPlacement.mode === 'after-selected'
@@ -1614,7 +1738,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               <Layers className="w-4 h-4 text-sky-400" />
               <div>
                 <div className="font-medium">Thin Film Deposition</div>
-                <div className="text-[10px] text-slate-500">CVD, ALD, Sputter, Evaporation</div>
+                <div className="text-[10px] text-slate-500">CVD, ALD, Sputter, Plating, Dry Film</div>
               </div>
             </button>
             <button
@@ -1624,7 +1748,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               <Scissors className="w-4 h-4 text-rose-400" />
               <div>
                 <div className="font-medium">Photolithography</div>
-                <div className="text-[10px] text-slate-500">Photoresist coat & reticle mask exposure</div>
+                <div className="text-[10px] text-slate-500">Spin / dry film resist & reticle exposure</div>
               </div>
             </button>
             <button
@@ -1675,6 +1799,26 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               <div>
                 <div className="font-medium">Wafer Bonding</div>
                 <div className="text-[10px] text-slate-500">Bond custom substrate or imported pre-processed wafer</div>
+              </div>
+            </button>
+            <button
+              onClick={() => handleAddStep('tape-frame')}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-left hover:bg-slate-800 text-slate-200"
+            >
+              <Frame className="w-4 h-4 text-sky-300" />
+              <div>
+                <div className="font-medium">Tape &amp; Frame</div>
+                <div className="text-[10px] text-slate-500">Mount on dicing/BG tape &amp; ring frame, or UV demount</div>
+              </div>
+            </button>
+            <button
+              onClick={() => handleAddStep('dicing')}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-left hover:bg-slate-800 text-slate-200"
+            >
+              <Slice className="w-4 h-4 text-orange-400" />
+              <div>
+                <div className="font-medium">Wafer Dicing</div>
+                <div className="text-[10px] text-slate-500">Blade saw, laser grooving, stealth or plasma singulation</div>
               </div>
             </button>
           </div>

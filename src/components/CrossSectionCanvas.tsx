@@ -122,6 +122,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   // Hovered layer inspector
   const [hoveredPolygon, setHoveredPolygon] = useState<RenderedPolygon | null>(null);
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [hoverWorldPos, setHoverWorldPos] = useState<{ x: number; y: number } | null>(null);
 
   // Display toggles
   const [showGrid, setShowGrid] = useState<boolean>(true);
@@ -246,6 +247,87 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       return { x: Math.max(0, Math.min(waferWidth, wx)), y: wy };
     },
     [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX, waferWidth]
+  );
+
+  // Compute local vertical thickness of a hovered polygon at cursor world (x, y)
+  const computeLocalThicknessAtPoint = useCallback(
+    (poly: RenderedPolygon, worldX: number, worldY: number): number | null => {
+      const pts = poly.points;
+      if (pts.length >= 3) {
+        const eps = 1e-3;
+        const xProbe =
+          poly.xMax - poly.xMin > eps * 4
+            ? Math.max(poly.xMin + eps, Math.min(poly.xMax - eps, worldX))
+            : (poly.xMin + poly.xMax) * 0.5;
+
+        const ys: number[] = [];
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i];
+          const b = pts[(i + 1) % pts.length];
+          if ((a.x <= xProbe && b.x > xProbe) || (b.x <= xProbe && a.x > xProbe)) {
+            const t = (xProbe - a.x) / (b.x - a.x);
+            ys.push(a.y + t * (b.y - a.y));
+          }
+        }
+        if (ys.length >= 2) {
+          ys.sort((u, v) => u - v);
+          let bestHeight: number | null = null;
+          let bestDist = Infinity;
+          for (let k = 0; k + 1 < ys.length; k += 2) {
+            const yBot = ys[k];
+            const yTop = ys[k + 1];
+            const h = yTop - yBot;
+            if (worldY >= yBot && worldY <= yTop) {
+              return Math.round(h);
+            }
+            const dist = worldY < yBot ? yBot - worldY : worldY - yTop;
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestHeight = h;
+            }
+          }
+          if (bestHeight !== null) return Math.round(bestHeight);
+        }
+      }
+
+      if (mesh.columns.length > 0 && mesh.width > 0) {
+        const colIdx = Math.max(
+          0,
+          Math.min(
+            mesh.columns.length - 1,
+            Math.floor((worldX / mesh.width) * mesh.columns.length)
+          )
+        );
+        const matching = mesh.columns[colIdx].segments.filter(
+          (s) =>
+            s.materialId === poly.materialId &&
+            (!poly.stepId || !s.stepId || s.stepId === poly.stepId)
+        );
+        if (matching.length > 0) {
+          const seg =
+            matching.find((s) => worldY >= s.yBottom && worldY <= s.yTop) ||
+            matching.reduce((best, cur) => {
+              const curDist =
+                worldY < cur.yBottom
+                  ? cur.yBottom - worldY
+                  : worldY > cur.yTop
+                  ? worldY - cur.yTop
+                  : 0;
+              const bestDist =
+                worldY < best.yBottom
+                  ? best.yBottom - worldY
+                  : worldY > best.yTop
+                  ? worldY - best.yTop
+                  : 0;
+              return curDist < bestDist ? cur : best;
+            });
+          return Math.round(seg.yTop - seg.yBottom);
+        }
+      }
+
+      return null;
+    },
+    [mesh.columns, mesh.width]
   );
 
   // Convert polygon points to SVG path with Z-scale
@@ -634,6 +716,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
     const rect = e.currentTarget.getBoundingClientRect();
     setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    const svgP = clientToSvg(e.clientX, e.clientY);
+    if (svgP) {
+      const unscaledX = (svgP.x - pan.x) / zoom;
+      const unscaledY = (svgP.y - pan.y) / zoom;
+      setHoverWorldPos(toWorld(unscaledX, unscaledY));
+    }
 
     if (isPanning) {
       const nextPanX = e.clientX - panStart.x;
@@ -958,6 +1046,101 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 );
               })}
             </g>
+
+            {/* Mounted Dicing Tape Ring Frame Brackets */}
+            {mesh.mountedFrames && mesh.mountedFrames.length > 0 && (
+              <g id="mounted-tape-frames" pointerEvents="none">
+                {mesh.mountedFrames.map((frame, fIdx) => {
+                  const leftX = toScreen(0, 0).x;
+                  const rightX = toScreen(waferWidth, 0).x;
+                  const yTopPx = toScreen(0, frame.yTop).y;
+                  const yBotPx = toScreen(0, frame.yBottom).y;
+                  const yMinPx = Math.min(yTopPx, yBotPx);
+                  const yMaxPx = Math.max(yTopPx, yBotPx);
+                  const clampH = Math.max(8, yMaxPx - yMinPx);
+                  const extW = 24;
+                  const jawW = 10;
+                  const lip = 4;
+
+                  return (
+                    <g key={`tape_frame_${fIdx}_${frame.side}`}>
+                      {/* Tape film extensions into ring frame */}
+                      <rect
+                        x={leftX - extW}
+                        y={yMinPx}
+                        width={extW}
+                        height={clampH}
+                        fill="#0284c7"
+                        fillOpacity="0.65"
+                        stroke="#38bdf8"
+                        strokeWidth="1"
+                      />
+                      <rect
+                        x={rightX}
+                        y={yMinPx}
+                        width={extW}
+                        height={clampH}
+                        fill="#0284c7"
+                        fillOpacity="0.65"
+                        stroke="#38bdf8"
+                        strokeWidth="1"
+                      />
+
+                      {/* Left stainless steel ring frame clamp */}
+                      <rect
+                        x={leftX - extW - jawW}
+                        y={yMinPx - lip}
+                        width={jawW + 6}
+                        height={clampH + lip * 2}
+                        rx="2"
+                        fill="#475569"
+                        stroke="#94a3b8"
+                        strokeWidth="1.2"
+                      />
+                      <line
+                        x1={leftX - extW - jawW + 3}
+                        y1={yMinPx - lip + 3}
+                        x2={leftX - extW - jawW + 3}
+                        y2={yMaxPx + lip - 3}
+                        stroke="#cbd5e1"
+                        strokeWidth="1"
+                      />
+
+                      {/* Right stainless steel ring frame clamp */}
+                      <rect
+                        x={rightX + extW - 6}
+                        y={yMinPx - lip}
+                        width={jawW + 6}
+                        height={clampH + lip * 2}
+                        rx="2"
+                        fill="#475569"
+                        stroke="#94a3b8"
+                        strokeWidth="1.2"
+                      />
+                      <line
+                        x1={rightX + extW + jawW - 3}
+                        y1={yMinPx - lip + 3}
+                        x2={rightX + extW + jawW - 3}
+                        y2={yMaxPx + lip - 3}
+                        stroke="#cbd5e1"
+                        strokeWidth="1"
+                      />
+
+                      <text
+                        x={rightX + extW + jawW + 5}
+                        y={(yMinPx + yMaxPx) / 2 + 3}
+                        fill="#38bdf8"
+                        fontSize="8.5"
+                        fontWeight="600"
+                        fontFamily="JetBrains Mono, monospace"
+                      >
+                        FRAME
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            )}
 
             {/* Wafer X Axis & Coordinates */}
             <g id="wafer-axes">
@@ -1320,31 +1503,44 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           <div
             className="absolute pointer-events-none z-20 px-3 py-2 rounded-xl bg-slate-900/95 border border-sky-500/50 text-white shadow-2xl backdrop-blur-md"
             style={{
-              left: `${Math.min(svgWidth - 200, Math.max(10, mousePos.x + 15))}px`,
-              top: `${Math.max(10, Math.min(svgHeight - 85, mousePos.y - 65))}px`,
+              left: `${Math.min(svgWidth - 230, Math.max(10, mousePos.x + 15))}px`,
+              top: `${Math.max(10, Math.min(svgHeight - 108, mousePos.y - 78))}px`,
             }}
           >
             {(() => {
               const mat = getMaterialById(materials, hoveredPolygon.materialId);
-              const heightNm = Math.round(hoveredPolygon.yMax - hoveredPolygon.yMin);
+              const zSpanNm = Math.round(hoveredPolygon.yMax - hoveredPolygon.yMin);
+              const localNm = hoverWorldPos
+                ? computeLocalThicknessAtPoint(hoveredPolygon, hoverWorldPos.x, hoverWorldPos.y)
+                : null;
               return (
                 <div className="space-y-1 text-xs">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="w-3 h-3 rounded-full border border-white/20 shrink-0"
-                      style={{ backgroundColor: mat.color }}
-                    />
-                    <span className="font-semibold text-sky-300">{mat.name}</span>
-                  </div>
-                  <div className="text-[11px] text-slate-300 font-mono flex items-center gap-2">
-                    <span>
-                      Thickness: {formatThickness(heightNm, thicknessUnit)}
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className="w-3 h-3 rounded-full border border-white/20 shrink-0"
+                        style={{ backgroundColor: mat.color }}
+                      />
+                      <span className="font-semibold text-sky-300 truncate">{mat.name}</span>
+                    </div>
+                    <span className="text-[10px] text-slate-400 capitalize shrink-0">
+                      {mat.category}
                     </span>
-                    <span className="text-slate-500">|</span>
-                    <span className="text-slate-400 capitalize">{mat.category}</span>
+                  </div>
+                  <div className="text-[11px] font-mono space-y-0.5 pt-0.5">
+                    <div className="flex items-center justify-between gap-3 text-slate-100">
+                      <span className="text-slate-400">Local Thickness:</span>
+                      <span className="font-semibold text-emerald-300">
+                        {formatThickness(localNm ?? zSpanNm, thicknessUnit)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 text-slate-300">
+                      <span className="text-slate-400">Total Z-Span:</span>
+                      <span>{formatThickness(zSpanNm, thicknessUnit)}</span>
+                    </div>
                   </div>
                   {hoveredPolygon.stepId && (
-                    <div className="text-[10px] text-slate-400">
+                    <div className="text-[10px] text-slate-400 pt-0.5 border-t border-slate-800/80">
                       Step: {hoveredPolygon.stepId}
                     </div>
                   )}

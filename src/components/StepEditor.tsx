@@ -16,9 +16,19 @@ import {
   ProcessBlock,
   PhotomaskLevel,
   BondingConfig,
+  DicingConfig,
+  TapeFrameConfig,
+  EtchRecipe,
 } from '../types/microfab';
 import { ThicknessUnit, getUnitLabel, formatThickness } from '../lib/units';
 import { resolveResistMaterialId } from '../lib/materials';
+import {
+  getEtchRecipes,
+  getEtchRateNmMin,
+  computeSelectivityRatio,
+  formatEtchRate,
+  formatDurationCompact,
+} from '../lib/etchRates';
 import { ThicknessInput } from './ThicknessInput';
 import {
   Layers,
@@ -46,15 +56,20 @@ import {
   Upload,
   FileCheck,
   FlipHorizontal2,
+  Frame,
+  Slice,
+  FlaskConical,
 } from 'lucide-react';
 
 interface StepEditorProps {
   step: ProcessStep;
   waferWidth: number;
   materials: Material[];
+  etchRecipes?: EtchRecipe[];
   thicknessUnit?: ThicknessUnit;
   onUpdateStep: (updated: ProcessStep) => void;
   onOpenMaterialsModal: () => void;
+  onOpenEtchLibrary?: () => void;
   onMergeMaterials?: (materials: Material[]) => void;
   blocks?: ProcessBlock[];
   masks?: PhotomaskLevel[];
@@ -66,9 +81,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   step,
   waferWidth,
   materials,
+  etchRecipes,
   thicknessUnit = 'nm',
   onUpdateStep,
   onOpenMaterialsModal,
+  onOpenEtchLibrary,
   onMergeMaterials,
   blocks,
   masks,
@@ -112,7 +129,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full min-w-0 bg-slate-900 border-l border-slate-800 text-slate-200">
+    <div className="flex flex-col h-full min-w-0 bg-slate-900 text-slate-200">
       {/* Editor Header */}
       <div className="p-4 border-b border-slate-800">
         <div className="flex items-center justify-between mb-2">
@@ -292,6 +309,36 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       };
                     }
                   }
+                  if (newType === 'dicing' && !step.dicing) {
+                    patch.dicing = {
+                      method: 'blade',
+                      cutMode: 'through-wafer',
+                      kerfWidth: 400,
+                      cutDepth: 1500,
+                      sidewallAngle: 90,
+                      tapeOvercut: 120,
+                      streets: [
+                        {
+                          id: `street_${Date.now()}`,
+                          xCenter: Math.round(waferWidth * 0.5),
+                        },
+                      ],
+                    };
+                  }
+                  if (newType === 'tape-frame') {
+                    if (!step.side || step.side === 'both') {
+                      patch.side = 'back';
+                    }
+                    if (!step.tapeFrame) {
+                      patch.tapeFrame = {
+                        action: 'mount',
+                        tapeMaterialId: 'mat_dicing_tape',
+                        thickness: 600,
+                        conformality: 'flat',
+                        showFrame: true,
+                      };
+                    }
+                  }
                   handleUpdate(patch);
                 }}
                 className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 text-xs font-medium focus:outline-none focus:border-sky-500"
@@ -303,6 +350,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                 <option value="liftoff">Metal Lift-off</option>
                 <option value="cmp">Grind/Polish/Planarize (Grinding &amp; CMP)</option>
                 <option value="bonding">Wafer Bonding (Substrate / Pre-Processed Flow)</option>
+                <option value="tape-frame">Tape &amp; Frame (Mount / UV Demount)</option>
+                <option value="dicing">Wafer Dicing (Blade / Laser / Plasma)</option>
                 <option value="anneal">Thermal Anneal / Drive-In</option>
                 <option value="substrate">Substrate Initialization</option>
               </select>
@@ -313,7 +362,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-xs font-medium text-slate-400">
-                    {step.type === 'bonding' ? 'Bond Target Side' : 'Substrate Side'}
+                    {step.type === 'bonding'
+                      ? 'Bond Target Side'
+                      : step.type === 'tape-frame'
+                      ? 'Tape Lamination Side'
+                      : 'Substrate Side'}
                   </label>
                   <span className="text-[10px] font-mono text-slate-500">
                     {(step.side || 'front') === 'front'
@@ -325,22 +378,27 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                 </div>
                 <div
                   className={`grid ${
-                    step.type === 'bonding' ? 'grid-cols-2' : 'grid-cols-3'
+                    step.type === 'bonding' || step.type === 'tape-frame'
+                      ? 'grid-cols-2'
+                      : 'grid-cols-3'
                   } gap-1 p-1 rounded-lg bg-slate-950 border border-slate-800 text-xs`}
                 >
                   {(
                     [
                       { id: 'front' as ProcessSide, label: 'Front', icon: ArrowUp, activeClass: 'bg-sky-600 text-white shadow-sm' },
                       { id: 'back' as ProcessSide, label: 'Back', icon: ArrowDown, activeClass: 'bg-amber-600 text-white shadow-sm' },
-                      ...(step.type === 'bonding'
+                      ...(step.type === 'bonding' || step.type === 'tape-frame'
                         ? []
                         : [{ id: 'both' as ProcessSide, label: 'Both Sides', icon: ArrowUpDown, activeClass: 'bg-emerald-600 text-white shadow-sm' }]),
                     ]
                   ).map((opt) => {
                     const currentSide: ProcessSide =
-                      step.type === 'bonding' && step.side === 'both'
-                        ? 'front'
-                        : step.side || 'front';
+                      (step.type === 'bonding' || step.type === 'tape-frame') &&
+                      step.side === 'both'
+                        ? step.type === 'tape-frame'
+                          ? 'back'
+                          : 'front'
+                        : step.side || (step.type === 'tape-frame' ? 'back' : 'front');
                     const isActive = currentSide === opt.id;
                     const Icon = opt.icon;
                     return (
@@ -423,18 +481,60 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     </label>
                     <select
                       value={step.deposition?.method || 'PECVD'}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const nextMethod = e.target.value as NonNullable<ProcessStep['deposition']>['method'];
+                        const prevDep = step.deposition || {
+                          depositionType: 'conformal' as const,
+                          thickness: step.thickness || 200,
+                          method: 'PECVD' as const,
+                        };
+                        const wasPlating =
+                          prevDep.method === 'Electroplating' ||
+                          prevDep.method === 'Electroless Plating';
+                        const isNextPlating =
+                          nextMethod === 'Electroplating' ||
+                          nextMethod === 'Electroless Plating';
+                        const wasDryFilm = prevDep.method === 'Dry Film Lamination';
+                        const isNextDryFilm = nextMethod === 'Dry Film Lamination';
+                        const wasSpinCoat = prevDep.method === 'Spin Coat';
+                        const isNextSpinCoat = nextMethod === 'Spin Coat';
+
                         handleUpdate({
                           deposition: {
-                            ...(step.deposition || {
-                              depositionType: 'conformal',
-                              thickness: step.thickness || 200,
-                              method: 'PECVD',
-                            }),
-                            method: e.target.value as any,
+                            ...prevDep,
+                            method: nextMethod,
+                            ...(isNextPlating && !wasPlating
+                              ? {
+                                  depositionType:
+                                    nextMethod === 'Electroplating'
+                                      ? 'bottom-up'
+                                      : 'conformal',
+                                  platingSelective: prevDep.platingSelective ?? true,
+                                  platingSeedScope: prevDep.platingSeedScope ?? 'conductive',
+                                }
+                              : isNextDryFilm && !wasDryFilm
+                              ? {
+                                  depositionType: 'dry-film' as const,
+                                  laminationSag: prevDep.laminationSag ?? 0,
+                                }
+                              : isNextSpinCoat && !wasSpinCoat
+                              ? {
+                                  depositionType: 'spin-coat' as const,
+                                  planarization: prevDep.planarization ?? 100,
+                                }
+                              : !isNextDryFilm &&
+                                (prevDep.depositionType === 'dry-film' ||
+                                  (wasSpinCoat && prevDep.depositionType === 'spin-coat'))
+                              ? {
+                                  depositionType:
+                                    nextMethod === 'E-Beam Evaporation'
+                                      ? 'directional'
+                                      : 'conformal',
+                                }
+                              : {}),
                           },
-                        })
-                      }
+                        });
+                      }}
                       className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
                     >
                       <option value="PECVD">PECVD</option>
@@ -442,8 +542,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <option value="ALD">ALD (Atomic Layer)</option>
                       <option value="Sputter">Sputtering (PVD)</option>
                       <option value="E-Beam Evaporation">E-Beam Evap</option>
+                      <option value="Electroplating">Electroplating (ECD)</option>
+                      <option value="Electroless Plating">Electroless Plating</option>
                       <option value="Thermal Oxidation">Thermal Oxide</option>
                       <option value="Spin Coat">Spin Coat</option>
+                      <option value="Dry Film Lamination">Dry Film Lamination</option>
                     </select>
                   </div>
                 </div>
@@ -471,9 +574,312 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     <option value="conformal">Conformal (Uniform sidewalls & top)</option>
                     <option value="directional">Directional (Line-of-sight, E-Beam)</option>
                     <option value="semi-conformal">Semi-Conformal (Custom sidewall coverage)</option>
-                    <option value="spin-coat">Planarizing Spin-Coat (Fills valleys flat)</option>
+                    <option value="spin-coat">Planarizing Spin-Coat / Superfill (Fills valleys flat)</option>
+                    <option value="dry-film">Dry Film Lamination / Tenting (Bridges cavities flat)</option>
+                    <option value="bottom-up">Bottom-Up / Through-Mask Plating (Vertical growth)</option>
                   </select>
                 </div>
+
+                {step.deposition?.depositionType === 'spin-coat' && (
+                  <div className="pt-2.5 border-t border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">
+                        Planarization (Viscosity vs Topography)
+                      </span>
+                      <span className="font-mono text-sky-400">
+                        {step.deposition?.planarization ?? 100}%{' '}
+                        {(step.deposition?.planarization ?? 100) >= 95
+                          ? '(Ideal Flat)'
+                          : (step.deposition?.planarization ?? 100) >= 65
+                          ? '(Low Visc.)'
+                          : (step.deposition?.planarization ?? 100) >= 35
+                          ? '(Moderate)'
+                          : '(High Visc.)'}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={step.deposition?.planarization ?? 100}
+                      onChange={(e) =>
+                        handleUpdate({
+                          deposition: {
+                            ...(step.deposition || {
+                              method: 'Spin Coat',
+                              depositionType: 'spin-coat',
+                              thickness: step.thickness || 200,
+                            }),
+                            planarization: parseInt(e.target.value, 10),
+                          },
+                        })
+                      }
+                      className="w-full accent-sky-500"
+                    />
+                    <div className="flex items-center justify-between gap-1">
+                      {[
+                        { val: 25, label: '25% High Visc.' },
+                        { val: 65, label: '65% Standard' },
+                        { val: 100, label: '100% Ideal' },
+                      ].map((preset) => {
+                        const active = (step.deposition?.planarization ?? 100) === preset.val;
+                        return (
+                          <button
+                            key={preset.val}
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                deposition: {
+                                  ...(step.deposition || {
+                                    method: 'Spin Coat',
+                                    depositionType: 'spin-coat',
+                                    thickness: step.thickness || 200,
+                                  }),
+                                  planarization: preset.val,
+                                },
+                              })
+                            }
+                            className={`flex-1 py-1 rounded text-[10px] font-mono border transition-colors ${
+                              active
+                                ? 'bg-sky-500/20 border-sky-500/60 text-sky-300'
+                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      {(step.deposition?.planarization ?? 100) >= 95
+                        ? 'Ideal planarization: levels completely flat across all steps and valleys.'
+                        : 'Models non-ideal viscous spin-coating: capillary forces fill narrow trenches faster while wider topography steps sag and dish.'}
+                    </p>
+                  </div>
+                )}
+
+                {(step.deposition?.method === 'Dry Film Lamination' ||
+                  step.deposition?.depositionType === 'dry-film') && (
+                  <div className="pt-2.5 border-t border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">
+                        Vacuum / Roll Conformality (Sag)
+                      </span>
+                      <span className="font-mono text-sky-400">
+                        {step.deposition?.laminationSag ?? 0}%{' '}
+                        {(step.deposition?.laminationSag ?? 0) === 0
+                          ? '(Rigid Tent)'
+                          : (step.deposition?.laminationSag ?? 0) <= 45
+                          ? '(Warm Roll)'
+                          : '(Vacuum Drape)'}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={step.deposition?.laminationSag ?? 0}
+                      onChange={(e) =>
+                        handleUpdate({
+                          deposition: {
+                            ...(step.deposition || {
+                              method: 'Dry Film Lamination',
+                              depositionType: 'dry-film',
+                              thickness: step.thickness || 200,
+                            }),
+                            laminationSag: parseInt(e.target.value, 10),
+                          },
+                        })
+                      }
+                      className="w-full accent-sky-500"
+                    />
+                    <div className="flex items-center justify-between gap-1">
+                      {[
+                        { val: 0, label: '0% Rigid Tent' },
+                        { val: 35, label: '35% Warm Roll' },
+                        { val: 75, label: '75% Vacuum' },
+                      ].map((preset) => {
+                        const active = (step.deposition?.laminationSag ?? 0) === preset.val;
+                        return (
+                          <button
+                            key={preset.val}
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                deposition: {
+                                  ...(step.deposition || {
+                                    method: 'Dry Film Lamination',
+                                    depositionType: 'dry-film',
+                                    thickness: step.thickness || 200,
+                                  }),
+                                  laminationSag: preset.val,
+                                },
+                              })
+                            }
+                            className={`flex-1 py-1 rounded text-[10px] font-mono border transition-colors ${
+                              active
+                                ? 'bg-sky-500/20 border-sky-500/60 text-sky-300'
+                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      {(step.deposition?.laminationSag ?? 0) === 0
+                        ? 'Laminates as a flat rigid sheet over peaks, tenting across channels & cavities to form sealed voids.'
+                        : 'Bridges narrow trenches while smoothly draping onto wider open terraces under roller/vacuum pressure.'}
+                    </p>
+
+                    {(() => {
+                      const activeMat = materials.find(
+                        (m) => m.id === (step.materialId || 'mat_sio2_thermal')
+                      );
+                      const filmCandidates = materials.filter(
+                        (m) => m.category === 'polymer' || m.category === 'photoresist'
+                      );
+                      if (
+                        activeMat &&
+                        (activeMat.category === 'polymer' || activeMat.category === 'photoresist')
+                      ) {
+                        return null;
+                      }
+                      if (filmCandidates.length === 0) return null;
+                      return (
+                        <div className="p-2 rounded-lg bg-sky-950/30 border border-sky-500/30 space-y-1.5">
+                          <div className="text-[10px] text-sky-300 leading-snug">
+                            Selected material ({activeMat?.name || 'dielectric'}) is inorganic. Quick-select a dry film sheet:
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {filmCandidates.slice(0, 4).map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => handleUpdate({ materialId: m.id })}
+                                className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] text-slate-200 font-mono"
+                              >
+                                {m.name}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+
+                {(step.deposition?.method === 'Electroplating' ||
+                  step.deposition?.method === 'Electroless Plating') && (
+                  <div className="pt-2.5 border-t border-slate-800 space-y-2.5">
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(step.deposition?.platingSelective)}
+                        onChange={(e) =>
+                          handleUpdate({
+                            deposition: {
+                              ...step.deposition!,
+                              platingSelective: e.target.checked,
+                              platingSeedScope:
+                                step.deposition?.platingSeedScope ?? 'conductive',
+                            },
+                          })
+                        }
+                        className="mt-0.5 rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-[11px] font-medium text-slate-200 block">
+                          Selective Seed-Surface Plating
+                        </span>
+                        <span className="text-[10px] text-slate-400 leading-snug block">
+                          Plates only onto exposed seed/conductive regions; skips photoresist molds &amp; dielectrics.
+                        </span>
+                      </div>
+                    </label>
+
+                    {step.deposition?.platingSelective && (
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-slate-400 block font-medium">
+                          Active Plating Seed Surfaces
+                        </span>
+                        <div className="grid grid-cols-2 gap-1.5 bg-slate-900 p-1 rounded-lg border border-slate-800 text-[10px]">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                deposition: {
+                                  ...step.deposition!,
+                                  platingSeedScope: 'conductive',
+                                },
+                              })
+                            }
+                            className={`py-1 px-2 rounded font-medium transition-colors ${
+                              (step.deposition?.platingSeedScope ?? 'conductive') ===
+                              'conductive'
+                                ? 'bg-sky-600 text-white'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            Metals &amp; Si
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                deposition: {
+                                  ...step.deposition!,
+                                  platingSeedScope: 'metal-only',
+                                },
+                              })
+                            }
+                            className={`py-1 px-2 rounded font-medium transition-colors ${
+                              step.deposition?.platingSeedScope === 'metal-only'
+                                ? 'bg-sky-600 text-white'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            Metals Only
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {(() => {
+                      const activeMat = materials.find(
+                        (m) => m.id === (step.materialId || 'mat_sio2_thermal')
+                      );
+                      const metalCandidates = materials
+                        .filter((m) => m.category === 'metal')
+                        .slice(0, 4);
+                      if (activeMat?.category === 'metal' || metalCandidates.length === 0) {
+                        return null;
+                      }
+                      return (
+                        <div className="p-2 rounded-lg bg-amber-950/30 border border-amber-500/30 space-y-1.5">
+                          <div className="text-[10px] text-amber-300 leading-snug">
+                            Selected material ({activeMat?.name || 'oxide'}) is non-metallic. Quick-select a plated metal:
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {metalCandidates.map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => handleUpdate({ materialId: m.id })}
+                                className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] text-slate-200 font-mono"
+                              >
+                                {m.formula}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
 
                 {step.deposition?.depositionType === 'directional' && (
                   <div className="pt-2.5 border-t border-slate-800 space-y-2">
@@ -821,6 +1227,181 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   )}
                 </div>
 
+                <div className="space-y-1.5">
+                  <label className="block text-[11px] text-slate-400">
+                    Resist Application Method
+                  </label>
+                  <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                    {(
+                      [
+                        { id: 'spin-coat' as const, label: 'Spin Coat (Fill)' },
+                        { id: 'dry-film' as const, label: 'Dry Film Lamination' },
+                      ]
+                    ).map((opt) => {
+                      const active = (step.lithography?.coatMethod ?? 'spin-coat') === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            const prevLith = step.lithography || {
+                              resistMaterialId: 'mat_pr_pos',
+                              resistThickness: 1000,
+                              polarity: 'positive' as const,
+                              windows: [],
+                              sidewallAngle: 90,
+                              exposureMethod: 'UV Contact (365nm)' as const,
+                            };
+                            const hasDfr = materials.some((m) => m.id === 'mat_dfr');
+                            handleUpdate({
+                              lithography: {
+                                ...prevLith,
+                                coatMethod: opt.id,
+                                ...(opt.id === 'dry-film' &&
+                                hasDfr &&
+                                (prevLith.resistMaterialId === 'mat_pr_pos' ||
+                                  prevLith.resistMaterialId === 'mat_pr_neg')
+                                  ? { resistMaterialId: 'mat_dfr' }
+                                  : opt.id === 'spin-coat' &&
+                                    prevLith.resistMaterialId === 'mat_dfr'
+                                  ? {
+                                      resistMaterialId:
+                                        prevLith.polarity === 'negative'
+                                          ? 'mat_pr_neg'
+                                          : 'mat_pr_pos',
+                                    }
+                                  : {}),
+                              },
+                            });
+                          }}
+                          className={`py-1 px-2 rounded-md font-medium transition-colors ${
+                            active
+                              ? 'bg-rose-600 text-white shadow-sm'
+                              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {(step.lithography?.coatMethod ?? 'spin-coat') === 'spin-coat' ? (
+                  <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">
+                        Spin-Coat Planarization (Viscosity)
+                      </span>
+                      <span className="font-mono text-rose-400">
+                        {step.lithography?.planarization ?? 100}%{' '}
+                        {(step.lithography?.planarization ?? 100) >= 95
+                          ? '(Ideal)'
+                          : (step.lithography?.planarization ?? 100) >= 50
+                          ? '(Partial)'
+                          : '(High Visc.)'}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={step.lithography?.planarization ?? 100}
+                      onChange={(e) =>
+                        handleUpdate({
+                          lithography: {
+                            ...(step.lithography || {
+                              resistMaterialId: 'mat_pr_pos',
+                              resistThickness: 1000,
+                              polarity: 'positive',
+                              windows: [],
+                              sidewallAngle: 90,
+                              exposureMethod: 'UV Contact (365nm)',
+                            }),
+                            planarization: parseInt(e.target.value, 10),
+                          },
+                        })
+                      }
+                      className="w-full accent-rose-500"
+                    />
+                    <div className="flex items-center justify-between gap-1">
+                      {[
+                        { val: 25, label: '25% High Visc.' },
+                        { val: 65, label: '65% Standard' },
+                        { val: 100, label: '100% Ideal' },
+                      ].map((preset) => {
+                        const active = (step.lithography?.planarization ?? 100) === preset.val;
+                        return (
+                          <button
+                            key={preset.val}
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                lithography: {
+                                  ...(step.lithography || {
+                                    resistMaterialId: 'mat_pr_pos',
+                                    resistThickness: 1000,
+                                    polarity: 'positive',
+                                    windows: [],
+                                    sidewallAngle: 90,
+                                    exposureMethod: 'UV Contact (365nm)',
+                                  }),
+                                  planarization: preset.val,
+                                },
+                              })
+                            }
+                            className={`flex-1 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                              active
+                                ? 'bg-rose-500/20 border-rose-500/60 text-rose-300'
+                                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      {(step.lithography?.planarization ?? 100) >= 95
+                        ? 'Flat planarized resist surface across all underlying topography.'
+                        : 'High-viscosity resist dips over wide valleys while narrow trenches fill more flatly.'}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">
+                        Lamination Conformality (Sag)
+                      </span>
+                      <span className="font-mono text-rose-400">
+                        {step.lithography?.laminationSag ?? 0}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={step.lithography?.laminationSag ?? 0}
+                      onChange={(e) =>
+                        handleUpdate({
+                          lithography: {
+                            ...step.lithography!,
+                            laminationSag: parseInt(e.target.value, 10),
+                          },
+                        })
+                      }
+                      className="w-full accent-rose-500"
+                    />
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      {(step.lithography?.laminationSag ?? 0) === 0
+                        ? 'Dry film resist tents flat across cavities before UV exposure & development.'
+                        : 'Dry film bridges narrow trenches while draping into wider topography.'}
+                    </p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-[11px] text-slate-400 mb-1">
@@ -939,40 +1520,314 @@ export const StepEditor: React.FC<StepEditorProps> = ({
             )}
 
             {/* Customization for ETCH */}
-            {step.type === 'etch' && (
-              <div className="space-y-3.5 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800">
-                <span className="text-xs font-semibold text-amber-400">
-                  Etch Parameters & Isotropy
-                </span>
+            {step.type === 'etch' && (() => {
+              const libraryRecipes = getEtchRecipes(etchRecipes);
+              const linkedRecipe = step.etch?.etchRecipeId
+                ? libraryRecipes.find((r) => r.id === step.etch?.etchRecipeId)
+                : undefined;
+              const rateMode =
+                linkedRecipe && step.etch?.rateMode === 'time-rate'
+                  ? 'time-rate'
+                  : 'manual';
+              const targetMatId = step.etch?.targetMaterialId || 'all';
+              const refMatId =
+                targetMatId !== 'all'
+                  ? targetMatId
+                  : linkedRecipe?.primaryMaterialId || 'mat_si_sub';
+              const refMat = materials.find((m) => m.id === refMatId);
+              const refRate = linkedRecipe ? getEtchRateNmMin(linkedRecipe, refMatId) : 0;
+              const prRate = linkedRecipe ? getEtchRateNmMin(linkedRecipe, 'mat_pr_pos') : 0;
+              const stopMatId = step.etch?.stopLayerMaterialId;
+              const stopRate =
+                linkedRecipe && stopMatId
+                  ? getEtchRateNmMin(linkedRecipe, stopMatId)
+                  : undefined;
+              const etchTimeSec = step.etch?.etchTimeSec ?? 60;
+              const currentDepth = step.etch?.depth ?? step.thickness ?? 300;
+              const estTimeSec =
+                refRate > 0 ? Math.max(1, (currentDepth / refRate) * 60) : 0;
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">
-                      Etch Depth ({getUnitLabel(thicknessUnit)})
-                    </label>
-                    <ThicknessInput
-                      valueNm={step.etch?.depth ?? step.thickness ?? 300}
-                      onChangeNm={(val) => {
+              return (
+              <div className="space-y-3.5 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-amber-400">
+                    Etch Parameters &amp; Isotropy
+                  </span>
+                  {onOpenEtchLibrary && (
+                    <button
+                      type="button"
+                      onClick={onOpenEtchLibrary}
+                      className="flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 hover:underline shrink-0"
+                    >
+                      <FlaskConical className="w-3 h-3" />
+                      <span>Etch Rate Library</span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Etch Rate Library Recipe Selector */}
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    Etch Chemistry / Rate Recipe
+                  </label>
+                  <select
+                    value={step.etch?.etchRecipeId || ''}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      if (!nextId) {
                         handleUpdate({
-                          thickness: val,
                           etch: {
                             ...(step.etch || {
                               etchType: 'rie',
+                              depth: currentDepth,
                               targetMaterialId: 'all',
-                              depth: val,
                               isotropy: 0.05,
                               sidewallAngle: 90,
                             }),
-                            depth: val,
+                            etchRecipeId: undefined,
+                            rateMode: 'manual',
                           },
                         });
-                      }}
-                      unit={thicknessUnit}
-                      minNm={10}
-                      stepNm={25}
-                      className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
-                    />
+                        return;
+                      }
+                      const chosen = libraryRecipes.find((r) => r.id === nextId);
+                      if (!chosen) return;
+                      const chosenRefMatId =
+                        targetMatId !== 'all' ? targetMatId : chosen.primaryMaterialId;
+                      const chosenRefRate = getEtchRateNmMin(chosen, chosenRefMatId);
+                      const nextMode = step.etch?.rateMode || 'time-rate';
+                      const nextSec =
+                        step.etch?.etchTimeSec ||
+                        (chosenRefRate > 0
+                          ? Math.max(5, Math.min(600, Math.round((currentDepth / chosenRefRate) * 60)))
+                          : 60);
+                      const derivedDepth =
+                        nextMode === 'time-rate' && chosenRefRate > 0
+                          ? Math.max(5, Math.round((chosenRefRate * nextSec) / 60))
+                          : currentDepth;
+
+                      handleUpdate({
+                        thickness: derivedDepth,
+                        etch: {
+                          ...(step.etch || {
+                            etchType: chosen.etchType,
+                            depth: derivedDepth,
+                            targetMaterialId: 'all',
+                            isotropy: chosen.isotropy,
+                            sidewallAngle: chosen.sidewallAngle,
+                          }),
+                          etchRecipeId: chosen.id,
+                          etchType: chosen.etchType,
+                          isotropy: chosen.isotropy,
+                          sidewallAngle: chosen.sidewallAngle,
+                          scallopEffect: chosen.scallopEffect ?? (chosen.etchType === 'drie-bosch'),
+                          scallopDepth: chosen.scallopDepth ?? step.etch?.scallopDepth,
+                          scallopPitch: chosen.scallopPitch ?? step.etch?.scallopPitch,
+                          ardeEnabled: chosen.ardeEnabled ?? step.etch?.ardeEnabled,
+                          ardeStrength: chosen.ardeStrength ?? step.etch?.ardeStrength,
+                          rateMode: nextMode,
+                          etchTimeSec: nextSec,
+                          depth: derivedDepth,
+                        },
+                        toolRecipe: {
+                          ...(step.toolRecipe || {
+                            toolName: '',
+                            gases: '',
+                            power: '',
+                            pressure: '',
+                            temperature: '',
+                            duration: '',
+                          }),
+                          toolName: chosen.toolName || step.toolRecipe?.toolName || '',
+                          gases: chosen.gases || chosen.chemistry,
+                          power: chosen.power || '',
+                          pressure: chosen.pressure || '',
+                          temperature: chosen.temperature || '',
+                          duration: formatDurationCompact(nextSec),
+                          targetRate:
+                            chosenRefRate > 0
+                              ? formatEtchRate(chosenRefRate, thicknessUnit)
+                              : '',
+                        },
+                      });
+                    }}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-amber-500"
+                  >
+                    <option value="">-- Manual Depth (Custom Parameters) --</option>
+                    {libraryRecipes.map((r) => {
+                      const rRate = getEtchRateNmMin(r, r.primaryMaterialId);
+                      return (
+                        <option key={r.id} value={r.id}>
+                          {r.name} ({r.chemistry} · {formatEtchRate(rRate, thicknessUnit)})
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                {/* Mode Switcher & Selectivity Readout when Recipe Linked */}
+                {linkedRecipe && (
+                  <div className="p-2.5 rounded-lg bg-amber-950/25 border border-amber-500/30 space-y-2 text-[11px]">
+                    <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-slate-950 border border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const syncedDepth =
+                            refRate > 0
+                              ? Math.max(5, Math.round((refRate * etchTimeSec) / 60))
+                              : currentDepth;
+                          handleUpdate({
+                            thickness: syncedDepth,
+                            etch: {
+                              ...step.etch!,
+                              rateMode: 'time-rate',
+                              etchTimeSec,
+                              depth: syncedDepth,
+                            },
+                          });
+                        }}
+                        className={`py-1 px-2 rounded text-[10px] font-medium transition-colors ${
+                          rateMode === 'time-rate'
+                            ? 'bg-amber-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Time &amp; Rate Physics
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdate({
+                            etch: {
+                              ...step.etch!,
+                              rateMode: 'manual',
+                            },
+                          })
+                        }
+                        className={`py-1 px-2 rounded text-[10px] font-medium transition-colors ${
+                          rateMode === 'manual'
+                            ? 'bg-amber-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Fixed Target Depth
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-1.5 text-[10px] font-mono text-slate-300">
+                      <span>
+                        {refMat?.formula || 'Target'}:{' '}
+                        <strong className="text-amber-300">
+                          {formatEtchRate(refRate, thicknessUnit)}
+                        </strong>
+                      </span>
+                      <span>
+                        vs PR:{' '}
+                        <strong className="text-emerald-300">
+                          {computeSelectivityRatio(refRate, prRate)}
+                        </strong>
+                        {prRate > 0 && (() => {
+                          const effSec =
+                            rateMode === 'time-rate' ? etchTimeSec : estTimeSec;
+                          const prLossNm = Math.round((prRate * effSec) / 60);
+                          return prLossNm > 0 ? (
+                            <span className="text-rose-300">
+                              {' '}(-{formatThickness(prLossNm, thicknessUnit)})
+                            </span>
+                          ) : null;
+                        })()}
+                      </span>
+                      {stopRate !== undefined && (
+                        <span>
+                          vs Stop:{' '}
+                          <strong className="text-sky-300">
+                            {computeSelectivityRatio(refRate, stopRate)}
+                          </strong>
+                        </span>
+                      )}
+                    </div>
+
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      {rateMode === 'time-rate'
+                        ? 'Multi-layer selectivity & photoresist mask erosion active; 0-rate layers act as etch stops.'
+                        : 'Fixed target depth active; photoresist mask erodes proportionally by recipe selectivity.'}
+                    </p>
                   </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  {linkedRecipe && rateMode === 'time-rate' ? (
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Etch Time (sec)
+                      </label>
+                      <div className="space-y-1">
+                        <input
+                          type="number"
+                          min={1}
+                          step={5}
+                          value={etchTimeSec}
+                          onChange={(e) => {
+                            const sec = Math.max(1, parseFloat(e.target.value) || 1);
+                            const nextDepth =
+                              refRate > 0
+                                ? Math.max(5, Math.round((refRate * sec) / 60))
+                                : currentDepth;
+                            handleUpdate({
+                              thickness: nextDepth,
+                              etch: {
+                                ...step.etch!,
+                                etchTimeSec: sec,
+                                depth: nextDepth,
+                              },
+                            });
+                          }}
+                          className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-amber-500"
+                        />
+                        <div className="flex items-center justify-between text-[10px] font-mono text-amber-300/90">
+                          <span>{formatDurationCompact(etchTimeSec)}</span>
+                          <span>
+                            {refRate > 0
+                              ? `→ ${formatThickness(Math.round((refRate * etchTimeSec) / 60), thicknessUnit)}`
+                              : '0 nm'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Etch Depth ({getUnitLabel(thicknessUnit)})
+                      </label>
+                      <ThicknessInput
+                        valueNm={step.etch?.depth ?? step.thickness ?? 300}
+                        onChangeNm={(val) => {
+                          handleUpdate({
+                            thickness: val,
+                            etch: {
+                              ...(step.etch || {
+                                etchType: 'rie',
+                                targetMaterialId: 'all',
+                                depth: val,
+                                isotropy: 0.05,
+                                sidewallAngle: 90,
+                              }),
+                              depth: val,
+                            },
+                          });
+                        }}
+                        unit={thicknessUnit}
+                        minNm={10}
+                        stepNm={25}
+                        className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      />
+                      {linkedRecipe && refRate > 0 && (
+                        <span className="text-[10px] font-mono text-amber-300/90 block mt-0.5">
+                          Est. time: {formatDurationCompact(estTimeSec)}
+                        </span>
+                      )}
+                    </div>
+                  )}
 
                   <div>
                     <label className="block text-[11px] text-slate-400 mb-1">
@@ -1440,7 +2295,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </div>
                 )}
               </div>
-            )}
+              );
+            })()}
 
             {/* Customization for STRIP / LIFTOFF */}
             {(step.type === 'strip' || step.type === 'liftoff') && (
@@ -2092,6 +2948,412 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                         </div>
                       </div>
                     )}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Customization for TAPE & FRAME */}
+            {step.type === 'tape-frame' && (() => {
+              const tfCfg: TapeFrameConfig = step.tapeFrame || {
+                action: 'mount',
+                tapeMaterialId: 'mat_dicing_tape',
+                thickness: 600,
+                conformality: 'flat',
+                showFrame: true,
+              };
+              const updateTf = (patch: Partial<TapeFrameConfig>) => {
+                handleUpdate({
+                  tapeFrame: {
+                    ...tfCfg,
+                    ...patch,
+                  },
+                });
+              };
+              const tapeMaterials = materials.filter(
+                (m) =>
+                  m.id === 'mat_dicing_tape' ||
+                  m.id === 'mat_uv_tape' ||
+                  m.id === 'mat_bg_tape' ||
+                  m.id === 'mat_daf' ||
+                  m.category === 'polymer'
+              );
+
+              return (
+                <div className="space-y-3.5 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-sky-300 flex items-center gap-1.5">
+                      <Frame className="w-3.5 h-3.5" />
+                      <span>Tape &amp; Frame Parameters</span>
+                    </span>
+                  </div>
+
+                  {/* Operation Toggle */}
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Frame Operation
+                    </label>
+                    <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => updateTf({ action: 'mount' })}
+                        className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                          tfCfg.action === 'mount'
+                            ? 'bg-sky-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Mount Tape &amp; Frame
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => updateTf({ action: 'demount' })}
+                        className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                          tfCfg.action === 'demount'
+                            ? 'bg-sky-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        UV Release / Demount
+                      </button>
+                    </div>
+                  </div>
+
+                  {tfCfg.action === 'mount' ? (
+                    <>
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">
+                          Carrier Tape / Film Type
+                        </label>
+                        <select
+                          value={tfCfg.tapeMaterialId}
+                          onChange={(e) => updateTf({ tapeMaterialId: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
+                        >
+                          {(tapeMaterials.length > 0 ? tapeMaterials : materials).map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name} ({m.formula})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-[11px] text-slate-400 mb-1">
+                            Tape Thickness ({getUnitLabel(thicknessUnit)})
+                          </label>
+                          <ThicknessInput
+                            valueNm={tfCfg.thickness}
+                            onChangeNm={(val) => updateTf({ thickness: val })}
+                            unit={thicknessUnit}
+                            minNm={25}
+                            stepNm={50}
+                            className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] text-slate-400 mb-1">
+                            Lamination Tension
+                          </label>
+                          <select
+                            value={tfCfg.conformality}
+                            onChange={(e) =>
+                              updateTf({ conformality: e.target.value as 'flat' | 'conformal' })
+                            }
+                            className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
+                          >
+                            <option value="flat">Flat Tensioned Frame</option>
+                            <option value="conformal">Conformal Roller Press</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <label className="flex items-start gap-2 pt-1 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={tfCfg.showFrame}
+                          onChange={(e) => updateTf({ showFrame: e.target.checked })}
+                          className="mt-0.5 rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0"
+                        />
+                        <div>
+                          <span className="text-[11px] font-medium text-slate-200 block">
+                            Render Stainless Ring Frame Clamps
+                          </span>
+                          <span className="text-[10px] text-slate-400 leading-snug block">
+                            Shows film-frame edge grips holding the wafer during grinding &amp; singulation.
+                          </span>
+                        </div>
+                      </label>
+                    </>
+                  ) : (
+                    <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-300 leading-relaxed">
+                      UV irradiation reduces tape tack and peels the mounted dicing / backgrind carrier tape off the selected wafer side, leaving any singulated dies free.
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Customization for WAFER DICING */}
+            {step.type === 'dicing' && (() => {
+              const dCfg: DicingConfig = step.dicing || {
+                method: 'blade',
+                cutMode: 'through-wafer',
+                kerfWidth: 400,
+                cutDepth: 1500,
+                sidewallAngle: 90,
+                tapeOvercut: 120,
+                streets: [
+                  { id: 'st_default', xCenter: Math.round(waferWidth * 0.5) },
+                ],
+              };
+              const updateDicing = (patch: Partial<DicingConfig>) => {
+                handleUpdate({
+                  dicing: {
+                    ...dCfg,
+                    ...patch,
+                  },
+                });
+              };
+              const streets = dCfg.streets || [];
+
+              const setEvenStreets = (count: number) => {
+                const next = Array.from({ length: count }, (_, idx) => ({
+                  id: `st_${Date.now()}_${idx}`,
+                  xCenter: Math.round(((idx + 1) / (count + 1)) * waferWidth),
+                }));
+                updateDicing({ streets: next });
+              };
+
+              return (
+                <div className="space-y-3.5 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-orange-400 flex items-center gap-1.5">
+                      <Slice className="w-3.5 h-3.5" />
+                      <span>Wafer Dicing &amp; Singulation</span>
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Dicing Method
+                      </label>
+                      <select
+                        value={dCfg.method}
+                        onChange={(e) => {
+                          const nextMethod = e.target.value as DicingConfig['method'];
+                          const defaultKerf =
+                            nextMethod === 'blade'
+                              ? 400
+                              : nextMethod === 'laser-ablation'
+                              ? 160
+                              : 90;
+                          const defaultAngle = nextMethod === 'laser-ablation' ? 82 : 90;
+                          updateDicing({
+                            method: nextMethod,
+                            kerfWidth: defaultKerf,
+                            sidewallAngle: defaultAngle,
+                          });
+                        }}
+                        className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
+                      >
+                        <option value="blade">Mechanical Blade Saw</option>
+                        <option value="laser-ablation">Laser Ablation / Grooving</option>
+                        <option value="stealth">Stealth Dicing (Laser)</option>
+                        <option value="plasma">Plasma Dicing (DRIE)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Kerf Width ({getUnitLabel(thicknessUnit)})
+                      </label>
+                      <ThicknessInput
+                        valueNm={dCfg.kerfWidth}
+                        onChangeNm={(val) => updateDicing({ kerfWidth: val })}
+                        unit={thicknessUnit}
+                        minNm={20}
+                        stepNm={25}
+                        className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Cut Depth Mode
+                    </label>
+                    <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => updateDicing({ cutMode: 'through-wafer' })}
+                        className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                          dCfg.cutMode === 'through-wafer'
+                            ? 'bg-orange-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Through-Wafer Cut
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => updateDicing({ cutMode: 'partial-depth' })}
+                        className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                          dCfg.cutMode === 'partial-depth'
+                            ? 'bg-orange-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Partial / Pre-Cut (DBG)
+                      </button>
+                    </div>
+                  </div>
+
+                  {dCfg.cutMode === 'partial-depth' ? (
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Pre-Cut Kerf Depth ({getUnitLabel(thicknessUnit)})
+                      </label>
+                      <ThicknessInput
+                        valueNm={dCfg.cutDepth ?? 1500}
+                        onChangeNm={(val) => updateDicing({ cutDepth: val })}
+                        unit={thicknessUnit}
+                        minNm={20}
+                        stepNm={100}
+                        className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Dicing Tape Overcut Depth ({getUnitLabel(thicknessUnit)})
+                      </label>
+                      <ThicknessInput
+                        valueNm={dCfg.tapeOvercut ?? 120}
+                        onChangeNm={(val) => updateDicing({ tapeOvercut: val })}
+                        unit={thicknessUnit}
+                        minNm={0}
+                        stepNm={25}
+                        className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      />
+                      <span className="text-[10px] text-slate-500 block mt-0.5">
+                        Stops cleanly inside mounted dicing tape while cutting all wafer &amp; DAF layers.
+                      </span>
+                    </div>
+                  )}
+
+                  <div>
+                    <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                      <span>Kerf Sidewall Angle</span>
+                      <span className="font-mono text-orange-400">
+                        {dCfg.sidewallAngle ?? 90}°{' '}
+                        {(dCfg.sidewallAngle ?? 90) < 89 ? '(V-Taper)' : '(Vertical)'}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="65"
+                      max="90"
+                      step="1"
+                      value={dCfg.sidewallAngle ?? 90}
+                      onChange={(e) =>
+                        updateDicing({ sidewallAngle: parseInt(e.target.value, 10) })
+                      }
+                      className="w-full accent-orange-500"
+                    />
+                  </div>
+
+                  {/* Dicing Streets List */}
+                  <div className="pt-2 border-t border-slate-800 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold text-slate-300">
+                        Dicing Streets ({streets.length})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateDicing({
+                            streets: [
+                              ...streets,
+                              {
+                                id: `st_${Date.now()}`,
+                                xCenter: Math.round(waferWidth * 0.5),
+                              },
+                            ],
+                          })
+                        }
+                        className="flex items-center gap-1 px-2 py-0.5 rounded bg-orange-600 hover:bg-orange-500 text-white text-[11px] font-medium"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>Add Cut</span>
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1">
+                      {[1, 2, 3, 4].map((cnt) => (
+                        <button
+                          key={cnt}
+                          type="button"
+                          onClick={() => setEvenStreets(cnt)}
+                          className={`flex-1 py-1 rounded text-[10px] font-mono border transition-colors ${
+                            streets.length === cnt
+                              ? 'bg-orange-500/20 border-orange-500/60 text-orange-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {cnt} {cnt === 1 ? 'Cut' : 'Cuts'}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
+                      {streets.map((st, idx) => (
+                        <div
+                          key={st.id}
+                          className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800"
+                        >
+                          <span className="text-[10px] font-mono text-orange-400 w-7 shrink-0">
+                            #{idx + 1}
+                          </span>
+                          <input
+                            type="range"
+                            min={Math.round(waferWidth * 0.05)}
+                            max={Math.round(waferWidth * 0.95)}
+                            step={50}
+                            value={st.xCenter}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value, 10);
+                              updateDicing({
+                                streets: streets.map((s) =>
+                                  s.id === st.id ? { ...s, xCenter: val } : s
+                                ),
+                              });
+                            }}
+                            className="flex-1 accent-orange-500 min-w-0"
+                          />
+                          <span className="text-[10px] font-mono text-slate-300 w-14 text-right shrink-0">
+                            {(st.xCenter / 1000).toFixed(2)}µm
+                          </span>
+                          <button
+                            type="button"
+                            disabled={streets.length <= 1}
+                            onClick={() => {
+                              if (streets.length <= 1) return;
+                              updateDicing({
+                                streets: streets.filter((s) => s.id !== st.id),
+                              });
+                            }}
+                            className="p-0.5 text-slate-400 hover:text-rose-400 disabled:opacity-20 shrink-0"
+                            title="Remove dicing street"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               );

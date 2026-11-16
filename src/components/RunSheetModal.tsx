@@ -29,8 +29,19 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
   );
 
   const formatStepTypeLabel = (step: ProcessStep) => {
+    if (step.type === 'deposition' && step.deposition?.method) {
+      return `deposition · ${step.deposition.method}`;
+    }
     if (step.type === 'cmp') return 'Grind/Polish/Planarize';
     if (step.type === 'bonding') return 'Wafer Bonding';
+    if (step.type === 'dicing') {
+      return `Wafer Dicing · ${step.dicing?.method || 'blade'}`;
+    }
+    if (step.type === 'tape-frame') {
+      return step.tapeFrame?.action === 'demount'
+        ? 'Tape & Frame · Demount'
+        : 'Tape & Frame · Mount';
+    }
     return step.type;
   };
 

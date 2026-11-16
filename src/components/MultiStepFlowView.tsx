@@ -58,6 +58,8 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
         strip?: any;
         cmp?: any;
         bonding?: any;
+        dicing?: any;
+        tapeFrame?: any;
       };
       idx: number;
       mesh: CrossSectionMesh;
@@ -413,7 +415,11 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                               thicknessUnit
                             )}`) ||
                           (step.type === 'lithography' &&
-                            `Photolithography · ${step.lithography?.polarity} tone${
+                            `${
+                              step.lithography?.coatMethod === 'dry-film'
+                                ? 'Dry Film Litho'
+                                : 'Photolithography'
+                            } · ${step.lithography?.polarity} tone${
                               item.reticleName ? ` · Reticle: ${item.reticleName}` : ''
                             }`) ||
                           (step.type === 'etch' &&
@@ -436,6 +442,17 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                                 ? step.bonding?.importedFlowTitle || 'Imported Wafer'
                                 : 'Custom Substrate'
                             }`) ||
+                          (step.type === 'dicing' &&
+                            `Dicing (${step.dicing?.method || 'blade'}) · ${
+                              step.dicing?.streets?.length || 1
+                            } cut${(step.dicing?.streets?.length || 1) === 1 ? '' : 's'} · kerf ${formatThickness(
+                              step.dicing?.kerfWidth || 400,
+                              thicknessUnit
+                            )}`) ||
+                          (step.type === 'tape-frame' &&
+                            `Tape & Frame (${
+                              step.tapeFrame?.action === 'demount' ? 'UV Demount' : 'Mount'
+                            })`) ||
                           step.type
                         }`}
                     </text>

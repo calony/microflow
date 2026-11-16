@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ProcessFlow, ProcessStep, Material } from './types/microfab';
+import { ProcessFlow, ProcessStep, Material, EtchRecipe } from './types/microfab';
 import { PRESET_PROCESS_FLOWS } from './lib/presets';
 import { simulateCrossSection, buildRenderPolygons } from './lib/simulationEngine';
 import { Header } from './components/Header';
@@ -14,12 +14,20 @@ import { MaskEditor } from './components/MaskEditor';
 import { StepEditor } from './components/StepEditor';
 import { MultiStepFlowView } from './components/MultiStepFlowView';
 import { MaterialsModal } from './components/MaterialsModal';
+import { EtchRateLibraryModal } from './components/EtchRateLibraryModal';
 import { RunSheetModal } from './components/RunSheetModal';
 import { PresetPickerModal } from './components/PresetPickerModal';
 import { MaskLevelsModal } from './components/MaskLevelsModal';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { ensureFlowMasks, syncStepWindowsToMask } from './lib/maskUtils';
 import { ensureFlowBlocks, createBlock, assignStepToBlock } from './lib/blockUtils';
+import { DEFAULT_MATERIALS } from './lib/materials';
+import {
+  getEtchRecipes,
+  getEtchRateNmMin,
+  formatEtchRate,
+  formatDurationCompact,
+} from './lib/etchRates';
 import { ThicknessUnit } from './lib/units';
 import { ListOrdered, Layers as LayersIcon, Sliders as SlidersIcon, X } from 'lucide-react';
 
@@ -42,13 +50,37 @@ export default function App() {
               },
             ];
           }
+          const existingMatIds = new Set((parsed.materials || []).map((m: Material) => m.id));
+          const missingDefaults = DEFAULT_MATERIALS.filter((d) => !existingMatIds.has(d.id));
+          if (missingDefaults.length > 0) {
+            parsed.materials = [...(parsed.materials || []), ...missingDefaults];
+          }
+          if (!parsed.etchLibrary) {
+            try {
+              const savedCustomEtch = localStorage.getItem('microflow_custom_etch_recipes');
+              if (savedCustomEtch) {
+                parsed.etchLibrary = JSON.parse(savedCustomEtch);
+              }
+            } catch {
+              // ignore
+            }
+          }
           return ensureFlowBlocks(ensureFlowMasks(parsed));
         }
       }
     } catch (e) {
       // ignore
     }
-    return ensureFlowBlocks(ensureFlowMasks(PRESET_PROCESS_FLOWS[0]));
+    const basePreset = { ...PRESET_PROCESS_FLOWS[0] };
+    try {
+      const savedCustomEtch = localStorage.getItem('microflow_custom_etch_recipes');
+      if (savedCustomEtch) {
+        basePreset.etchLibrary = JSON.parse(savedCustomEtch);
+      }
+    } catch {
+      // ignore
+    }
+    return ensureFlowBlocks(ensureFlowMasks(basePreset));
   });
 
   const [activeStepIndex, setActiveStepIndex] = useState<number>(() =>
@@ -69,6 +101,7 @@ export default function App() {
   // Modals state
   const [showPresets, setShowPresets] = useState<boolean>(false);
   const [showMaterials, setShowMaterials] = useState<boolean>(false);
+  const [showEtchLibrary, setShowEtchLibrary] = useState<boolean>(false);
   const [showMaskLevels, setShowMaskLevels] = useState<boolean>(false);
   const [focusMaskId, setFocusMaskId] = useState<string | undefined>(undefined);
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
@@ -181,8 +214,16 @@ export default function App() {
     setFlow({ ...flow, title });
   };
 
+  const allEtchRecipes = useMemo(
+    () => getEtchRecipes(flow.etchLibrary),
+    [flow.etchLibrary]
+  );
+
   const handleSelectPreset = (preset: ProcessFlow) => {
-    setFlow(ensureFlowBlocks(ensureFlowMasks(preset)));
+    const withEtchLib = flow.etchLibrary?.length
+      ? { ...preset, etchLibrary: flow.etchLibrary }
+      : preset;
+    setFlow(ensureFlowBlocks(ensureFlowMasks(withEtchLib)));
     setActiveStepIndex(preset.steps.length > 0 ? 0 : -1);
     setIsPlaying(false);
     setShowPresets(false);
@@ -190,6 +231,73 @@ export default function App() {
 
   const handleUpdateMaterials = (updatedMats: Material[]) => {
     setFlow({ ...flow, materials: updatedMats });
+  };
+
+  const handleUpdateEtchRecipes = (updatedCustom: EtchRecipe[]) => {
+    try {
+      localStorage.setItem('microflow_custom_etch_recipes', JSON.stringify(updatedCustom));
+    } catch {
+      // ignore
+    }
+    setFlow({ ...flow, etchLibrary: updatedCustom });
+  };
+
+  const handleApplyEtchRecipeToStep = (
+    recipe: EtchRecipe,
+    rateMode: 'manual' | 'time-rate',
+    etchTimeSec: number
+  ) => {
+    if (!activeStep || activeStep.type !== 'etch') return;
+    const targetMatId = activeStep.etch?.targetMaterialId || 'all';
+    const refMatId = targetMatId !== 'all' ? targetMatId : recipe.primaryMaterialId;
+    const refRate = getEtchRateNmMin(recipe, refMatId);
+    const derivedDepth =
+      rateMode === 'time-rate' && refRate > 0
+        ? Math.max(5, Math.round((refRate * etchTimeSec) / 60))
+        : activeStep.etch?.depth ?? activeStep.thickness ?? 300;
+
+    handleUpdateStep({
+      ...activeStep,
+      thickness: derivedDepth,
+      etch: {
+        ...(activeStep.etch || {
+          etchType: recipe.etchType,
+          depth: derivedDepth,
+          targetMaterialId: 'all',
+          isotropy: recipe.isotropy,
+          sidewallAngle: recipe.sidewallAngle,
+        }),
+        etchRecipeId: recipe.id,
+        etchType: recipe.etchType,
+        isotropy: recipe.isotropy,
+        sidewallAngle: recipe.sidewallAngle,
+        scallopEffect: recipe.scallopEffect ?? (recipe.etchType === 'drie-bosch'),
+        scallopDepth: recipe.scallopDepth ?? activeStep.etch?.scallopDepth,
+        scallopPitch: recipe.scallopPitch ?? activeStep.etch?.scallopPitch,
+        ardeEnabled: recipe.ardeEnabled ?? activeStep.etch?.ardeEnabled,
+        ardeStrength: recipe.ardeStrength ?? activeStep.etch?.ardeStrength,
+        rateMode,
+        etchTimeSec,
+        depth: derivedDepth,
+      },
+      toolRecipe: {
+        ...(activeStep.toolRecipe || {
+          toolName: '',
+          gases: '',
+          power: '',
+          pressure: '',
+          temperature: '',
+          duration: '',
+        }),
+        toolName: recipe.toolName || activeStep.toolRecipe?.toolName || '',
+        gases: recipe.gases || recipe.chemistry,
+        power: recipe.power || '',
+        pressure: recipe.pressure || '',
+        temperature: recipe.temperature || '',
+        duration: formatDurationCompact(etchTimeSec),
+        targetRate: refRate > 0 ? formatEtchRate(refRate, thicknessUnit) : '',
+      },
+    });
   };
 
   const handleExportJson = () => {
@@ -248,6 +356,7 @@ export default function App() {
         onUpdateTitle={handleUpdateTitle}
         onOpenPresets={() => setShowPresets(true)}
         onOpenMaterials={() => setShowMaterials(true)}
+        onOpenEtchLibrary={() => setShowEtchLibrary(true)}
         onOpenMaskLevels={() => {
           setFocusMaskId(undefined);
           setShowMaskLevels(true);
@@ -307,12 +416,91 @@ export default function App() {
                 }}
                 onUpdateFlow={setFlow}
                 onOpenPresets={() => setShowPresets(true)}
+                onOpenParameters={() => {
+                  setRightSidebarOpen(true);
+                  if (isCompactViewport()) {
+                    setLeftSidebarOpen(false);
+                  }
+                }}
               />
             </div>
           </aside>
         )}
 
-        {/* Center: Canvas Viewport & Photomask Track */}
+        {/* Adjacent: Substrate Layer Editor OR Step Deep Parameters Editor (Docked next to Process Timeline) */}
+        {rightSidebarOpen && (
+          <aside className="fixed inset-y-0 left-0 z-40 w-[88vw] max-w-[370px] h-full border-r border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-80 xl:w-[340px] lg:shadow-none flex-shrink-0">
+            <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
+              <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                <SlidersIcon className="w-3.5 h-3.5 text-sky-400" />
+                <span>{isSubstrateActive ? 'Substrate Stack' : 'Step Parameters'}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setRightSidebarOpen(false)}
+                className="flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 text-slate-300 hover:text-white text-[11px]"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Done</span>
+              </button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden">
+              {isSubstrateActive ? (
+                <SubstrateEditor
+                  flow={flow}
+                  thicknessUnit={thicknessUnit}
+                  onUpdateFlow={setFlow}
+                  onOpenMaterialsModal={() => setShowMaterials(true)}
+                />
+              ) : activeStep ? (
+                <StepEditor
+                  step={activeStep}
+                  waferWidth={flow.substrateWidth}
+                  materials={flow.materials}
+                  etchRecipes={allEtchRecipes}
+                  thicknessUnit={thicknessUnit}
+                  onUpdateStep={handleUpdateStep}
+                  onOpenMaterialsModal={() => setShowMaterials(true)}
+                  onOpenEtchLibrary={() => setShowEtchLibrary(true)}
+                  onMergeMaterials={(incomingMats) => {
+                    const existingIds = new Set(flow.materials.map((m) => m.id));
+                    const missing = incomingMats.filter((m) => !existingIds.has(m.id));
+                    if (missing.length > 0) {
+                      setFlow((prev) => {
+                        const prevIds = new Set(prev.materials.map((m) => m.id));
+                        const toAdd = incomingMats.filter((m) => !prevIds.has(m.id));
+                        if (toAdd.length === 0) return prev;
+                        return { ...prev, materials: [...prev.materials, ...toAdd] };
+                      });
+                    }
+                  }}
+                  blocks={flow.blocks}
+                  masks={flow.masks}
+                  onOpenMaskLevelsModal={(maskId) => {
+                    setFocusMaskId(maskId);
+                    setShowMaskLevels(true);
+                  }}
+                  onCreateBlock={(name) => {
+                    const { flow: updated, block: newBlock } = createBlock(flow, name);
+                    const currentStep = updated.steps[activeStepIndex];
+                    if (currentStep) {
+                      const assignedFlow = assignStepToBlock(updated, currentStep.id, newBlock.id);
+                      const newIdx = assignedFlow.steps.findIndex((s) => s.id === currentStep.id);
+                      setFlow(assignedFlow);
+                      if (newIdx >= 0 && newIdx !== activeStepIndex) {
+                        setActiveStepIndex(newIdx);
+                      }
+                    } else {
+                      setFlow(updated);
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
+          </aside>
+        )}
+
+        {/* Main Viewport: Canvas & Photomask Track */}
         <main className="flex-1 flex flex-col h-full bg-[#030712] p-1.5 sm:p-3 overflow-hidden space-y-2 sm:space-y-3 min-w-0">
           {/* Photomask Aperture Editor (Active if current step is Lithography) */}
           {activeStep && activeStep.type === 'lithography' && (
@@ -352,77 +540,6 @@ export default function App() {
             />
           </div>
         </main>
-
-        {/* Right: Substrate Layer Editor OR Step Deep Parameters Editor */}
-        {rightSidebarOpen && (
-          <aside className="fixed inset-y-0 right-0 z-40 w-[88vw] max-w-[370px] h-full border-l border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-80 xl:w-96 lg:shadow-none flex-shrink-0">
-            <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
-              <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
-                <SlidersIcon className="w-3.5 h-3.5 text-sky-400" />
-                <span>{isSubstrateActive ? 'Substrate Stack' : 'Step Parameters'}</span>
-              </span>
-              <button
-                type="button"
-                onClick={() => setRightSidebarOpen(false)}
-                className="flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 text-slate-300 hover:text-white text-[11px]"
-              >
-                <X className="w-3.5 h-3.5" />
-                <span>Done</span>
-              </button>
-            </div>
-            <div className="flex-1 min-h-0 overflow-hidden">
-              {isSubstrateActive ? (
-                <SubstrateEditor
-                  flow={flow}
-                  thicknessUnit={thicknessUnit}
-                  onUpdateFlow={setFlow}
-                  onOpenMaterialsModal={() => setShowMaterials(true)}
-                />
-              ) : activeStep ? (
-                <StepEditor
-                  step={activeStep}
-                  waferWidth={flow.substrateWidth}
-                  materials={flow.materials}
-                  thicknessUnit={thicknessUnit}
-                  onUpdateStep={handleUpdateStep}
-                  onOpenMaterialsModal={() => setShowMaterials(true)}
-                  onMergeMaterials={(incomingMats) => {
-                    const existingIds = new Set(flow.materials.map((m) => m.id));
-                    const missing = incomingMats.filter((m) => !existingIds.has(m.id));
-                    if (missing.length > 0) {
-                      setFlow((prev) => {
-                        const prevIds = new Set(prev.materials.map((m) => m.id));
-                        const toAdd = incomingMats.filter((m) => !prevIds.has(m.id));
-                        if (toAdd.length === 0) return prev;
-                        return { ...prev, materials: [...prev.materials, ...toAdd] };
-                      });
-                    }
-                  }}
-                  blocks={flow.blocks}
-                  masks={flow.masks}
-                  onOpenMaskLevelsModal={(maskId) => {
-                    setFocusMaskId(maskId);
-                    setShowMaskLevels(true);
-                  }}
-                  onCreateBlock={(name) => {
-                    const { flow: updated, block: newBlock } = createBlock(flow, name);
-                    const currentStep = updated.steps[activeStepIndex];
-                    if (currentStep) {
-                      const assignedFlow = assignStepToBlock(updated, currentStep.id, newBlock.id);
-                      const newIdx = assignedFlow.steps.findIndex((s) => s.id === currentStep.id);
-                      setFlow(assignedFlow);
-                      if (newIdx >= 0 && newIdx !== activeStepIndex) {
-                        setActiveStepIndex(newIdx);
-                      }
-                    } else {
-                      setFlow(updated);
-                    }
-                  }}
-                />
-              ) : null}
-            </div>
-          </aside>
-        )}
       </div>
 
       {/* Mobile & Tablet Bottom Panel Switcher (< lg) */}
@@ -481,6 +598,18 @@ export default function App() {
           materials={flow.materials}
           onUpdateMaterials={handleUpdateMaterials}
           onClose={() => setShowMaterials(false)}
+        />
+      )}
+
+      {showEtchLibrary && (
+        <EtchRateLibraryModal
+          recipes={allEtchRecipes}
+          materials={flow.materials}
+          thicknessUnit={thicknessUnit}
+          activeStep={activeStep}
+          onUpdateRecipes={handleUpdateEtchRecipes}
+          onApplyRecipeToStep={handleApplyEtchRecipeToStep}
+          onClose={() => setShowEtchLibrary(false)}
         />
       )}
 

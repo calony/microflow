@@ -223,7 +223,7 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-900 border-l border-slate-800 text-slate-200">
+    <div className="flex flex-col h-full min-w-0 bg-slate-900 text-slate-200">
       {/* Editor Header */}
       <div className="p-4 border-b border-slate-800">
         <div className="flex items-center justify-between mb-2">
