@@ -23,6 +23,8 @@ import {
   Maximize,
   Minimize,
   Search,
+  Layers,
+  EyeOff,
 } from 'lucide-react';
 
 interface CrossSectionCanvasProps {
@@ -89,6 +91,15 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   const [isPanning, setIsPanning] = useState<boolean>(false);
   const [panStart, setPanStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
+  // Multi-touch pinch-to-zoom state
+  const activePointersRef = useRef<Map<number, { clientX: number; clientY: number }>>(new Map());
+  const pinchStateRef = useRef<{
+    initialDistance: number;
+    initialZoom: number;
+    anchorWorldSvgX: number;
+    anchorWorldSvgY: number;
+  } | null>(null);
+
   // Region zoom (Magnifying glass) state
   const [regionZoomMode, setRegionZoomMode] = useState<boolean>(false);
   const [zoomSelection, setZoomSelection] = useState<{
@@ -115,6 +126,19 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   // Display toggles
   const [showGrid, setShowGrid] = useState<boolean>(true);
   const [renderMode, setRenderMode] = useState<'hatch' | 'solid'>('hatch');
+  const [showLegend, setShowLegend] = useState<boolean>(true);
+
+  const legendMaterials = useMemo(() => {
+    const seen = new Set<string>();
+    const list: Material[] = [];
+    for (const poly of polygons) {
+      if (!seen.has(poly.materialId)) {
+        seen.add(poly.materialId);
+        list.push(getMaterialById(materials, poly.materialId));
+      }
+    }
+    return list;
+  }, [polygons, materials]);
 
   // Locked projection baseline when user manually zooms or pans so step changes,
   // MaskEditor mounting/unmounting, and sidebar toggles never rescale or shift features.
@@ -476,6 +500,23 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     };
   }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight]);
 
+  // Prevent mobile browser page pinch-zoom inside the SVG viewport so custom canvas pinch-zoom works
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const preventMultiTouchZoom = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        e.preventDefault();
+      }
+    };
+    el.addEventListener('touchstart', preventMultiTouchZoom, { passive: false });
+    el.addEventListener('touchmove', preventMultiTouchZoom, { passive: false });
+    return () => {
+      el.removeEventListener('touchstart', preventMultiTouchZoom);
+      el.removeEventListener('touchmove', preventMultiTouchZoom);
+    };
+  }, []);
+
   const toggleFullscreen = () => {
     if (!cardRef.current) return;
     if (!document.fullscreenElement) {
@@ -485,9 +526,47 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     }
   };
 
-  // Unified pointer pan / caliper / region zoom handlers (mouse + touch)
+  // Unified pointer pan / pinch-zoom / caliper / region zoom handlers (mouse + touch)
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
+
+    activePointersRef.current.set(e.pointerId, {
+      clientX: e.clientX,
+      clientY: e.clientY,
+    });
+
+    // Two-finger pinch-to-zoom activation
+    if (activePointersRef.current.size === 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY);
+      const midClientX = (pts[0].clientX + pts[1].clientX) * 0.5;
+      const midClientY = (pts[0].clientY + pts[1].clientY) * 0.5;
+      const midSvg = clientToSvg(midClientX, midClientY);
+
+      setIsPanning(false);
+      setZoomSelection(null);
+
+      if (midSvg) {
+        lockViewport();
+        pinchStateRef.current = {
+          initialDistance: Math.max(10, dist),
+          initialZoom: zoom,
+          anchorWorldSvgX: (midSvg.x - pan.x) / zoom,
+          anchorWorldSvgY: (midSvg.y - pan.y) / zoom,
+        };
+      }
+      try {
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (activePointersRef.current.size > 2) {
+      return;
+    }
+
     const svgP = clientToSvg(e.clientX, e.clientY);
 
     if (regionZoomMode && svgP) {
@@ -523,6 +602,36 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
+    }
+
+    if (pinchStateRef.current && activePointersRef.current.size >= 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY);
+      const midClientX = (pts[0].clientX + pts[1].clientX) * 0.5;
+      const midClientY = (pts[0].clientY + pts[1].clientY) * 0.5;
+      const midSvg = clientToSvg(midClientX, midClientY);
+
+      if (midSvg) {
+        const scale = dist / pinchStateRef.current.initialDistance;
+        const nextZoom = Math.max(
+          0.12,
+          Math.min(25.0, pinchStateRef.current.initialZoom * scale)
+        );
+        lockViewport();
+        setZoom(nextZoom);
+        setPan({
+          x: midSvg.x - pinchStateRef.current.anchorWorldSvgX * nextZoom,
+          y: midSvg.y - pinchStateRef.current.anchorWorldSvgY * nextZoom,
+        });
+      }
+      return;
+    }
+
     const rect = e.currentTarget.getBoundingClientRect();
     setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
 
@@ -540,10 +649,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   };
 
   const handlePointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    activePointersRef.current.delete(e.pointerId);
     try {
       (e.currentTarget as Element).releasePointerCapture(e.pointerId);
     } catch {
       // ignore
+    }
+    if (activePointersRef.current.size < 2) {
+      pinchStateRef.current = null;
     }
     setIsPanning(false);
   };
@@ -706,6 +819,21 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             Hatch
           </button>
 
+          {/* Material Legend Toggle */}
+          <button
+            type="button"
+            onClick={() => setShowLegend((v) => !v)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              showLegend
+                ? 'bg-sky-600/20 border-sky-500/50 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+            title={showLegend ? 'Hide Material Legend' : 'Show Material Legend'}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Legend</span>
+          </button>
+
           {/* Caliper Measurement tool */}
           <button
             onClick={() => {
@@ -757,7 +885,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       <div
         ref={containerRef}
         onWheel={handleWheel}
-        className={`relative flex-1 w-full h-full overflow-hidden bg-[#060a12] ${
+        className={`relative flex-1 min-h-0 w-full overflow-hidden bg-[#060a12] touch-none ${
           regionZoomMode
             ? 'cursor-zoom-in'
             : measureMode
@@ -771,6 +899,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           ref={svgRef}
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
           className="w-full h-full block touch-none"
+          style={{ touchAction: 'none' }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
@@ -1225,6 +1354,75 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           </div>
         )}
       </div>
+
+      {/* Bottom Material Legend Bar */}
+      {showLegend && (
+        <div className="shrink-0 border-t border-slate-800 bg-slate-900/90 px-3 py-1.5 flex items-center justify-between gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1 shrink-0">
+              <Layers className="w-3 h-3 text-sky-400" />
+              <span>Materials:</span>
+            </span>
+            {legendMaterials.length === 0 ? (
+              <span className="text-slate-500 italic">No layers visible</span>
+            ) : (
+              legendMaterials.map((mat) => (
+                <div
+                  key={mat.id}
+                  className="inline-flex items-center gap-1.5 text-slate-200"
+                  title={`${mat.name}${mat.formula ? ` (${mat.formula})` : ''} · ${mat.category}`}
+                >
+                  <svg
+                    width="13"
+                    height="13"
+                    viewBox="0 0 12 12"
+                    className="rounded-[3px] shrink-0 border"
+                    style={{ borderColor: mat.strokeColor || '#475569' }}
+                  >
+                    <rect width="12" height="12" fill={mat.color} />
+                    {renderMode === 'hatch' && mat.pattern === 'diagonal-right' && (
+                      <line x1="0" y1="0" x2="12" y2="12" stroke="#000" strokeWidth="1.3" strokeOpacity="0.28" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'diagonal-left' && (
+                      <line x1="12" y1="0" x2="0" y2="12" stroke="#000" strokeWidth="1.3" strokeOpacity="0.28" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'crosshatch' && (
+                      <path d="M 0 0 L 12 12 M 12 0 L 0 12" stroke="#000" strokeWidth="1.1" strokeOpacity="0.28" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'dots' && (
+                      <circle cx="6" cy="6" r="1.6" fill="#000" fillOpacity="0.32" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'horizontal' && (
+                      <line x1="0" y1="6" x2="12" y2="6" stroke="#000" strokeWidth="1.2" strokeOpacity="0.28" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'vertical' && (
+                      <line x1="6" y1="0" x2="6" y2="12" stroke="#000" strokeWidth="1.2" strokeOpacity="0.28" />
+                    )}
+                    {renderMode === 'hatch' && mat.pattern === 'stipple' && (
+                      <>
+                        <circle cx="3" cy="3" r="1.1" fill="#000" fillOpacity="0.32" />
+                        <circle cx="9" cy="9" r="1.1" fill="#000" fillOpacity="0.32" />
+                      </>
+                    )}
+                  </svg>
+                  <span className="font-medium text-slate-200 whitespace-nowrap">
+                    {mat.name}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowLegend(false)}
+            className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors shrink-0"
+            title="Hide Material Legend"
+          >
+            <EyeOff className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };

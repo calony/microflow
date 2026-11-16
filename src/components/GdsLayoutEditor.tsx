@@ -464,6 +464,31 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     | { kind: 'draw-drag'; startWorld: GdsPoint }
   >(null);
 
+  // Multi-touch pinch-to-zoom state
+  const activePointersRef = useRef<Map<number, { clientX: number; clientY: number }>>(new Map());
+  const pinchStateRef = useRef<{
+    initialDistance: number;
+    initialSpanX: number;
+    anchorWorldX: number;
+    anchorWorldY: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const el = svgContainerRef.current;
+    if (!el) return;
+    const preventMultiTouchZoom = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        e.preventDefault();
+      }
+    };
+    el.addEventListener('touchstart', preventMultiTouchZoom, { passive: false });
+    el.addEventListener('touchmove', preventMultiTouchZoom, { passive: false });
+    return () => {
+      el.removeEventListener('touchstart', preventMultiTouchZoom);
+      el.removeEventListener('touchmove', preventMultiTouchZoom);
+    };
+  }, []);
+
   // Multi-section-cut normalization & updater
   const { sectionLines, activeSectionLine } = useMemo(
     () => getLayoutSectionLines(layout, waferWidth),
@@ -638,6 +663,42 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   };
 
   const handleSvgPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.pointerType !== 'mouse' || e.button === 0 || e.button === 1 || e.button === 2) {
+      activePointersRef.current.set(e.pointerId, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
+    }
+
+    // Two-finger pinch-to-zoom activation
+    if (activePointersRef.current.size === 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY);
+      const midClientX = (pts[0].clientX + pts[1].clientX) * 0.5;
+      const midClientY = (pts[0].clientY + pts[1].clientY) * 0.5;
+      const { sx, sy } = getLocalCoords(midClientX, midClientY);
+      const anchor = screenToWorld(sx, sy, false);
+
+      setPointerOp(null);
+      setDragBox(null);
+      pinchStateRef.current = {
+        initialDistance: Math.max(10, dist),
+        initialSpanX: camera.spanX,
+        anchorWorldX: anchor.x,
+        anchorWorldY: anchor.y,
+      };
+      try {
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (activePointersRef.current.size > 2) {
+      return;
+    }
+
     const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
 
     // Middle-mouse / Alt-click / Pan tool -> pan
@@ -715,6 +776,33 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   };
 
   const handleSvgPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
+    }
+
+    if (pinchStateRef.current && activePointersRef.current.size >= 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY);
+      const midClientX = (pts[0].clientX + pts[1].clientX) * 0.5;
+      const midClientY = (pts[0].clientY + pts[1].clientY) * 0.5;
+      const { sx, sy } = getLocalCoords(midClientX, midClientY);
+      const scale = dist / pinchStateRef.current.initialDistance;
+      const nextSpanX = Math.max(
+        400,
+        Math.min(2000000, pinchStateRef.current.initialSpanX / Math.max(0.05, scale))
+      );
+      const nextPxPerNm = svgSize.w / nextSpanX;
+      setCamera({
+        cx: pinchStateRef.current.anchorWorldX - (sx - svgSize.w * 0.5) / nextPxPerNm,
+        cy: pinchStateRef.current.anchorWorldY + (sy - svgSize.h * 0.5) / nextPxPerNm,
+        spanX: nextSpanX,
+      });
+      return;
+    }
+
     const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
     const worldPt = screenToWorld(sx, sy, true);
     setCursorWorld(worldPt);
@@ -897,6 +985,11 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         }
       }
       setDragBox(null);
+    }
+
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size < 2) {
+      pinchStateRef.current = null;
     }
 
     try {
