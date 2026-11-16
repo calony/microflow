@@ -370,6 +370,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [draftPoints, setDraftPoints] = useState<GdsPoint[]>([]);
   const [dragBox, setDragBox] = useState<{ start: GdsPoint; current: GdsPoint } | null>(null);
   const [cursorWorld, setCursorWorld] = useState<GdsPoint | null>(null);
+  const [draftHoverPoint, setDraftHoverPoint] = useState<GdsPoint | null>(null);
   const [targetMaskId, setTargetMaskId] = useState<string>(() => selectedMask?.id || masks[0]?.id || '');
 
   useEffect(() => {
@@ -462,6 +463,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     | { kind: 'drag-section-vertex'; initSection: GdsSectionLine; vertexIndex: number }
     | { kind: 'drag-section-move'; initSection: GdsSectionLine; startWorld: GdsPoint }
     | { kind: 'draw-drag'; startWorld: GdsPoint }
+    | { kind: 'tap-draft-point'; startWorld: GdsPoint; startClientX: number; startClientY: number }
   >(null);
 
   // Multi-touch pinch-to-zoom state
@@ -564,6 +566,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
       if (e.key === 'Escape') {
         setDraftPoints([]);
+        setDraftHoverPoint(null);
         setDragBox(null);
         setSelectedShapeId(null);
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedShapeId) {
@@ -610,6 +613,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       updateSingleSection(nextCut);
     }
     setDraftPoints([]);
+    setDraftHoverPoint(null);
   };
 
   // Hit-testing for Select tool respects current layer Z-order (topmost visible layer first)
@@ -743,12 +747,26 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       return;
     }
 
+    if (e.pointerType === 'touch') {
+      setDraftHoverPoint(null);
+      setCursorWorld(null);
+    }
+
     if (tool === 'section') {
       if (draftPoints.length === 0) {
         // Supports both drag-for-2-point cut OR click-click-dblclick for multi-point cut
         (e.currentTarget as Element).setPointerCapture(e.pointerId);
         setDragBox({ start: worldPt, current: worldPt });
         setPointerOp({ kind: 'draw-drag', startWorld: worldPt });
+        return;
+      }
+      if (e.pointerType === 'touch') {
+        setPointerOp({
+          kind: 'tap-draft-point',
+          startWorld: worldPt,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+        });
         return;
       }
       const last = draftPoints[draftPoints.length - 1];
@@ -759,6 +777,15 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     }
 
     if (tool === 'polygon' || tool === 'path') {
+      if (e.pointerType === 'touch') {
+        setPointerOp({
+          kind: 'tap-draft-point',
+          startWorld: worldPt,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+        });
+        return;
+      }
       // Check if clicking near first point of polygon to close
       if (tool === 'polygon' && draftPoints.length >= 3) {
         const firstScr = worldToScreen(draftPoints[0].x, draftPoints[0].y);
@@ -805,7 +832,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
     const worldPt = screenToWorld(sx, sy, true);
-    setCursorWorld(worldPt);
+    if (e.pointerType !== 'touch') {
+      setCursorWorld(worldPt);
+      setDraftHoverPoint(worldPt);
+    } else {
+      setDraftHoverPoint(null);
+      setCursorWorld(null);
+    }
 
     if (!pointerOp) return;
 
@@ -985,6 +1018,40 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         }
       }
       setDragBox(null);
+    } else if (
+      e.type !== 'pointercancel' &&
+      pointerOp?.kind === 'tap-draft-point' &&
+      activePointersRef.current.size <= 1
+    ) {
+      const movePx = Math.hypot(
+        e.clientX - pointerOp.startClientX,
+        e.clientY - pointerOp.startClientY
+      );
+      if (movePx < 20) {
+        const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
+        const tappedPt = screenToWorld(sx, sy, true);
+        if (tool === 'polygon' && draftPoints.length >= 3) {
+          const firstScr = worldToScreen(draftPoints[0].x, draftPoints[0].y);
+          if (Math.hypot(sx - firstScr.x, sy - firstScr.y) < 16) {
+            finalizeMultiClickShape(draftPoints);
+          } else {
+            const last = draftPoints[draftPoints.length - 1];
+            if (!last || Math.hypot(last.x - tappedPt.x, last.y - tappedPt.y) > 1) {
+              setDraftPoints((prev) => [...prev, tappedPt]);
+            }
+          }
+        } else {
+          const last = draftPoints[draftPoints.length - 1];
+          if (!last || Math.hypot(last.x - tappedPt.x, last.y - tappedPt.y) > 1) {
+            setDraftPoints((prev) => [...prev, tappedPt]);
+          }
+        }
+      }
+    }
+
+    if (e.pointerType === 'touch') {
+      setDraftHoverPoint(null);
+      setCursorWorld(null);
     }
 
     activePointersRef.current.delete(e.pointerId);
@@ -1695,6 +1762,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 onClick={() => {
                   setTool(item.id);
                   setDraftPoints([]);
+                  setDraftHoverPoint(null);
                   setDragBox(null);
                 }}
                 className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium border shrink-0 transition-colors ${
@@ -1913,6 +1981,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 onClick={() => {
                   setTool(item.id);
                   setDraftPoints([]);
+                  setDraftHoverPoint(null);
                   setDragBox(null);
                 }}
                 title={item.tip}
@@ -2100,6 +2169,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             onPointerMove={handleSvgPointerMove}
             onPointerUp={handleSvgPointerUp}
             onPointerCancel={handleSvgPointerUp}
+            onPointerLeave={() => {
+              setDraftHoverPoint(null);
+              setCursorWorld(null);
+            }}
             onDoubleClick={handleSvgDoubleClick}
           >
             <defs>
@@ -2360,7 +2433,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
             {/* Multi-click Draft Preview (Polygon / Path / Multi-point Section Cut) */}
             {draftPoints.length > 0 && (() => {
-              const allPts = cursorWorld ? [...draftPoints, cursorWorld] : draftPoints;
+              const allPts = draftHoverPoint ? [...draftPoints, draftHoverPoint] : draftPoints;
               const str = allPts
                 .map((p) => {
                   const sp = worldToScreen(p.x, p.y);
