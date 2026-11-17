@@ -18,8 +18,13 @@ import { EtchRateLibraryModal } from './components/EtchRateLibraryModal';
 import { RunSheetModal } from './components/RunSheetModal';
 import { PresetPickerModal } from './components/PresetPickerModal';
 import { MaskLevelsModal } from './components/MaskLevelsModal';
+import { AboutModal } from './components/AboutModal';
 import { SubstrateEditor } from './components/SubstrateEditor';
-import { ensureFlowMasks, syncStepWindowsToMask } from './lib/maskUtils';
+import {
+  ensureFlowMasks,
+  syncStepWindowsToMask,
+  attachNewMaskToLithoStep,
+} from './lib/maskUtils';
 import { ensureFlowBlocks, createBlock, assignStepToBlock } from './lib/blockUtils';
 import { DEFAULT_MATERIALS } from './lib/materials';
 import {
@@ -106,6 +111,7 @@ export default function App() {
   const [focusMaskId, setFocusMaskId] = useState<string | undefined>(undefined);
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
+  const [showAbout, setShowAbout] = useState<boolean>(false);
 
   // Panel visibility state: docked open on desktop (>=1024px), drawer-closed on mobile/tablet
   const [leftSidebarOpen, setLeftSidebarOpen] = useState<boolean>(() =>
@@ -196,7 +202,27 @@ export default function App() {
     );
     let updatedFlow = { ...flow, steps: updatedSteps };
     if (updatedStep.type === 'lithography') {
-      updatedFlow = syncStepWindowsToMask(updatedFlow, updatedStep);
+      if (prevStep && prevStep.type !== 'lithography') {
+        const validUnclaimedMask = updatedStep.lithography?.maskId
+          ? (updatedFlow.masks || []).find(
+              (m) =>
+                m.id === updatedStep.lithography?.maskId &&
+                (!m.assignedStepId || m.assignedStepId === updatedStep.id)
+            )
+          : undefined;
+        updatedFlow = validUnclaimedMask
+          ? syncStepWindowsToMask(updatedFlow, updatedStep)
+          : attachNewMaskToLithoStep(updatedFlow, updatedStep.id);
+      } else {
+        updatedFlow = syncStepWindowsToMask(updatedFlow, updatedStep);
+      }
+    } else if (prevStep && prevStep.type === 'lithography' && updatedFlow.masks) {
+      updatedFlow = {
+        ...updatedFlow,
+        masks: updatedFlow.masks.map((m) =>
+          m.assignedStepId === updatedStep.id ? { ...m, assignedStepId: undefined } : m
+        ),
+      };
     }
 
     if (blockChanged) {
@@ -249,7 +275,11 @@ export default function App() {
   ) => {
     if (!activeStep || activeStep.type !== 'etch') return;
     const targetMatId = activeStep.etch?.targetMaterialId || 'all';
-    const refMatId = targetMatId !== 'all' ? targetMatId : recipe.primaryMaterialId;
+    const isSameRecipe = activeStep.etch?.etchRecipeId === recipe.id;
+    const nextRefMatId =
+      isSameRecipe ? activeStep.etch?.referenceMaterialId : undefined;
+    const refMatId =
+      nextRefMatId || (targetMatId !== 'all' ? targetMatId : recipe.primaryMaterialId);
     const refRate = getEtchRateNmMin(recipe, refMatId);
     const derivedDepth =
       rateMode === 'time-rate' && refRate > 0
@@ -268,6 +298,7 @@ export default function App() {
           sidewallAngle: recipe.sidewallAngle,
         }),
         etchRecipeId: recipe.id,
+        referenceMaterialId: nextRefMatId,
         etchType: recipe.etchType,
         isotropy: recipe.isotropy,
         sidewallAngle: recipe.sidewallAngle,
@@ -363,6 +394,7 @@ export default function App() {
         }}
         onOpenRunSheet={() => setShowRunSheet(true)}
         onOpenMultiStepView={() => setShowMultiStep(true)}
+        onOpenAbout={() => setShowAbout(true)}
         onExportJson={handleExportJson}
         onImportJson={handleImportJson}
         leftSidebarOpen={leftSidebarOpen}
@@ -643,6 +675,8 @@ export default function App() {
           onClose={() => setShowMultiStep(false)}
         />
       )}
+
+      {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
     </div>
   );
 }

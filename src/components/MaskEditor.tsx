@@ -275,6 +275,11 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     });
   };
 
+  const maskField = litho.maskField ?? 'dark-field';
+  const isLightField = maskField === 'light-field';
+  const featureNoun = isLightField ? 'blocker' : 'aperture';
+  const featureNounCap = isLightField ? 'Blocker' : 'Aperture';
+
   const togglePolarity = () => {
     const newPol = litho.polarity === 'positive' ? 'negative' : 'positive';
     onUpdateStep({
@@ -283,6 +288,17 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         ...litho,
         polarity: newPol,
         resistMaterialId: resolveResistMaterialId(newPol, litho.resistMaterialId),
+      },
+    });
+  };
+
+  const toggleMaskField = () => {
+    const nextField = isLightField ? 'dark-field' : 'light-field';
+    onUpdateStep({
+      ...step,
+      lithography: {
+        ...litho,
+        maskField: nextField,
       },
     });
   };
@@ -376,7 +392,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       <div className="bg-slate-900 border border-slate-800 rounded-xl px-3 py-1.5 text-slate-200 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-semibold tracking-wider uppercase text-sky-400 shrink-0">
-            Photomask Aperture Track
+            Photomask Track
           </span>
           {step.side === 'back' && (
             <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-semibold shrink-0">
@@ -394,8 +410,13 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           </span>
           <span className="text-xs text-slate-600 shrink-0 hidden sm:inline">·</span>
           <span className="text-[11px] font-mono text-slate-400 shrink-0 hidden sm:inline">
-            <span className="capitalize text-slate-200">{litho.polarity}</span> · {windows.length}{' '}
-            {windows.length === 1 ? 'aperture' : 'apertures'}
+            <span className={isLightField ? 'text-sky-300' : 'text-slate-200'}>
+              {isLightField ? 'Light-Field' : 'Dark-Field'}
+            </span>
+            {' · '}
+            <span className="capitalize text-slate-200">{litho.polarity} resist</span>
+            {' · '}
+            {windows.length} {windows.length === 1 ? featureNoun : `${featureNoun}s`}
           </span>
         </div>
 
@@ -415,7 +436,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
             type="button"
             onClick={handleToggleMinimize}
             className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-            title="Expand Photomask Aperture Track"
+            title="Expand Photomask Track"
           >
             <ChevronDown className="w-3.5 h-3.5 text-sky-400" />
             <span>Expand</span>
@@ -425,12 +446,20 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     );
   }
 
+  const outcomeSummary = isLightField
+    ? litho.polarity === 'positive'
+      ? 'Quartz bg passes UV (dissolves resist) · Chrome blocks protect resist underneath'
+      : 'Quartz bg passes UV (crosslinks resist) · Chrome blocks dissolve resist underneath'
+    : litho.polarity === 'positive'
+    ? 'Chrome bg blocks UV · Clear apertures expose & dissolve resist'
+    : 'Chrome bg blocks UV · Clear apertures expose & crosslink resist';
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 sm:p-3 text-slate-200">
       <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2 border-b border-slate-800">
         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
           <span className="text-xs font-semibold tracking-wider uppercase text-sky-400">
-            Photomask Aperture Track
+            Photomask Track
           </span>
           {step.side === 'back' && (
             <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-semibold">
@@ -495,26 +524,66 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
 
         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
           <button
-            onClick={togglePolarity}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-            title="Switch between Positive (clear field) and Negative (dark field) photoresist"
+            type="button"
+            onClick={toggleMaskField}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
+              isLightField
+                ? 'bg-sky-950/60 hover:bg-sky-900/60 text-sky-200 border-sky-500/50'
+                : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+            }`}
+            title={
+              isLightField
+                ? 'Light-Field Mask: clear quartz background; movable blocks are opaque chrome blockers. Click to switch to Dark-Field.'
+                : 'Dark-Field Mask: opaque chrome background; movable blocks are clear UV apertures. Click to switch to Light-Field.'
+            }
           >
-            <ArrowLeftRight className="w-3.5 h-3.5 text-amber-400" />
+            <span
+              className={`w-3 h-3 rounded-xs border shrink-0 flex items-center justify-center ${
+                isLightField
+                  ? 'bg-sky-200/85 border-sky-300'
+                  : 'bg-slate-950 border-slate-500'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-[1px] ${
+                  isLightField ? 'bg-slate-900' : 'bg-amber-300'
+                }`}
+              />
+            </span>
             <span>
-              Tone: <strong className="capitalize text-white">{litho.polarity}</strong>
+              Mask: <strong className="text-white">{isLightField ? 'Light-Field' : 'Dark-Field'}</strong>
             </span>
           </button>
 
           <button
+            type="button"
+            onClick={togglePolarity}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+            title="Switch Photoresist Tone: Positive (UV-exposed dissolves) vs Negative (UV-exposed crosslinks & stays)"
+          >
+            <ArrowLeftRight className="w-3.5 h-3.5 text-amber-400" />
+            <span>
+              Resist: <strong className="capitalize text-white">{litho.polarity}</strong>
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={handleAddWindow}
             className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-sky-600 hover:bg-sky-500 text-white transition-colors shadow-sm"
+            title={
+              isLightField
+                ? 'Add an opaque chrome blocker island on the clear quartz mask'
+                : 'Add a clear quartz aperture window in the opaque chrome mask'
+            }
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Add Aperture</span>
+            <span>Add {featureNounCap}</span>
           </button>
 
           {onOpenMaskLevels && (
             <button
+              type="button"
               onClick={onOpenMaskLevels}
               className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 transition-colors"
               title="Open Photolithography Mask Levels Panel"
@@ -528,7 +597,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
             type="button"
             onClick={handleToggleMinimize}
             className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors"
-            title="Minimize Photomask Aperture Track to maximize cross-section view"
+            title="Minimize Photomask Track to maximize cross-section view"
           >
             <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
             <span className="hidden xl:inline">Minimize</span>
@@ -538,37 +607,82 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
 
       {/* Visual Photomask Bar */}
       <div className="relative my-2 select-none">
-        <div className="text-[10px] text-slate-400 flex justify-between font-mono mb-1">
+        <div className="text-[10px] text-slate-400 flex flex-wrap items-center justify-between gap-2 font-mono mb-1">
           <span>0 µm</span>
-          <span className="text-slate-500">
+          <span className="text-slate-400 truncate max-w-[75%]">
             {dragState ? (
               <span className="text-amber-300 font-semibold animate-pulse">
-                {dragState.type === 'move' ? 'Sliding Aperture...' : 'Resizing Boundary...'}
+                {dragState.type === 'move'
+                  ? `Sliding ${featureNounCap}...`
+                  : `Resizing ${featureNounCap} Boundary...`}
               </span>
             ) : (
-              `Wafer Width: ${(waferWidth / 1000).toFixed(1)} µm`
+              <span className={isLightField ? 'text-sky-300/90' : 'text-slate-400'}>
+                {outcomeSummary}
+              </span>
             )}
           </span>
           <span>{(waferWidth / 1000).toFixed(1)} µm</span>
         </div>
 
-        {/* Chrome base / Glass strip */}
+        {/* Chrome base (Dark-Field) OR Clear Quartz Glass (Light-Field) */}
         <div
           ref={containerRef}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className="relative h-11 w-full bg-slate-950 border border-slate-700 rounded-lg overflow-hidden shadow-inner select-none touch-none"
+          className={`relative h-11 w-full rounded-lg overflow-hidden shadow-inner select-none touch-none border ${
+            isLightField
+              ? 'bg-gradient-to-b from-sky-200/35 via-cyan-100/25 to-amber-100/30 border-sky-400/50'
+              : 'bg-slate-950 border-slate-700'
+          }`}
         >
-          {/* Default mask field: dark chrome or quartz background */}
-          <div className="absolute inset-0 bg-slate-800/80 opacity-40 pattern-crosshatch" />
+          {/* Mask Background Texture */}
+          {isLightField ? (
+            <div
+              className="absolute inset-0 pointer-events-none flex items-center justify-center"
+              style={{
+                backgroundImage:
+                  'linear-gradient(90deg, rgba(125,211,252,0.12) 1px, transparent 1px)',
+                backgroundSize: '24px 100%',
+              }}
+            >
+              {windows.length === 0 && (
+                <span className="text-[10px] font-mono font-semibold uppercase tracking-widest text-sky-100/80">
+                  Clear Quartz Field (100% UV Transmitting)
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="absolute inset-0 bg-slate-800/80 opacity-40 pattern-crosshatch flex items-center justify-center">
+              {windows.length === 0 && (
+                <span className="text-[10px] font-mono font-semibold uppercase tracking-widest text-slate-400">
+                  Opaque Chrome Field (0% UV Transmitting)
+                </span>
+              )}
+            </div>
+          )}
 
-          {/* Aperture windows (Clear quartz openings for positive resist) */}
+          {/* Movable Mask Blocks: Chrome Blockers (Light-Field) OR Clear Apertures (Dark-Field) */}
           {windows.map((win) => {
             const leftPct = (win.xStart / waferWidth) * 100;
             const widthPct = Math.max(1.5, ((win.xEnd - win.xStart) / waferWidth) * 100);
             const isActive = activeWindowId === win.id;
             const isDraggingThis = dragState?.winId === win.id;
+
+            const blockClasses = isLightField
+              ? isActive || isDraggingThis
+                ? 'bg-slate-900 border-y-2 border-amber-400 shadow-xl'
+                : 'bg-slate-900/95 border-y border-slate-300/80 hover:bg-slate-800 shadow-md'
+              : isActive || isDraggingThis
+              ? 'bg-amber-400/40 border-y border-amber-400 shadow-xl'
+              : 'bg-emerald-400/25 border-y border-emerald-400/80 hover:bg-emerald-400/35';
+
+            const handleClasses = isLightField
+              ? isActive || isDraggingThis
+                ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
+                : 'bg-slate-300/90 hover:bg-white text-slate-950'
+              : 'bg-amber-500/80 hover:bg-amber-400 text-slate-950';
 
             return (
               <div
@@ -577,22 +691,24 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   e.stopPropagation();
                   setActiveWindowId(win.id);
                 }}
-                className={`absolute top-0 bottom-0 transition-shadow select-none group/box ${
-                  isActive || isDraggingThis
-                    ? 'bg-amber-400/40 border-y border-amber-400 shadow-xl'
-                    : 'bg-emerald-400/25 border-y border-emerald-400/80 hover:bg-emerald-400/35'
-                }`}
+                className={`absolute top-0 bottom-0 transition-shadow select-none group/box ${blockClasses}`}
                 style={{
                   left: `${leftPct}%`,
                   width: `${widthPct}%`,
+                  ...(isLightField
+                    ? {
+                        backgroundImage:
+                          'repeating-linear-gradient(135deg, rgba(148,163,184,0.16) 0, rgba(148,163,184,0.16) 5px, transparent 5px, transparent 10px)',
+                      }
+                    : {}),
                 }}
               >
                 {/* Left Resize Handle (disabled when width is fixed) */}
                 {!win.fixedWidth && (
                   <div
                     onPointerDown={(e) => handlePointerDown(e, win, 'resize-start')}
-                    className="absolute left-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center bg-amber-500/80 hover:bg-amber-400 text-slate-950 z-20 transition-all select-none group/left"
-                    title="Drag to resize aperture left boundary"
+                    className={`absolute left-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center z-20 transition-all select-none group/left ${handleClasses}`}
+                    title={`Drag to resize ${featureNoun} left boundary`}
                   >
                     <div className="w-1 h-5 rounded-full bg-slate-950/70" />
                   </div>
@@ -604,15 +720,19 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   className="w-full h-full flex items-center justify-center cursor-grab active:cursor-grabbing px-3 overflow-hidden select-none"
                   title={
                     win.fixedWidth
-                      ? 'Width locked — drag to slide aperture'
-                      : 'Click and drag to slide aperture'
+                      ? `Width locked — drag to slide ${featureNoun}`
+                      : `Click and drag to slide ${featureNoun}`
                   }
                 >
                   <div className="flex items-center gap-1 text-[11px] font-mono font-bold text-white drop-shadow truncate select-none pointer-events-none">
                     {win.fixedWidth ? (
                       <Lock className="w-3 h-3 text-amber-300 flex-shrink-0" />
                     ) : (
-                      <MoveHorizontal className="w-3 h-3 text-amber-300 flex-shrink-0" />
+                      <MoveHorizontal
+                        className={`w-3 h-3 flex-shrink-0 ${
+                          isLightField ? 'text-slate-300' : 'text-amber-300'
+                        }`}
+                      />
                     )}
                     <span>{((win.xEnd - win.xStart) / 1000).toFixed(2)} µm</span>
                   </div>
@@ -622,8 +742,8 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 {!win.fixedWidth && (
                   <div
                     onPointerDown={(e) => handlePointerDown(e, win, 'resize-end')}
-                    className="absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center bg-amber-500/80 hover:bg-amber-400 text-slate-950 z-20 transition-all select-none group/right"
-                    title="Drag to resize aperture right boundary"
+                    className={`absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center z-20 transition-all select-none group/right ${handleClasses}`}
+                    title={`Drag to resize ${featureNoun} right boundary`}
                   >
                     <div className="w-1 h-5 rounded-full bg-slate-950/70" />
                   </div>
@@ -656,7 +776,18 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   <span className="w-5 h-5 rounded-md bg-slate-800 flex items-center justify-center font-mono text-[11px] text-slate-300">
                     {idx + 1}
                   </span>
-                  <span className="font-medium text-slate-300">Aperture #{idx + 1}</span>
+                  <span className="font-medium text-slate-300">
+                    {featureNounCap} #{idx + 1}
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[9.5px] font-mono border ${
+                      isLightField
+                        ? 'bg-slate-900 border-slate-600 text-slate-300'
+                        : 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
+                    }`}
+                  >
+                    {isLightField ? 'Chrome Blocker' : 'Clear Aperture'}
+                  </span>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2.5">
@@ -674,7 +805,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       title={
                         isFixed
                           ? 'Width is fixed (click Fix Width toggle to unlock)'
-                          : 'Edit aperture width (keeps window centered)'
+                          : `Edit ${featureNoun} width (keeps block centered)`
                       }
                     />
                     <span className="text-slate-500">µm</span>
@@ -688,8 +819,8 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       }`}
                       title={
                         isFixed
-                          ? 'Width Fixed: editing X start or X end slides the window without changing width'
-                          : 'Fix Width: lock width so editing X start or X end moves the window cleanly'
+                          ? `Width Fixed: editing X start or X end slides the ${featureNoun} without changing width`
+                          : `Fix Width: lock width so editing X start or X end moves the ${featureNoun} cleanly`
                       }
                     >
                       {isFixed ? (
@@ -713,8 +844,8 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xStart', valNm)}
                       title={
                         isFixed
-                          ? 'Edit start X (slides window with fixed width)'
-                          : 'Edit aperture start X'
+                          ? `Edit start X (slides ${featureNoun} with fixed width)`
+                          : `Edit ${featureNoun} start X`
                       }
                       className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500"
                     />
@@ -726,8 +857,8 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xEnd', valNm)}
                       title={
                         isFixed
-                          ? 'Edit end X (slides window with fixed width)'
-                          : 'Edit aperture end X'
+                          ? `Edit end X (slides ${featureNoun} with fixed width)`
+                          : `Edit ${featureNoun} end X`
                       }
                       className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500"
                     />
@@ -740,7 +871,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       handleRemoveWindow(win.id);
                     }}
                     className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-                    title="Delete aperture"
+                    title={`Delete ${featureNoun}`}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>

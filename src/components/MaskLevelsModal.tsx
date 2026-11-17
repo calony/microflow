@@ -176,6 +176,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       id: `mask_${Date.now()}`,
       name: `${maskToDup.name} (Copy)`,
       layerCode: `${maskToDup.layerCode || 'LVL'}-CPY`,
+      maskField: maskToDup.maskField || 'dark-field',
       assignedStepId: undefined, // Fresh copy is unassigned
       windows: maskToDup.windows.map((w) => ({ ...w, id: `w_${Date.now()}_${Math.random().toString(36).substring(2, 6)}` })),
     };
@@ -589,33 +590,63 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
             </div>
           </div>
 
-          {/* Miniature Reticle Aperture Preview Strip */}
-          <div className="h-2 w-full bg-slate-900 rounded overflow-hidden border border-slate-800 relative mb-2">
-            {mask.windows.map((w, wIdx) => {
-              const leftPct = (w.xStart / waferWidth) * 100;
-              const widthPct = ((w.xEnd - w.xStart) / waferWidth) * 100;
-              return (
-                <div
-                  key={w.id || `mini_${wIdx}`}
-                  className="absolute top-0 bottom-0"
-                  style={{
-                    left: `${leftPct}%`,
-                    width: `${Math.max(1, widthPct)}%`,
-                    backgroundColor: mask.color || '#38bdf8',
-                  }}
-                />
-              );
-            })}
-          </div>
+          {/* Miniature Reticle Track Strip */}
+          {(() => {
+            const isLF = mask.maskField === 'light-field';
+            return (
+              <div
+                className={`h-2 w-full rounded overflow-hidden border relative mb-2 ${
+                  isLF
+                    ? 'bg-sky-200/35 border-sky-400/40'
+                    : 'bg-slate-900 border-slate-800'
+                }`}
+              >
+                {mask.windows.map((w, wIdx) => {
+                  const leftPct = (w.xStart / waferWidth) * 100;
+                  const widthPct = ((w.xEnd - w.xStart) / waferWidth) * 100;
+                  return (
+                    <div
+                      key={w.id || `mini_${wIdx}`}
+                      className={`absolute top-0 bottom-0 ${
+                        isLF ? 'border-x border-slate-300/80' : ''
+                      }`}
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${Math.max(1, widthPct)}%`,
+                        backgroundColor: isLF ? '#0f172a' : mask.color || '#38bdf8',
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            );
+          })()}
 
           {/* Metadata strip */}
           <div className="flex items-center justify-between text-[10px] text-slate-400">
             <div className="flex items-center gap-1.5 flex-wrap">
+              <span
+                className={`font-semibold ${
+                  mMetrics.isLightField ? 'text-sky-300' : 'text-slate-300'
+                }`}
+              >
+                {mMetrics.isLightField ? 'Light-Field' : 'Dark-Field'}
+              </span>
+              <span>·</span>
               <span className="capitalize text-slate-300 font-medium">
                 {mask.polarity} Resist
               </span>
               <span>·</span>
-              <span>{mMetrics.apertureCount} {mMetrics.apertureCount === 1 ? 'Aperture' : 'Apertures'}</span>
+              <span>
+                {mMetrics.apertureCount}{' '}
+                {mMetrics.isLightField
+                  ? mMetrics.apertureCount === 1
+                    ? 'Blocker'
+                    : 'Blockers'
+                  : mMetrics.apertureCount === 1
+                  ? 'Aperture'
+                  : 'Apertures'}
+              </span>
               <span>·</span>
               <span className="font-mono text-amber-400/90">{mMetrics.clearPercentage}% Clear</span>
             </div>
@@ -934,10 +965,54 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     />
                   </div>
 
-                  {/* Polarity & Duplicate/Delete */}
-                  <div className="flex items-center gap-2 w-full sm:w-auto">
-                    <div className="grid grid-cols-2 flex-1 sm:flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 text-[11px] sm:text-xs">
+                  {/* Mask Field Polarity & Resist Tone + Duplicate/Delete */}
+                  <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                    <div
+                      className="grid grid-cols-2 flex-1 sm:flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 text-[11px] sm:text-xs"
+                      title="Mask Field Polarity: Dark-Field (opaque chrome bg, movable blocks = clear apertures) vs Light-Field (clear quartz bg, movable blocks = opaque chrome blockers)"
+                    >
                       <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateMask({
+                            ...selectedMask,
+                            maskField: 'dark-field',
+                          })
+                        }
+                        className={`px-2.5 py-1 rounded font-medium whitespace-nowrap transition-colors ${
+                          (selectedMask.maskField || 'dark-field') === 'dark-field'
+                            ? 'bg-slate-700 text-white'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                        title="Dark-Field Mask: Opaque chrome background; movable blocks are clear UV apertures"
+                      >
+                        Dark-Field
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateMask({
+                            ...selectedMask,
+                            maskField: 'light-field',
+                          })
+                        }
+                        className={`px-2.5 py-1 rounded font-medium whitespace-nowrap transition-colors ${
+                          selectedMask.maskField === 'light-field'
+                            ? 'bg-cyan-600 text-white'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                        title="Light-Field Mask: Clear quartz background; movable blocks are opaque chrome blockers"
+                      >
+                        Light-Field
+                      </button>
+                    </div>
+
+                    <div
+                      className="grid grid-cols-2 flex-1 sm:flex items-center bg-slate-950 border border-slate-700 rounded-lg p-0.5 text-[11px] sm:text-xs"
+                      title="Target Photoresist Tone: Positive (UV-exposed resist dissolves) vs Negative (UV-exposed resist crosslinks and stays)"
+                    >
+                      <button
+                        type="button"
                         onClick={() =>
                           handleUpdateMask({
                             ...selectedMask,
@@ -949,11 +1024,12 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                             ? 'bg-sky-600 text-white'
                             : 'text-slate-400 hover:text-slate-200'
                         }`}
-                        title="Positive Resist: Apertures expose resist, exposed areas dissolve"
+                        title="Positive Resist: UV-exposed resist dissolves in developer"
                       >
                         Positive Resist
                       </button>
                       <button
+                        type="button"
                         onClick={() =>
                           handleUpdateMask({
                             ...selectedMask,
@@ -965,7 +1041,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                             ? 'bg-amber-600 text-white'
                             : 'text-slate-400 hover:text-slate-200'
                         }`}
-                        title="Negative Resist: Unexposed areas dissolve, exposed areas crosslink and stay"
+                        title="Negative Resist: UV-exposed resist crosslinks and remains; unexposed dissolves"
                       >
                         Negative Resist
                       </button>
@@ -1082,7 +1158,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               {metrics && (
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
                   <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 text-center">
-                    <span className="block text-[10px] text-slate-400 uppercase tracking-wider">Apertures</span>
+                    <span className="block text-[10px] text-slate-400 uppercase tracking-wider">
+                      {metrics.isLightField ? 'Chrome Blockers' : 'Clear Apertures'}
+                    </span>
                     <span className="text-base font-bold font-mono text-white">{metrics.apertureCount}</span>
                   </div>
                   <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 text-center">
@@ -1106,156 +1184,211 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 </div>
               )}
 
-              {/* INTERACTIVE APERTURE TRACK SECTION */}
-              <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-                    <span className="font-semibold text-xs text-slate-200">
-                      Aperture Track
-                    </span>
-                    <span className="hidden sm:inline text-[11px] text-slate-400">
-                      · Drag to slide · Drag borders to resize · 50nm snapping
-                    </span>
-                  </div>
-
-                  {/* Preset Pattern Buttons */}
-                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
-                    <span className="text-[10px] text-slate-400 mr-0.5">Presets:</span>
-                    <button
-                      onClick={() => handleApplyPreset('center-slit')}
-                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
-                      title="Single Center Slit"
-                    >
-                      Center Slit
-                    </button>
-                    <button
-                      onClick={() => handleApplyPreset('dual-pad')}
-                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
-                      title="Dual Contact Openings"
-                    >
-                      Dual Pads
-                    </button>
-                    <button
-                      onClick={() => handleApplyPreset('grating')}
-                      className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
-                      title="Periodic Grating Slits"
-                    >
-                      Grating
-                    </button>
-                    <button
-                      onClick={() => handleApplyPreset('invert')}
-                      className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
-                      title="Invert Chrome / Clear"
-                    >
-                      <FlipHorizontal className="w-3 h-3" />
-                      <span>Invert</span>
-                    </button>
-                    <button
-                      onClick={() => handleClearApertureTrack(selectedMask)}
-                      disabled={selectedMask.windows.length === 0}
-                      className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-amber-950/50 text-amber-300 hover:text-amber-200 text-[11px] border border-slate-700 hover:border-amber-500/40 disabled:opacity-40 disabled:pointer-events-none transition-colors"
-                      title="Clear all apertures from this mask track (dark field)"
-                    >
-                      <Eraser className="w-3 h-3" />
-                      <span>Clear Track</span>
-                    </button>
-                    <button
-                      onClick={handleAddWindow}
-                      className="flex items-center gap-1 px-2.5 py-1 sm:py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold transition-colors"
-                    >
-                      <Plus className="w-3 h-3" />
-                      <span>Add Slit</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Visual Draggable Mask Track */}
-                <div
-                  ref={trackRef}
-                  onPointerMove={handlePointerMove}
-                  onPointerUp={handlePointerUp}
-                  onPointerCancel={handlePointerUp}
-                  className="relative h-14 bg-slate-950 border border-slate-800 rounded-xl overflow-hidden cursor-default select-none shadow-inner touch-none"
-                >
-                  {/* Chrome Opaque Background */}
-                  <div
-                    className="absolute inset-0 opacity-40"
-                    style={{
-                      backgroundImage:
-                        'repeating-linear-gradient(45deg, #1e293b 0, #1e293b 8px, #0f172a 8px, #0f172a 16px)',
-                    }}
-                  />
-
-                  {/* Clear Glass Aperture Boxes */}
-                  {selectedMask.windows.map((win, idx) => {
-                    const leftPct = (win.xStart / waferWidth) * 100;
-                    const widthPct = ((win.xEnd - win.xStart) / waferWidth) * 100;
-                    const isActive = activeWindowId === win.id;
-                    const widthNm = Math.round(win.xEnd - win.xStart);
-
-                    const accentColor = selectedMask.color || '#38bdf8';
-
-                    return (
-                      <div
-                        key={win.id || `win_${idx}`}
-                        className={`absolute top-1 bottom-1 rounded-lg flex items-center justify-center transition-all ${
-                          isActive
-                            ? 'ring-2 ring-white shadow-xl z-20 brightness-110'
-                            : 'hover:brightness-110 shadow-md z-10'
-                        }`}
-                        style={{
-                          left: `${leftPct}%`,
-                          width: `${Math.max(1, widthPct)}%`,
-                          backgroundColor: accentColor,
-                          boxShadow: isActive
-                            ? `0 0 0 2px #ffffff, 0 8px 18px -2px ${accentColor}90`
-                            : `0 3px 10px -2px ${accentColor}60`,
-                          cursor: 'grab',
-                        }}
-                        onPointerDown={(e) => handlePointerDown(e, win, 'move')}
-                      >
-                        {/* Left edge resize handle */}
-                        <div
-                          className="absolute left-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
-                          onPointerDown={(e) => handlePointerDown(e, win, 'resize-start')}
-                          title="Drag to resize left edge"
-                        >
-                          <div className="w-1 h-4 bg-slate-900/50 rounded-full group-hover:bg-slate-950" />
-                        </div>
-
-                        {/* Aperture label (width) */}
-                        <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/50 text-white backdrop-blur-xs select-none pointer-events-none truncate shadow-sm">
-                          {widthNm >= 1000 ? `${(widthNm / 1000).toFixed(2)} µm` : `${widthNm} nm`}
+              {/* INTERACTIVE MASK TRACK SECTION */}
+              {(() => {
+                const isLF = selectedMask.maskField === 'light-field';
+                const featNoun = isLF ? 'Blocker' : 'Aperture';
+                return (
+                  <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                        <span className="font-semibold text-xs text-slate-200">
+                          {isLF ? 'Light-Field Blocker Track' : 'Dark-Field Aperture Track'}
                         </span>
-
-                        {/* Right edge resize handle */}
-                        <div
-                          className="absolute right-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize hover:bg-white/40 flex items-center justify-center group"
-                          onPointerDown={(e) => handlePointerDown(e, win, 'resize-end')}
-                          title="Drag to resize right edge"
-                        >
-                          <div className="w-1 h-4 bg-slate-900/50 rounded-full group-hover:bg-slate-950" />
-                        </div>
+                        <span className="hidden sm:inline text-[11px] text-slate-400">
+                          · {isLF ? 'Quartz bg (UV passes) · Blocks = Chrome blockers' : 'Chrome bg (UV blocked) · Blocks = Clear apertures'} · 50nm snap
+                        </span>
                       </div>
-                    );
-                  })}
-                </div>
 
-                {/* Coordinate Scale Bar beneath track */}
-                <div className="flex justify-between items-center text-[10px] font-mono text-slate-400 px-1 pt-1">
-                  <span>0.0 µm</span>
-                  <span>{(waferWidth / 4000).toFixed(1)} µm</span>
-                  <span>{(waferWidth / 2000).toFixed(1)} µm</span>
-                  <span>{((waferWidth * 3) / 4000).toFixed(1)} µm</span>
-                  <span>{(waferWidth / 1000).toFixed(1)} µm</span>
-                </div>
-              </div>
+                      {/* Preset Pattern Buttons */}
+                      <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                        <span className="text-[10px] text-slate-400 mr-0.5">Presets:</span>
+                        <button
+                          onClick={() => handleApplyPreset('center-slit')}
+                          className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                          title={isLF ? 'Single Center Blocker' : 'Single Center Slit'}
+                        >
+                          {isLF ? 'Center Block' : 'Center Slit'}
+                        </button>
+                        <button
+                          onClick={() => handleApplyPreset('dual-pad')}
+                          className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                          title="Dual Symmetric Features"
+                        >
+                          Dual Pads
+                        </button>
+                        <button
+                          onClick={() => handleApplyPreset('grating')}
+                          className="px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                          title="Periodic Grating Lines"
+                        >
+                          Grating
+                        </button>
+                        <button
+                          onClick={() => handleApplyPreset('invert')}
+                          className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+                          title="Invert Windows Across Wafer Span"
+                        >
+                          <FlipHorizontal className="w-3 h-3" />
+                          <span>Invert</span>
+                        </button>
+                        <button
+                          onClick={() => handleClearApertureTrack(selectedMask)}
+                          disabled={selectedMask.windows.length === 0}
+                          className="flex items-center gap-1 px-2 py-1 sm:py-0.5 rounded bg-slate-800 hover:bg-amber-950/50 text-amber-300 hover:text-amber-200 text-[11px] border border-slate-700 hover:border-amber-500/40 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+                          title={
+                            isLF
+                              ? 'Clear all chrome blockers (100% clear quartz field)'
+                              : 'Clear all apertures from this mask track (100% opaque dark field)'
+                          }
+                        >
+                          <Eraser className="w-3 h-3" />
+                          <span>Clear Track</span>
+                        </button>
+                        <button
+                          onClick={handleAddWindow}
+                          className="flex items-center gap-1 px-2.5 py-1 sm:py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold transition-colors"
+                        >
+                          <Plus className="w-3 h-3" />
+                          <span>Add {featNoun}</span>
+                        </button>
+                      </div>
+                    </div>
 
-              {/* PRECISION NUMERIC APERTURE TABLE / MOBILE CARDS */}
+                    {/* Visual Draggable Mask Track */}
+                    <div
+                      ref={trackRef}
+                      onPointerMove={handlePointerMove}
+                      onPointerUp={handlePointerUp}
+                      onPointerCancel={handlePointerUp}
+                      className={`relative h-14 rounded-xl overflow-hidden cursor-default select-none shadow-inner touch-none border ${
+                        isLF
+                          ? 'bg-gradient-to-b from-sky-200/35 via-cyan-100/25 to-amber-100/30 border-sky-400/50'
+                          : 'bg-slate-950 border-slate-800'
+                      }`}
+                    >
+                      {/* Background Field: Chrome (Dark-Field) OR Clear Quartz (Light-Field) */}
+                      {isLF ? (
+                        <div
+                          className="absolute inset-0 pointer-events-none flex items-center justify-center"
+                          style={{
+                            backgroundImage:
+                              'linear-gradient(90deg, rgba(125,211,252,0.14) 1px, transparent 1px)',
+                            backgroundSize: '24px 100%',
+                          }}
+                        >
+                          {selectedMask.windows.length === 0 && (
+                            <span className="text-[10px] font-mono font-semibold uppercase tracking-widest text-sky-100/80">
+                              Clear Quartz Field (100% UV Transmitting)
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div
+                          className="absolute inset-0 opacity-40 flex items-center justify-center"
+                          style={{
+                            backgroundImage:
+                              'repeating-linear-gradient(45deg, #1e293b 0, #1e293b 8px, #0f172a 8px, #0f172a 16px)',
+                          }}
+                        />
+                      )}
+
+                      {/* Movable Blocks: Chrome Blockers (Light-Field) OR Clear Apertures (Dark-Field) */}
+                      {selectedMask.windows.map((win, idx) => {
+                        const leftPct = (win.xStart / waferWidth) * 100;
+                        const widthPct = ((win.xEnd - win.xStart) / waferWidth) * 100;
+                        const isActive = activeWindowId === win.id;
+                        const widthNm = Math.round(win.xEnd - win.xStart);
+                        const accentColor = selectedMask.color || '#38bdf8';
+
+                        return (
+                          <div
+                            key={win.id || `win_${idx}`}
+                            className={`absolute top-1 bottom-1 rounded-lg flex items-center justify-center transition-all ${
+                              isActive
+                                ? 'ring-2 ring-white shadow-xl z-20 brightness-110'
+                                : 'hover:brightness-110 shadow-md z-10'
+                            } ${isLF ? 'border-2' : ''}`}
+                            style={{
+                              left: `${leftPct}%`,
+                              width: `${Math.max(1, widthPct)}%`,
+                              backgroundColor: isLF ? '#0f172a' : accentColor,
+                              borderColor: isLF ? accentColor : undefined,
+                              ...(isLF
+                                ? {
+                                    backgroundImage:
+                                      'repeating-linear-gradient(135deg, rgba(148,163,184,0.16) 0, rgba(148,163,184,0.16) 5px, transparent 5px, transparent 10px)',
+                                  }
+                                : {}),
+                              boxShadow: isActive
+                                ? `0 0 0 2px #ffffff, 0 8px 18px -2px ${accentColor}90`
+                                : `0 3px 10px -2px ${accentColor}60`,
+                              cursor: 'grab',
+                            }}
+                            onPointerDown={(e) => handlePointerDown(e, win, 'move')}
+                          >
+                            {/* Left edge resize handle */}
+                            <div
+                              className={`absolute left-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize flex items-center justify-center group ${
+                                isLF ? 'hover:bg-white/25' : 'hover:bg-white/40'
+                              }`}
+                              onPointerDown={(e) => handlePointerDown(e, win, 'resize-start')}
+                              title="Drag to resize left edge"
+                            >
+                              <div
+                                className={`w-1 h-4 rounded-full ${
+                                  isLF
+                                    ? 'bg-slate-300/70 group-hover:bg-white'
+                                    : 'bg-slate-900/50 group-hover:bg-slate-950'
+                                }`}
+                              />
+                            </div>
+
+                            {/* Feature label (width) */}
+                            <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/50 text-white backdrop-blur-xs select-none pointer-events-none truncate shadow-sm">
+                              {widthNm >= 1000 ? `${(widthNm / 1000).toFixed(2)} µm` : `${widthNm} nm`}
+                            </span>
+
+                            {/* Right edge resize handle */}
+                            <div
+                              className={`absolute right-0 top-0 bottom-0 w-4 sm:w-3 cursor-ew-resize flex items-center justify-center group ${
+                                isLF ? 'hover:bg-white/25' : 'hover:bg-white/40'
+                              }`}
+                              onPointerDown={(e) => handlePointerDown(e, win, 'resize-end')}
+                              title="Drag to resize right edge"
+                            >
+                              <div
+                                className={`w-1 h-4 rounded-full ${
+                                  isLF
+                                    ? 'bg-slate-300/70 group-hover:bg-white'
+                                    : 'bg-slate-900/50 group-hover:bg-slate-950'
+                                }`}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Coordinate Scale Bar beneath track */}
+                    <div className="flex justify-between items-center text-[10px] font-mono text-slate-400 px-1 pt-1">
+                      <span>0.0 µm</span>
+                      <span>{(waferWidth / 4000).toFixed(1)} µm</span>
+                      <span>{(waferWidth / 2000).toFixed(1)} µm</span>
+                      <span>{((waferWidth * 3) / 4000).toFixed(1)} µm</span>
+                      <span>{(waferWidth / 1000).toFixed(1)} µm</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* PRECISION NUMERIC FEATURE TABLE / MOBILE CARDS */}
               <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-semibold text-xs text-slate-200">
-                    Aperture Windows ({selectedMask.windows.length})
+                    {selectedMask.maskField === 'light-field'
+                      ? `Chrome Blockers (${selectedMask.windows.length})`
+                      : `Aperture Windows (${selectedMask.windows.length})`}
                   </span>
 
                   <button
@@ -1263,7 +1396,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 text-xs font-semibold transition-colors"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>Add Window</span>
+                    <span>
+                      {selectedMask.maskField === 'light-field' ? 'Add Blocker' : 'Add Window'}
+                    </span>
                   </button>
                 </div>
 
@@ -1341,7 +1476,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
                   {selectedMask.windows.length === 0 && (
                     <div className="p-4 text-center text-xs text-slate-500 italic border border-slate-800 rounded-xl bg-slate-950/40">
-                      No apertures defined (dark field). Tap &quot;Add Window&quot; or pick a preset above.
+                      {selectedMask.maskField === 'light-field'
+                        ? 'No chrome blockers defined (100% clear quartz light field). Tap "Add Blocker" or pick a preset above.'
+                        : 'No apertures defined (0% clear dark field). Tap "Add Window" or pick a preset above.'}
                     </div>
                   )}
                 </div>
@@ -1351,7 +1488,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-900/90 text-[11px] text-slate-400 font-mono uppercase tracking-wider border-b border-slate-800">
                       <tr>
-                        <th className="px-3.5 py-2">Window #</th>
+                        <th className="px-3.5 py-2">
+                          {selectedMask.maskField === 'light-field' ? 'Blocker #' : 'Window #'}
+                        </th>
                         <th className="px-3.5 py-2">Start X₁ (nm)</th>
                         <th className="px-3.5 py-2">End X₂ (nm)</th>
                         <th className="px-3.5 py-2">Width ΔX</th>
@@ -1436,8 +1575,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                       {selectedMask.windows.length === 0 && (
                         <tr>
                           <td colSpan={5} className="px-4 py-6 text-center text-slate-500 italic">
-                            No apertures defined. This reticle is completely opaque (dark field).
-                            Click &quot;Add Window&quot; or choose a preset above.
+                            {selectedMask.maskField === 'light-field'
+                              ? 'No chrome blockers defined. This reticle is completely clear quartz (100% light field). Click "Add Blocker" or choose a preset above.'
+                              : 'No apertures defined. This reticle is completely opaque chrome (0% clear dark field). Click "Add Window" or choose a preset above.'}
                           </td>
                         </tr>
                       )}

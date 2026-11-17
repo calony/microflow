@@ -29,6 +29,7 @@ import {
   formatEtchRate,
   formatDurationCompact,
 } from '../lib/etchRates';
+import { getDefaultStepTitle } from '../lib/stepDefaults';
 import { ThicknessInput } from './ThicknessInput';
 import {
   Layers,
@@ -59,6 +60,7 @@ import {
   Frame,
   Slice,
   FlaskConical,
+  Bookmark,
 } from 'lucide-react';
 
 interface StepEditorProps {
@@ -140,15 +142,42 @@ export const StepEditor: React.FC<StepEditorProps> = ({
             <span className="text-xs text-slate-400 font-mono">Step Config</span>
           </div>
 
-          <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={step.enabled}
-              onChange={(e) => handleUpdate({ enabled: e.target.checked })}
-              className="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0"
-            />
-            <span>Enabled</span>
-          </label>
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() =>
+                handleUpdate({
+                  bookmarked: !step.bookmarked,
+                  bookmarkLabel: !step.bookmarked ? step.bookmarkLabel : undefined,
+                })
+              }
+              className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium border transition-colors ${
+                step.bookmarked
+                  ? 'bg-amber-500/15 border-amber-500/45 text-amber-300 hover:bg-amber-500/25'
+                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-amber-300 hover:border-slate-700'
+              }`}
+              title={
+                step.bookmarked
+                  ? 'Remove milestone bookmark from this step'
+                  : 'Bookmark this step as a process milestone'
+              }
+            >
+              <Bookmark
+                className={`w-3 h-3 ${step.bookmarked ? 'fill-amber-400 text-amber-400' : ''}`}
+              />
+              <span>{step.bookmarked ? 'Bookmarked' : 'Bookmark'}</span>
+            </button>
+
+            <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={step.enabled}
+                onChange={(e) => handleUpdate({ enabled: e.target.checked })}
+                className="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0"
+              />
+              <span>Enabled</span>
+            </label>
+          </div>
         </div>
 
         {/* Step Title Input */}
@@ -159,6 +188,25 @@ export const StepEditor: React.FC<StepEditorProps> = ({
           placeholder="Step title..."
           className="w-full px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-white font-medium text-sm focus:outline-none focus:border-sky-500 transition-colors"
         />
+
+        {/* Milestone Bookmark Label (when bookmarked) */}
+        {step.bookmarked && (
+          <div className="mt-2 flex items-center gap-2">
+            <span className="text-[11px] text-amber-300 shrink-0 font-medium flex items-center gap-1">
+              <Bookmark className="w-3 h-3 fill-amber-400 text-amber-400" />
+              Milestone:
+            </span>
+            <input
+              type="text"
+              value={step.bookmarkLabel || ''}
+              onChange={(e) =>
+                handleUpdate({ bookmarkLabel: e.target.value || undefined })
+              }
+              placeholder="Optional milestone tag (e.g. Gate Stack, Via Open)..."
+              className="min-w-0 flex-1 px-2 py-1 rounded bg-slate-950 border border-amber-500/40 text-xs text-amber-100 placeholder-slate-500 focus:outline-none focus:border-amber-400"
+            />
+          </div>
+        )}
 
         {/* Fabrication Block / Module Assignment */}
         <div className="mt-2.5 flex items-center gap-2 min-w-0">
@@ -278,10 +326,66 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                 value={step.type}
                 onChange={(e) => {
                   const newType = e.target.value as ProcessStepType;
+                  if (newType === step.type) return;
                   const patch: Partial<ProcessStep> = {
                     type: newType,
+                    title: getDefaultStepTitle(newType),
                     thickness: step.thickness || 200,
                   };
+                  if (newType === 'deposition') {
+                    if (!step.materialId) {
+                      patch.materialId = 'mat_sio2_thermal';
+                    }
+                    if (!step.deposition) {
+                      patch.deposition = {
+                        method: 'PECVD',
+                        depositionType: 'conformal',
+                        thickness: step.thickness || 200,
+                      };
+                    }
+                  }
+                  if (newType === 'lithography' && !step.lithography) {
+                    patch.lithography = {
+                      resistMaterialId: 'mat_pr_pos',
+                      resistThickness: 1000,
+                      polarity: 'positive',
+                      windows: [
+                        {
+                          id: `w_${Date.now()}`,
+                          xStart: Math.round(waferWidth * 0.35),
+                          xEnd: Math.round(waferWidth * 0.65),
+                        },
+                      ],
+                      sidewallAngle: 90,
+                      exposureMethod: 'UV Contact (365nm)',
+                    };
+                  }
+                  if (newType === 'etch' && !step.etch) {
+                    patch.etch = {
+                      etchType: 'rie',
+                      depth: step.thickness || 200,
+                      targetMaterialId: 'all',
+                      isotropy: 0.05,
+                      sidewallAngle: 90,
+                    };
+                  }
+                  if (newType === 'strip') {
+                    patch.strip = {
+                      solvent: step.strip?.solvent || 'O₂ Plasma Ashing',
+                      ...step.strip,
+                      stripType:
+                        step.strip?.stripType === 'sacrificial-release'
+                          ? 'sacrificial-release'
+                          : 'resist-strip',
+                    };
+                  }
+                  if (newType === 'liftoff') {
+                    patch.strip = {
+                      solvent: step.strip?.solvent || 'Acetone / NMP Ultrasonic',
+                      ...step.strip,
+                      stripType: 'metal-liftoff',
+                    };
+                  }
                   if (newType === 'cmp' && !step.cmp) {
                     patch.cmp = {
                       operation: 'cmp',
@@ -1108,6 +1212,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                               maskName: matchingMask.name,
                               maskColor: matchingMask.color,
                               polarity: matchingMask.polarity,
+                              maskField: matchingMask.maskField || 'dark-field',
                               resistMaterialId: resolveResistMaterialId(
                                 matchingMask.polarity,
                                 step.lithography?.resistMaterialId
@@ -1128,10 +1233,13 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       }}
                       className="min-w-0 flex-1 w-full truncate px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 text-xs font-mono focus:outline-none focus:border-sky-500"
                     >
-                      <option value="none">-- Unlinked Custom Apertures --</option>
+                      <option value="none">-- Unlinked Custom Features --</option>
                       {masks?.map((m) => (
                         <option key={m.id} value={m.id}>
-                          {m.name} ({m.windows?.length || 0} slits · {m.polarity})
+                          {m.name} ({m.windows?.length || 0}{' '}
+                          {m.maskField === 'light-field' ? 'blockers' : 'apertures'} ·{' '}
+                          {m.maskField === 'light-field' ? 'light-field' : 'dark-field'} ·{' '}
+                          {m.polarity})
                         </option>
                       ))}
                     </select>
@@ -1219,9 +1327,23 @@ export const StepEditor: React.FC<StepEditorProps> = ({
 
                   {step.lithography?.windows && (
                     <div className="flex items-center justify-between gap-2 flex-wrap text-[10px] text-slate-400 font-mono pt-0.5">
-                      <span>{step.lithography.windows.length} Aperture {step.lithography.windows.length === 1 ? 'window' : 'windows'}</span>
+                      <span>
+                        {step.lithography.maskField === 'light-field'
+                          ? 'Light-Field'
+                          : 'Dark-Field'}{' '}
+                        · {step.lithography.windows.length}{' '}
+                        {step.lithography.maskField === 'light-field'
+                          ? step.lithography.windows.length === 1
+                            ? 'blocker'
+                            : 'blockers'
+                          : step.lithography.windows.length === 1
+                          ? 'aperture'
+                          : 'apertures'}
+                      </span>
                       <span className="text-amber-400">
-                        {step.lithography.polarity === 'positive' ? 'Positive (Exposed Dissolves)' : 'Negative (Exposed Crosslinks)'}
+                        {step.lithography.polarity === 'positive'
+                          ? 'Positive Resist (Exposed dissolves)'
+                          : 'Negative Resist (Exposed crosslinks)'}
                       </span>
                     </div>
                   )}
@@ -1402,10 +1524,39 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </div>
                 )}
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-[11px] text-slate-400 mb-1">
-                      Resist Tone (Polarity)
+                      Mask Field Polarity
+                    </label>
+                    <select
+                      value={step.lithography?.maskField || 'dark-field'}
+                      onChange={(e) => {
+                        const nextField = e.target.value as 'dark-field' | 'light-field';
+                        handleUpdate({
+                          lithography: {
+                            ...(step.lithography || {
+                              resistMaterialId: 'mat_pr_pos',
+                              resistThickness: 1000,
+                              polarity: 'positive',
+                              windows: [],
+                              sidewallAngle: 90,
+                              exposureMethod: 'UV Contact (365nm)',
+                            }),
+                            maskField: nextField,
+                          },
+                        });
+                      }}
+                      className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
+                    >
+                      <option value="dark-field">Dark-Field (Blocks = Apertures)</option>
+                      <option value="light-field">Light-Field (Blocks = Chrome Blockers)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Resist Tone (Chemistry)
                     </label>
                     <select
                       value={step.lithography?.polarity || 'positive'}
@@ -1435,34 +1586,56 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <option value="negative">Negative (Unexposed dissolves)</option>
                     </select>
                   </div>
+                </div>
 
-                  <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">
-                      Resist Thickness ({getUnitLabel(thicknessUnit)})
-                    </label>
-                    <ThicknessInput
-                      valueNm={step.lithography?.resistThickness ?? 1000}
-                      onChangeNm={(val) =>
-                        handleUpdate({
-                          lithography: {
-                            ...(step.lithography || {
-                              resistMaterialId: 'mat_pr_pos',
-                              polarity: 'positive',
-                              windows: [],
-                              sidewallAngle: 90,
-                              exposureMethod: 'UV Contact (365nm)',
-                              resistThickness: 1000,
-                            }),
-                            resistThickness: val,
-                          },
-                        })
-                      }
-                      unit={thicknessUnit}
-                      minNm={100}
-                      stepNm={100}
-                      className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
-                    />
-                  </div>
+                <div className="px-2.5 py-1.5 rounded-lg bg-slate-900/80 border border-slate-800 text-[10px] text-slate-400 leading-snug">
+                  {(step.lithography?.maskField || 'dark-field') === 'light-field' ? (
+                    (step.lithography?.polarity || 'positive') === 'positive' ? (
+                      <span>
+                        <strong className="text-sky-300">Light-Field + Positive:</strong> Clear quartz exposes &amp; dissolves background resist; resist <strong className="text-slate-200">remains under chrome blockers</strong>.
+                      </span>
+                    ) : (
+                      <span>
+                        <strong className="text-sky-300">Light-Field + Negative:</strong> Clear quartz crosslinks background resist; resist <strong className="text-slate-200">dissolves under chrome blockers</strong>.
+                      </span>
+                    )
+                  ) : (step.lithography?.polarity || 'positive') === 'positive' ? (
+                    <span>
+                      <strong className="text-amber-300">Dark-Field + Positive:</strong> UV passes through apertures to <strong className="text-slate-200">dissolve resist at apertures</strong>; background chrome protects resist.
+                    </span>
+                  ) : (
+                    <span>
+                      <strong className="text-amber-300">Dark-Field + Negative:</strong> UV passes through apertures to <strong className="text-slate-200">crosslink resist at apertures</strong>; unexposed background dissolves.
+                    </span>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    Resist Thickness ({getUnitLabel(thicknessUnit)})
+                  </label>
+                  <ThicknessInput
+                    valueNm={step.lithography?.resistThickness ?? 1000}
+                    onChangeNm={(val) =>
+                      handleUpdate({
+                        lithography: {
+                          ...(step.lithography || {
+                            resistMaterialId: 'mat_pr_pos',
+                            polarity: 'positive',
+                            windows: [],
+                            sidewallAngle: 90,
+                            exposureMethod: 'UV Contact (365nm)',
+                            resistThickness: 1000,
+                          }),
+                          resistThickness: val,
+                        },
+                      })
+                    }
+                    unit={thicknessUnit}
+                    minNm={100}
+                    stepNm={100}
+                    className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                  />
                 </div>
 
                 <div>
@@ -1522,18 +1695,26 @@ export const StepEditor: React.FC<StepEditorProps> = ({
             {/* Customization for ETCH */}
             {step.type === 'etch' && (() => {
               const libraryRecipes = getEtchRecipes(etchRecipes);
+              const currentEtchType = step.etch?.etchType || 'rie';
+              const matchingRecipes = libraryRecipes.filter(
+                (r) => r.etchType === currentEtchType
+              );
               const linkedRecipe = step.etch?.etchRecipeId
-                ? libraryRecipes.find((r) => r.id === step.etch?.etchRecipeId)
+                ? matchingRecipes.find((r) => r.id === step.etch?.etchRecipeId)
                 : undefined;
               const rateMode =
                 linkedRecipe && step.etch?.rateMode === 'time-rate'
                   ? 'time-rate'
                   : 'manual';
               const targetMatId = step.etch?.targetMaterialId || 'all';
-              const refMatId =
+              const defaultRefMatId =
                 targetMatId !== 'all'
                   ? targetMatId
                   : linkedRecipe?.primaryMaterialId || 'mat_si_sub';
+              const refMatId =
+                linkedRecipe && step.etch?.referenceMaterialId
+                  ? step.etch.referenceMaterialId
+                  : defaultRefMatId;
               const refMat = materials.find((m) => m.id === refMatId);
               const refRate = linkedRecipe ? getEtchRateNmMin(linkedRecipe, refMatId) : 0;
               const prRate = linkedRecipe ? getEtchRateNmMin(linkedRecipe, 'mat_pr_pos') : 0;
@@ -1567,33 +1748,50 @@ export const StepEditor: React.FC<StepEditorProps> = ({
 
                 {/* Etch Rate Library Recipe Selector */}
                 <div>
-                  <label className="block text-[11px] text-slate-400 mb-1">
-                    Etch Chemistry / Rate Recipe
-                  </label>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="block text-[11px] text-slate-400">
+                      Etch Chemistry / Rate Recipe
+                    </label>
+                    <span className="text-[10px] font-mono text-slate-500">
+                      {matchingRecipes.length}{' '}
+                      {matchingRecipes.length === 1 ? 'recipe' : 'recipes'} for mechanism
+                    </span>
+                  </div>
                   <select
-                    value={step.etch?.etchRecipeId || ''}
+                    value={
+                      step.etch?.etchRecipeId &&
+                      matchingRecipes.some((r) => r.id === step.etch?.etchRecipeId)
+                        ? step.etch.etchRecipeId
+                        : ''
+                    }
                     onChange={(e) => {
                       const nextId = e.target.value;
                       if (!nextId) {
                         handleUpdate({
                           etch: {
                             ...(step.etch || {
-                              etchType: 'rie',
+                              etchType: currentEtchType,
                               depth: currentDepth,
                               targetMaterialId: 'all',
                               isotropy: 0.05,
                               sidewallAngle: 90,
                             }),
                             etchRecipeId: undefined,
+                            referenceMaterialId: undefined,
                             rateMode: 'manual',
                           },
                         });
                         return;
                       }
-                      const chosen = libraryRecipes.find((r) => r.id === nextId);
+                      const chosen = matchingRecipes.find((r) => r.id === nextId);
                       if (!chosen) return;
+                      const isSameRecipe = step.etch?.etchRecipeId === chosen.id;
+                      const nextRefMatId = isSameRecipe
+                        ? step.etch?.referenceMaterialId
+                        : undefined;
                       const chosenRefMatId =
-                        targetMatId !== 'all' ? targetMatId : chosen.primaryMaterialId;
+                        nextRefMatId ||
+                        (targetMatId !== 'all' ? targetMatId : chosen.primaryMaterialId);
                       const chosenRefRate = getEtchRateNmMin(chosen, chosenRefMatId);
                       const nextMode = step.etch?.rateMode || 'time-rate';
                       const nextSec =
@@ -1617,6 +1815,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             sidewallAngle: chosen.sidewallAngle,
                           }),
                           etchRecipeId: chosen.id,
+                          referenceMaterialId: nextRefMatId,
                           etchType: chosen.etchType,
                           isotropy: chosen.isotropy,
                           sidewallAngle: chosen.sidewallAngle,
@@ -1654,7 +1853,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-amber-500"
                   >
                     <option value="">-- Manual Depth (Custom Parameters) --</option>
-                    {libraryRecipes.map((r) => {
+                    {matchingRecipes.map((r) => {
                       const rRate = getEtchRateNmMin(r, r.primaryMaterialId);
                       return (
                         <option key={r.id} value={r.id}>
@@ -1714,9 +1913,52 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       </button>
                     </div>
 
+                    {rateMode === 'manual' && (
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Reference Material (for Equiv. Etch Time)
+                        </label>
+                        <select
+                          value={refMatId}
+                          onChange={(e) =>
+                            handleUpdate({
+                              etch: {
+                                ...step.etch!,
+                                referenceMaterialId: e.target.value,
+                              },
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200 text-[11px] focus:outline-none focus:border-amber-500"
+                        >
+                          {[...materials]
+                            .sort((a, b) => {
+                              const ra = getEtchRateNmMin(linkedRecipe, a.id);
+                              const rb = getEtchRateNmMin(linkedRecipe, b.id);
+                              if ((ra > 0) !== (rb > 0)) return rb > 0 ? 1 : -1;
+                              return rb - ra;
+                            })
+                            .map((m) => {
+                              const mRate = getEtchRateNmMin(linkedRecipe, m.id);
+                              return (
+                                <option
+                                  key={m.id}
+                                  value={m.id}
+                                  disabled={mRate <= 0 && m.id !== refMatId}
+                                >
+                                  {m.name} ({m.formula}) ·{' '}
+                                  {mRate > 0
+                                    ? formatEtchRate(mRate, thicknessUnit)
+                                    : '0 (Etch Stop)'}
+                                </option>
+                              );
+                            })}
+                        </select>
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center justify-between gap-1.5 text-[10px] font-mono text-slate-300">
                       <span>
-                        {refMat?.formula || 'Target'}:{' '}
+                        {refMat?.formula || 'Ref'}:{' '}
                         <strong className="text-amber-300">
                           {formatEtchRate(refRate, thicknessUnit)}
                         </strong>
@@ -1750,7 +1992,9 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     <p className="text-[10px] text-slate-400 leading-snug">
                       {rateMode === 'time-rate'
                         ? 'Multi-layer selectivity & photoresist mask erosion active; 0-rate layers act as etch stops.'
-                        : 'Fixed target depth active; photoresist mask erodes proportionally by recipe selectivity.'}
+                        : refRate > 0
+                        ? `Equiv. time from ${refMat?.formula || 'reference'} (${formatDurationCompact(estTimeSec)}); all open & masked layers follow recipe etch rates.`
+                        : 'Selected reference material has 0 nm/min etch rate in this recipe — select an etched material.'}
                     </p>
                   </div>
                 )}
@@ -1834,9 +2078,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       Etch Mechanism
                     </label>
                     <select
-                      value={step.etch?.etchType || 'rie'}
+                      value={currentEtchType}
                       onChange={(e) => {
                         const nextEtchType = e.target.value as any;
+                        const keepRecipe =
+                          linkedRecipe && linkedRecipe.etchType === nextEtchType;
                         handleUpdate({
                           etch: {
                             ...(step.etch || {
@@ -1847,11 +2093,20 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                               etchType: 'rie',
                             }),
                             etchType: nextEtchType,
+                            ...(keepRecipe
+                              ? {}
+                              : {
+                                  etchRecipeId: undefined,
+                                  referenceMaterialId: undefined,
+                                  rateMode: 'manual' as const,
+                                }),
                             isotropy:
                               nextEtchType === 'wet-isotropic'
                                 ? 0.95
-                                : nextEtchType === 'drie-bosch'
+                                : nextEtchType === 'drie-bosch' || nextEtchType === 'wet-koh'
                                 ? 0.02
+                                : nextEtchType === 'ashing'
+                                ? 0.45
                                 : 0.05,
                             sidewallAngle:
                               nextEtchType === 'wet-koh'
@@ -1889,7 +2144,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </label>
                   <select
                     value={step.etch?.targetMaterialId || 'all'}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      const nextTarget = e.target.value;
                       handleUpdate({
                         etch: {
                           ...(step.etch || {
@@ -1898,10 +2154,13 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             isotropy: 0.05,
                             sidewallAngle: 90,
                           }),
-                          targetMaterialId: e.target.value,
+                          targetMaterialId: nextTarget,
+                          ...(nextTarget !== 'all'
+                            ? { referenceMaterialId: undefined }
+                            : {}),
                         },
-                      })
-                    }
+                      });
+                    }}
                     className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
                   >
                     <option value="all">All Exposed Layers</option>

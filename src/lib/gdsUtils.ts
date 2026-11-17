@@ -50,6 +50,26 @@ export const DEFAULT_GDS_LAYER_PATTERNS: GdsPatternType[] = [
 ];
 
 /**
+ * Canonical key for a GDS (layer, datatype) pair.
+ */
+export function gdsLayerKey(layer: number, datatype: number = 0): string {
+  return `${layer}:${datatype}`;
+}
+
+/**
+ * Checks whether a GdsShape belongs to a specific GDS layer (and optional datatype).
+ */
+export function shapeMatchesLayer(
+  shape: GdsShape,
+  layer: number,
+  datatype?: number
+): boolean {
+  if (shape.layer !== layer) return false;
+  if (datatype === undefined) return true;
+  return (shape.datatype ?? 0) === datatype;
+}
+
+/**
  * Sorts shapes so layers near index 0 of `layers` (top of the layer stack UI)
  * are returned last (drawn on top in SVG paint order), preserving relative order within each layer.
  */
@@ -57,12 +77,27 @@ export function sortShapesByLayerOrder(
   shapes: GdsShape[],
   layers: GdsLayerInfo[]
 ): GdsShape[] {
-  const rank = new Map<number, number>();
+  const rankByKey = new Map<string, number>();
+  const rankByLayer = new Map<number, number>();
   const n = layers.length;
   layers.forEach((l, idx) => {
-    rank.set(l.layer, n - idx);
+    const r = n - idx;
+    rankByKey.set(gdsLayerKey(l.layer, l.datatype ?? 0), r);
+    if (!rankByLayer.has(l.layer)) {
+      rankByLayer.set(l.layer, r);
+    }
   });
-  return [...shapes].sort((a, b) => (rank.get(a.layer) ?? 0) - (rank.get(b.layer) ?? 0));
+  return [...shapes].sort((a, b) => {
+    const ra =
+      rankByKey.get(gdsLayerKey(a.layer, a.datatype ?? 0)) ??
+      rankByLayer.get(a.layer) ??
+      0;
+    const rb =
+      rankByKey.get(gdsLayerKey(b.layer, b.datatype ?? 0)) ??
+      rankByLayer.get(b.layer) ??
+      0;
+    return ra - rb;
+  });
 }
 
 export const SECTION_LINE_COLORS = [
@@ -174,14 +209,31 @@ interface RawGdsStructure {
   elements: RawGdsElement[];
 }
 
+export interface GdsCellSummary {
+  name: string;
+  isTopCell: boolean;
+  directElements: number;
+  childRefs: number;
+  referencedByCount: number;
+}
+
+export interface ParsedGdsStream {
+  libName: string;
+  fileName?: string;
+  dbuToNm: number;
+  structures: Map<string, RawGdsStructure>;
+  cells: GdsCellSummary[];
+  defaultTopCell: string;
+}
+
 /**
- * Parses a binary GDSII stream (.gds / .gds2 / .gdsii) into flattened nanometer 2D layout data.
+ * Stage 1 of GDSII loading: parses the binary GDSII stream into cell structures
+ * and computes hierarchy metadata so the user can choose and preview any top cell.
  */
-export function parseGdsFile(
+export function inspectGdsFile(
   buffer: ArrayBuffer,
-  fileName?: string,
-  existingMasks?: PhotomaskLevel[]
-): GdsLayoutData {
+  fileName?: string
+): ParsedGdsStream {
   const view = new DataView(buffer);
   const len = view.byteLength;
   if (len < 4) {
@@ -388,22 +440,73 @@ export function parseGdsFile(
     throw new Error('No GDSII cell structures found in file.');
   }
 
-  // Determine top cell(s) (structures never referenced by SREF/AREF)
-  const referenced = new Set<string>();
+  const refCounts = new Map<string, number>();
   for (const st of structures.values()) {
     for (const el of st.elements) {
       if ((el.kind === 'sref' || el.kind === 'aref') && el.sname) {
-        referenced.add(el.sname);
+        refCounts.set(el.sname, (refCounts.get(el.sname) || 0) + 1);
       }
     }
   }
-  const topCells = Array.from(structures.values()).filter((s) => !referenced.has(s.name));
-  const rootCells =
-    topCells.length > 0 ? topCells : [Array.from(structures.values())[structures.size - 1]];
+
+  const rawSummaries: GdsCellSummary[] = Array.from(structures.values()).map((st) => {
+    let directElements = 0;
+    let childRefs = 0;
+    for (const el of st.elements) {
+      if (el.kind === 'sref' || el.kind === 'aref') childRefs++;
+      else directElements++;
+    }
+    const referencedByCount = refCounts.get(st.name) || 0;
+    return {
+      name: st.name,
+      isTopCell: referencedByCount === 0,
+      directElements,
+      childRefs,
+      referencedByCount,
+    };
+  });
+
+  // Sort candidate top cells first, then sub-cells
+  const cells = [
+    ...rawSummaries.filter((c) => c.isTopCell),
+    ...rawSummaries.filter((c) => !c.isTopCell),
+  ];
+
+  const allStructList = Array.from(structures.values());
+  const defaultTopCell =
+    cells.find((c) => c.isTopCell)?.name ||
+    allStructList[allStructList.length - 1].name;
+
+  return {
+    libName,
+    fileName,
+    dbuToNm,
+    structures,
+    cells,
+    defaultTopCell,
+  };
+}
+
+/**
+ * Stage 2 of GDSII loading: flattens a chosen cell from a parsed GDSII stream into
+ * nanometer-scale 2D layout data.
+ */
+export function buildGdsLayoutFromCell(
+  parsed: ParsedGdsStream,
+  topCellName: string,
+  existingMasks?: PhotomaskLevel[],
+  maxShapes: number = 8000
+): { layout: GdsLayoutData; truncated: boolean } {
+  const { structures, dbuToNm, libName, defaultTopCell } = parsed;
+  const rootCell = structures.get(topCellName) || structures.get(defaultTopCell);
+  if (!rootCell) {
+    throw new Error(`Cell "${topCellName}" not found in GDSII file.`);
+  }
 
   const shapes: GdsShape[] = [];
   const layerMap = new Map<string, GdsLayerInfo>();
   let shapeCounter = 0;
+  let truncated = false;
 
   interface Matrix2D {
     a: number;
@@ -453,7 +556,7 @@ export function parseGdsFile(
   });
 
   const ensureLayer = (layer: number, datatype: number) => {
-    const key = `${layer}:${datatype}`;
+    const key = gdsLayerKey(layer, datatype);
     if (!layerMap.has(key)) {
       const idx = layerMap.size;
       const linkedMask = existingMasks?.[idx];
@@ -469,12 +572,18 @@ export function parseGdsFile(
     }
   };
 
-  const MAX_SHAPES = 8000;
   const flattenCell = (cell: RawGdsStructure, xform: Matrix2D, depth: number) => {
-    if (depth > 16 || shapes.length >= MAX_SHAPES) return;
+    if (depth > 16) return;
+    if (shapes.length >= maxShapes) {
+      truncated = true;
+      return;
+    }
 
     for (const el of cell.elements) {
-      if (shapes.length >= MAX_SHAPES) break;
+      if (shapes.length >= maxShapes) {
+        truncated = true;
+        break;
+      }
 
       if (el.kind === 'sref' && el.sname && el.points.length > 0) {
         const child = structures.get(el.sname);
@@ -508,7 +617,10 @@ export function parseGdsFile(
 
           for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
-              if (shapes.length >= MAX_SHAPES) break;
+              if (shapes.length >= maxShapes) {
+                truncated = true;
+                break;
+              }
               const px = p0.x + c * colStepX + r * rowStepX;
               const py = p0.y + c * colStepY + r * rowStepY;
               const childXform = composeTransform(
@@ -597,9 +709,11 @@ export function parseGdsFile(
     }
   };
 
-  flattenCell(rootCells[0], identity, 0);
+  flattenCell(rootCell, identity, 0);
 
-  const layers = Array.from(layerMap.values()).sort((a, b) => a.layer - b.layer);
+  const layers = Array.from(layerMap.values()).sort(
+    (a, b) => a.layer - b.layer || (a.datatype ?? 0) - (b.datatype ?? 0)
+  );
   const bounds = computeGdsBounds(shapes);
   const midY = Math.round((bounds.minY + bounds.maxY) * 0.5);
   const initialCut: GdsSectionLine = {
@@ -614,13 +728,33 @@ export function parseGdsFile(
   };
 
   return {
-    name: libName,
-    layers,
-    shapes,
-    sectionLine: initialCut,
-    sectionLines: [initialCut],
-    activeSectionId: initialCut.id,
+    truncated,
+    layout: {
+      name: `${libName} · ${rootCell.name}`,
+      layers,
+      shapes,
+      sectionLine: initialCut,
+      sectionLines: [initialCut],
+      activeSectionId: initialCut.id,
+    },
   };
+}
+
+/**
+ * Parses a binary GDSII stream (.gds / .gds2 / .gdsii) into flattened nanometer 2D layout data.
+ */
+export function parseGdsFile(
+  buffer: ArrayBuffer,
+  fileName?: string,
+  existingMasks?: PhotomaskLevel[],
+  topCellName?: string
+): GdsLayoutData {
+  const parsed = inspectGdsFile(buffer, fileName);
+  return buildGdsLayoutFromCell(
+    parsed,
+    topCellName || parsed.defaultTopCell,
+    existingMasks
+  ).layout;
 }
 
 /**
@@ -908,12 +1042,13 @@ export function arcIntervalToPolylineSegments(
 
 /**
  * Computes exact merged 1D intervals [sStart, sEnd] (in cut arc-length coordinates [0, cutLength])
- * where the (possibly multi-point) section cut crosses shapes on the specified GDS layer.
+ * where the (possibly multi-point) section cut crosses shapes on the specified GDS layer (and optional datatype).
  */
 export function computeRawSectionIntervals(
   shapes: GdsShape[],
   layer: number,
-  section: GdsSectionLine
+  section: GdsSectionLine,
+  datatype?: number
 ): { cutLength: number; intervals: [number, number][] } {
   const pts = getSectionPoints(section);
   if (pts.length < 2) return { cutLength: 0, intervals: [] };
@@ -921,7 +1056,7 @@ export function computeRawSectionIntervals(
   // Pre-collect polygons on the target layer once
   const layerPolys: GdsPoint[][] = [];
   for (const shape of shapes) {
-    if (shape.layer !== layer) continue;
+    if (!shapeMatchesLayer(shape, layer, datatype)) continue;
     layerPolys.push(...shapeToPolygons(shape));
   }
 
@@ -973,9 +1108,10 @@ export function sliceGdsLayoutAlongSection(
   shapes: GdsShape[],
   layer: number,
   section: GdsSectionLine,
-  targetWaferWidth: number
+  targetWaferWidth: number,
+  datatype?: number
 ): { windows: MaskWindow[]; cutLength: number } {
-  const { cutLength, intervals } = computeRawSectionIntervals(shapes, layer, section);
+  const { cutLength, intervals } = computeRawSectionIntervals(shapes, layer, section, datatype);
   if (cutLength <= 1) return { windows: [], cutLength: 0 };
 
   const scale = section.resizeWaferToCut ? 1 : targetWaferWidth / cutLength;
@@ -1015,7 +1151,8 @@ export function sliceGdsLayoutConcatenated(
   sections: GdsSectionLine[],
   gapNm: number,
   resizeWaferToCut: boolean,
-  targetWaferWidth: number
+  targetWaferWidth: number,
+  datatype?: number
 ): { windows: MaskWindow[]; totalLength: number; segments: ConcatSegmentMeta[] } {
   const safeGap = Math.max(0, Math.round(gapNm || 0));
   const rawIntervals: [number, number][] = [];
@@ -1035,7 +1172,7 @@ export function sliceGdsLayoutConcatenated(
   let cursor = 0;
   for (let i = 0; i < validSections.length; i++) {
     const sec = validSections[i];
-    const { cutLength, intervals } = computeRawSectionIntervals(shapes, layer, sec);
+    const { cutLength, intervals } = computeRawSectionIntervals(shapes, layer, sec, datatype);
     rawSegments.push({
       section: sec,
       rawOffsetStart: cursor,

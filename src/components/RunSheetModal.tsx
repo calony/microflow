@@ -7,7 +7,7 @@ import React, { useState, useMemo } from 'react';
 import { ProcessFlow, ProcessStep } from '../types/microfab';
 import { buildTimelineItems } from '../lib/blockUtils';
 import { ThicknessUnit, formatThickness } from '../lib/units';
-import { X, Copy, Check, Printer, FileText, Layers, CornerDownRight } from 'lucide-react';
+import { X, Copy, Check, Printer, FileText, Layers, CornerDownRight, Bookmark } from 'lucide-react';
 
 interface RunSheetModalProps {
   flow: ProcessFlow;
@@ -89,8 +89,13 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
 
       const sideLabel = formatStepSideLabel(step);
       const statusSuffix = step.enabled ? '' : ' [SKIPPED]';
+      const milestoneSuffix = step.bookmarked
+        ? step.bookmarkLabel
+          ? ` ★ [Milestone: ${step.bookmarkLabel}]`
+          : ' ★ [Milestone]'
+        : '';
       const prefix = nestedInModule ? '↳ ' : '';
-      return `| ${idx + 1} | ${prefix}${step.title} (${sideLabel})${statusSuffix} | ${r?.toolName || 'Standard Cleanroom Bench'} | ${params || 'Standard Recipe'} | ${r?.inspectionNotes || step.notes || 'Visual microscope inspection'} |\n`;
+      return `| ${idx + 1} | ${prefix}${step.title} (${sideLabel})${milestoneSuffix}${statusSuffix} | ${r?.toolName || 'Standard Cleanroom Bench'} | ${params || 'Standard Recipe'} | ${r?.inspectionNotes || step.notes || 'Visual microscope inspection'} |\n`;
     };
 
     let modSeq = 0;
@@ -169,6 +174,12 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
         <td className={`py-3 px-3 ${isNested ? 'pl-4' : ''}`}>
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="font-semibold text-slate-100">{step.title}</span>
+            {step.bookmarked && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-[9px] font-mono font-semibold text-amber-300">
+                <Bookmark className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />
+                <span>{step.bookmarkLabel || 'Milestone'}</span>
+              </span>
+            )}
             {!step.enabled && (
               <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[9px] font-mono uppercase text-slate-400">
                 Skipped

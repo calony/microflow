@@ -82,10 +82,13 @@ export interface DepositionConfig {
   planarization?: number; // 0 - 100% (100 = ideal flat planarization, <100 = viscous non-ideal spin coat)
 }
 
+export type MaskFieldPolarity = 'dark-field' | 'light-field';
+
 export interface LithographyConfig {
   resistMaterialId: string;
   resistThickness: number; // nm
   polarity: 'positive' | 'negative';
+  maskField?: MaskFieldPolarity; // 'dark-field' (blocks = apertures, default) vs 'light-field' (blocks = opaque chrome blockers)
   coatMethod?: 'spin-coat' | 'dry-film'; // Spin Coat (planarizing) vs Dry Film Lamination (tenting)
   laminationSag?: number; // 0 - 100% when coatMethod === 'dry-film'
   planarization?: number; // 0 - 100% when coatMethod === 'spin-coat' (default 100)
@@ -104,6 +107,7 @@ export interface PhotomaskLevel {
   layerCode?: string; // e.g. "GATE-01", "VIA-01", "MET-01"
   description?: string; // e.g. "Defines gate line features"
   polarity: 'positive' | 'negative';
+  maskField?: MaskFieldPolarity; // 'dark-field' (blocks = apertures) vs 'light-field' (blocks = chrome blockers)
   color?: string; // Reticle accent color for UI tracking
   windows: MaskWindow[];
   assignedStepId?: string; // ID of assigned photolithography step
@@ -127,6 +131,7 @@ export interface EtchConfig {
   etchRecipeId?: string; // Linked recipe from Etch Rate Library
   rateMode?: 'manual' | 'time-rate'; // 'manual' = fixed depth budget; 'time-rate' = duration * material etch rates
   etchTimeSec?: number; // Etch duration in seconds when rateMode === 'time-rate'
+  referenceMaterialId?: string; // Reference material used in Fixed Target Depth mode to derive equivalent etch time
 }
 
 export type EtchRateCategory =
@@ -247,6 +252,8 @@ export interface ProcessStep {
   side?: ProcessSide; // Defaults to 'front' when omitted
   enabled: boolean;
   notes?: string;
+  bookmarked?: boolean;
+  bookmarkLabel?: string;
   materialId?: string;
   thickness?: number; // in nm
   blockId?: string; // ID of the fabrication block this step belongs to

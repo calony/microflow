@@ -14,7 +14,7 @@ import { simulateCrossSection, buildRenderPolygons } from '../lib/simulationEngi
 import { SvgPatterns } from './SvgPatterns';
 import { getMaterialById } from '../lib/materials';
 import { ThicknessUnit, formatThickness } from '../lib/units';
-import { Download, LayoutGrid, Check, FileDown, Eye, Sliders } from 'lucide-react';
+import { Download, LayoutGrid, Check, FileDown, Eye, Sliders, Bookmark } from 'lucide-react';
 
 interface MultiStepFlowViewProps {
   flow: ProcessFlow;
@@ -35,11 +35,20 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
   const [showToolInfo, setShowToolInfo] = useState<boolean>(true);
   const [showLegend, setShowLegend] = useState<boolean>(true);
   const [includeSubstrateFrame, setIncludeSubstrateFrame] = useState<boolean>(true);
+  const [milestonesOnly, setMilestonesOnly] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
 
-  // Pre-calculate cross sections for all enabled steps
-  const enabledSteps = useMemo(
-    () => flow.steps.filter((s) => s.enabled),
+  const hasBookmarkedSteps = useMemo(
+    () => flow.steps.some((s) => Boolean(s.bookmarked)),
+    [flow.steps]
+  );
+
+  // Pre-calculate cross sections for enabled steps (with original flow.steps index)
+  const enabledStepsWithIndex = useMemo(
+    () =>
+      flow.steps
+        .map((step, stepIndex) => ({ step, stepIndex }))
+        .filter(({ step }) => step.enabled),
     [flow.steps]
   );
 
@@ -51,6 +60,8 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
         type: any;
         side?: 'front' | 'back' | 'both';
         notes?: string;
+        bookmarked?: boolean;
+        bookmarkLabel?: string;
         thickness?: number;
         deposition?: any;
         lithography?: any;
@@ -62,6 +73,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
         tapeFrame?: any;
       };
       idx: number;
+      flowStepIndex: number;
       mesh: CrossSectionMesh;
       polygons: RenderedPolygon[];
       customSubtitle?: string;
@@ -79,7 +91,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
       },
     ];
 
-    if (includeSubstrateFrame) {
+    if (includeSubstrateFrame && !(milestonesOnly && hasBookmarkedSteps)) {
       const subMesh = simulateCrossSection(flow, -1);
       const subPolys = buildRenderPolygons(subMesh, flow.materials);
       const subDesc = subLayers
@@ -92,14 +104,20 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
           type: 'substrate',
         },
         idx: -1,
+        flowStepIndex: -1,
         mesh: subMesh,
         polygons: subPolys,
         customSubtitle: `Pre-fab Stack: ${subDesc}`,
       });
     }
 
-    enabledSteps.forEach((step, idx) => {
-      const mesh = simulateCrossSection(flow, idx);
+    const filtered =
+      milestonesOnly && hasBookmarkedSteps
+        ? enabledStepsWithIndex.filter(({ step }) => Boolean(step.bookmarked))
+        : enabledStepsWithIndex;
+
+    filtered.forEach(({ step, stepIndex }, renderIdx) => {
+      const mesh = simulateCrossSection(flow, stepIndex);
       const polygons = buildRenderPolygons(mesh, flow.materials);
       const block = flow.blocks?.find((b) => b.id === step.blockId);
       const maskId = step.lithography?.maskId;
@@ -109,7 +127,8 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
 
       list.push({
         step,
-        idx,
+        idx: renderIdx,
+        flowStepIndex: stepIndex,
         mesh,
         polygons,
         blockName: block?.name,
@@ -119,7 +138,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
     });
 
     return list;
-  }, [flow, enabledSteps, includeSubstrateFrame]);
+  }, [flow, enabledStepsWithIndex, includeSubstrateFrame, milestonesOnly, hasBookmarkedSteps, thicknessUnit]);
 
   // Overall materials used
   const allUsedMaterials = useMemo(() => {
@@ -250,6 +269,22 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
             Substrate (a): {includeSubstrateFrame ? 'ON' : 'OFF'}
           </button>
 
+          {/* Bookmarked Milestones Filter */}
+          {hasBookmarkedSteps && (
+            <button
+              onClick={() => setMilestonesOnly((prev) => !prev)}
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-medium transition-colors ${
+                milestonesOnly
+                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-amber-300'
+              }`}
+              title="Show only bookmarked milestone steps"
+            >
+              <Bookmark className={`w-3 h-3 ${milestonesOnly ? 'fill-amber-400' : ''}`} />
+              <span>Milestones Only</span>
+            </button>
+          )}
+
           {/* Theme Selector */}
           <div className="flex items-center gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 text-[11px] sm:text-xs">
             <button
@@ -365,7 +400,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                   transform={`translate(${originX}, ${originY})`}
                   className="cursor-pointer"
                   onClick={() => {
-                    onSelectStepIndex(idx);
+                    onSelectStepIndex(item.flowStepIndex);
                     onClose();
                   }}
                 >
@@ -375,8 +410,14 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                     height={cellHeight - 10}
                     rx="8"
                     fill={theme === 'paper' ? '#fafafa' : '#0f172a'}
-                    stroke={theme === 'paper' ? '#e2e8f0' : '#1e293b'}
-                    strokeWidth="1.2"
+                    stroke={
+                      step.bookmarked
+                        ? '#f59e0b'
+                        : theme === 'paper'
+                        ? '#e2e8f0'
+                        : '#1e293b'
+                    }
+                    strokeWidth={step.bookmarked ? '1.6' : '1.2'}
                   />
 
                   {/* Step Caption / Title */}
@@ -389,6 +430,8 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                     fontFamily="Plus Jakarta Sans, sans-serif"
                   >
                     {getStepLetter(idx)} {step.title}
+                    {step.bookmarked &&
+                      ` ★ ${step.bookmarkLabel || 'Milestone'}`}
                     {item.blockName && ` [${item.blockName}]`}
                   </text>
 
@@ -419,7 +462,11 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                               step.lithography?.coatMethod === 'dry-film'
                                 ? 'Dry Film Litho'
                                 : 'Photolithography'
-                            } · ${step.lithography?.polarity} tone${
+                            } · ${step.lithography?.polarity} resist · ${
+                              step.lithography?.maskField === 'light-field'
+                                ? 'light-field'
+                                : 'dark-field'
+                            }${
                               item.reticleName ? ` · Reticle: ${item.reticleName}` : ''
                             }`) ||
                           (step.type === 'etch' &&

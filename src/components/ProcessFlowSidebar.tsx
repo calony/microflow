@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   ProcessFlow,
   ProcessStep,
@@ -27,7 +27,13 @@ import {
   normalizeFlowBlocksOrder,
   BLOCK_PALETTE,
 } from '../lib/blockUtils';
+import {
+  attachNewMaskToLithoStep,
+  formatMaskLevelTag,
+  getNextMaskLevelNumber,
+} from '../lib/maskUtils';
 import { getEtchRecipeById, formatDurationCompact } from '../lib/etchRates';
+import { getDefaultStepTitle } from '../lib/stepDefaults';
 import { ThicknessUnit, formatThickness } from '../lib/units';
 import {
   Plus,
@@ -60,6 +66,7 @@ import {
   X,
   Frame,
   Slice,
+  Bookmark,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -119,6 +126,13 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   const [dragSource, setDragSource] = useState<DragSource | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [stepSearchQuery, setStepSearchQuery] = useState<string>('');
+  const [showBookmarksOnly, setShowBookmarksOnly] = useState<boolean>(false);
+  const [isMilestonesExpanded, setIsMilestonesExpanded] = useState<boolean>(true);
+  const [editingBookmarkStepId, setEditingBookmarkStepId] = useState<string | null>(null);
+  const [editingBookmarkLabel, setEditingBookmarkLabel] = useState<string>('');
+
+  const stepCardRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
+  const pendingScrollStepIdRef = useRef<string | null>(null);
 
   const blocks = flow.blocks || [];
   const subLayers = flow.substrateLayers || [
@@ -132,8 +146,30 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   const totalSubThickness = subLayers.reduce((acc, l) => acc + (l.thickness || 0), 0);
   const isSubstrateSelected = activeStepIndex === -1;
 
+  const bookmarkedSteps = useMemo(
+    () =>
+      flow.steps
+        .map((step, idx) => ({ step, idx }))
+        .filter(({ step }) => Boolean(step.bookmarked)),
+    [flow.steps]
+  );
+
+  useEffect(() => {
+    const targetStepId = pendingScrollStepIdRef.current;
+    if (!targetStepId) return;
+    const rafId = requestAnimationFrame(() => {
+      const el = stepCardRefs.current.get(targetStepId);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        pendingScrollStepIdRef.current = null;
+      }
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [activeStepIndex, flow.blocks, showBookmarksOnly, stepSearchQuery]);
+
   const normalizedSearch = stepSearchQuery.trim().toLowerCase();
   const isSearchActive = normalizedSearch.length > 0;
+  const isFilterActive = isSearchActive || showBookmarksOnly;
 
   const blockMatchesQuery = (block: ProcessBlock): boolean => {
     if (!normalizedSearch) return true;
@@ -156,6 +192,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       step.type,
       step.side || 'front',
       step.notes || '',
+      step.bookmarkLabel || '',
+      step.bookmarked ? 'bookmark milestone' : '',
       mat?.name || '',
       mat?.formula || '',
       targetEtchMat?.name || '',
@@ -185,18 +223,110 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
     return searchable.includes(normalizedSearch);
   };
 
-  const matchedStepCount = isSearchActive
+  const stepMatchesFilters = (step: ProcessStep, globalIdx: number, block?: ProcessBlock): boolean => {
+    if (showBookmarksOnly && !step.bookmarked) return false;
+    return stepMatchesQuery(step, globalIdx, block);
+  };
+
+  const matchedStepCount = isFilterActive
     ? flow.steps.filter((step, idx) => {
         const blk = step.blockId ? blocks.find((b) => b.id === step.blockId) : undefined;
-        return stepMatchesQuery(step, idx, blk);
+        return stepMatchesFilters(step, idx, blk);
       }).length
     : flow.steps.length;
 
   const substrateMatchesSearch =
-    !isSearchActive ||
-    `0 starting substrate stack ${subLayers.map((l) => l.name || l.materialId).join(' ')}`
-      .toLowerCase()
-      .includes(normalizedSearch);
+    !showBookmarksOnly &&
+    (!isSearchActive ||
+      `0 starting substrate stack ${subLayers.map((l) => l.name || l.materialId).join(' ')}`
+        .toLowerCase()
+        .includes(normalizedSearch));
+
+  const jumpToStep = (idx: number) => {
+    const targetStep = flow.steps[idx];
+    if (!targetStep) return;
+
+    if (targetStep.blockId) {
+      const parentBlock = blocks.find((b) => b.id === targetStep.blockId);
+      if (parentBlock?.collapsed) {
+        onUpdateFlow(updateBlock(flow, { ...parentBlock, collapsed: false }));
+      }
+    }
+
+    if (showBookmarksOnly && !targetStep.bookmarked) {
+      setShowBookmarksOnly(false);
+    }
+
+    if (isSearchActive) {
+      const blk = targetStep.blockId ? blocks.find((b) => b.id === targetStep.blockId) : undefined;
+      if (!stepMatchesQuery(targetStep, idx, blk)) {
+        setStepSearchQuery('');
+      }
+    }
+
+    pendingScrollStepIdRef.current = targetStep.id;
+    onSelectStepIndex(idx);
+
+    requestAnimationFrame(() => {
+      const el = stepCardRefs.current.get(targetStep.id);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        pendingScrollStepIdRef.current = null;
+      }
+    });
+  };
+
+  const handleToggleBookmark = (idx: number) => {
+    const target = flow.steps[idx];
+    if (!target) return;
+    const nextBookmarked = !target.bookmarked;
+    const updatedSteps = flow.steps.map((s, i) =>
+      i === idx
+        ? {
+            ...s,
+            bookmarked: nextBookmarked,
+            bookmarkLabel: nextBookmarked ? s.bookmarkLabel : undefined,
+          }
+        : s
+    );
+    onUpdateFlow({ ...flow, steps: updatedSteps });
+    if (nextBookmarked) {
+      setIsMilestonesExpanded(true);
+    } else {
+      if (editingBookmarkStepId === target.id) {
+        setEditingBookmarkStepId(null);
+        setEditingBookmarkLabel('');
+      }
+      if (!updatedSteps.some((s) => s.bookmarked)) {
+        setShowBookmarksOnly(false);
+      }
+    }
+  };
+
+  const handleSaveBookmarkLabel = (stepId: string) => {
+    const trimmed = editingBookmarkLabel.trim();
+    const updatedSteps = flow.steps.map((s) =>
+      s.id === stepId ? { ...s, bookmarkLabel: trimmed || undefined } : s
+    );
+    onUpdateFlow({ ...flow, steps: updatedSteps });
+    setEditingBookmarkStepId(null);
+    setEditingBookmarkLabel('');
+  };
+
+  const handleJumpAdjacentBookmark = (direction: 'prev' | 'next') => {
+    if (bookmarkedSteps.length === 0) return;
+    if (direction === 'next') {
+      const nextMatch = bookmarkedSteps.find(({ idx }) => idx > activeStepIndex);
+      jumpToStep((nextMatch || bookmarkedSteps[0]).idx);
+    } else {
+      const prevMatches = bookmarkedSteps.filter(({ idx }) => idx < activeStepIndex);
+      const prevMatch =
+        prevMatches.length > 0
+          ? prevMatches[prevMatches.length - 1]
+          : bookmarkedSteps[bookmarkedSteps.length - 1];
+      jumpToStep(prevMatch.idx);
+    }
+  };
 
   const getStepIcon = (type: ProcessStepType) => {
     switch (type) {
@@ -233,7 +363,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'deposition':
         newStep = {
           id,
-          title: 'Thin Film Deposition',
+          title: getDefaultStepTitle('deposition'),
           type: 'deposition',
           enabled: true,
           materialId: 'mat_sio2_thermal',
@@ -249,7 +379,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'lithography':
         newStep = {
           id,
-          title: 'Photolithography Patterning',
+          title: getDefaultStepTitle('lithography'),
           type: 'lithography',
           enabled: true,
           blockId: blockId || undefined,
@@ -272,7 +402,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'etch':
         newStep = {
           id,
-          title: 'Plasma RIE Etch',
+          title: getDefaultStepTitle('etch'),
           type: 'etch',
           enabled: true,
           thickness: 200,
@@ -289,7 +419,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'strip':
         newStep = {
           id,
-          title: 'Photoresist Strip',
+          title: getDefaultStepTitle('strip'),
           type: 'strip',
           enabled: true,
           blockId: blockId || undefined,
@@ -302,7 +432,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'liftoff':
         newStep = {
           id,
-          title: 'Metal Lift-off',
+          title: getDefaultStepTitle('liftoff'),
           type: 'liftoff',
           enabled: true,
           blockId: blockId || undefined,
@@ -315,7 +445,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'cmp':
         newStep = {
           id,
-          title: 'Grind / Polish / Planarize',
+          title: getDefaultStepTitle('cmp'),
           type: 'cmp',
           enabled: true,
           blockId: blockId || undefined,
@@ -329,7 +459,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'bonding':
         newStep = {
           id,
-          title: 'Wafer Bonding',
+          title: getDefaultStepTitle('bonding'),
           type: 'bonding',
           side: 'front',
           enabled: true,
@@ -352,7 +482,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'dicing':
         newStep = {
           id,
-          title: 'Wafer Dicing',
+          title: getDefaultStepTitle('dicing'),
           type: 'dicing',
           side: 'front',
           enabled: true,
@@ -376,7 +506,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'tape-frame':
         newStep = {
           id,
-          title: 'Mount on Tape & Frame',
+          title: getDefaultStepTitle('tape-frame'),
           type: 'tape-frame',
           side: 'back',
           enabled: true,
@@ -393,7 +523,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       case 'anneal':
         newStep = {
           id,
-          title: 'Thermal Dopant Drive-in / Anneal',
+          title: getDefaultStepTitle('anneal'),
           type: 'anneal',
           enabled: true,
           blockId: blockId || undefined,
@@ -417,7 +547,11 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             newStep,
             addPlacement.mode === 'into-block' ? addPlacement.blockId : null
           );
-    onUpdateFlow(newFlow);
+    const finalFlow =
+      type === 'lithography'
+        ? attachNewMaskToLithoStep(newFlow, newStep.id)
+        : newFlow;
+    onUpdateFlow(finalFlow);
     onSelectStepIndex(insertedIndex);
     setShowAddMenu(false);
     setAddPlacement({ mode: 'end' });
@@ -433,14 +567,50 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
 
   const handleDuplicateStep = (idx: number) => {
     const original = flow.steps[idx];
+    const now = Date.now();
     const cloned: ProcessStep = {
       ...JSON.parse(JSON.stringify(original)),
-      id: `step_${Date.now()}`,
+      id: `step_${now}`,
       title: `${original.title} (Copy)`,
+      bookmarked: undefined,
+      bookmarkLabel: undefined,
     };
+
+    let dupMaskNameOverride: string | undefined;
+    if (cloned.type === 'lithography' && cloned.lithography) {
+      const nextLvl = getNextMaskLevelNumber(flow.masks || []);
+      const tag = formatMaskLevelTag(nextLvl);
+      const rawMaskLabel = (cloned.lithography.maskName || '')
+        .replace(/^MASK\s+\d+:\s*/i, '')
+        .trim();
+      if (rawMaskLabel) {
+        const copyLabel = /\(copy\)$/i.test(rawMaskLabel)
+          ? rawMaskLabel
+          : `${rawMaskLabel} (COPY)`;
+        dupMaskNameOverride = `MASK ${tag}: ${copyLabel.toUpperCase()}`;
+      }
+      cloned.lithography = {
+        ...cloned.lithography,
+        maskId: undefined,
+        maskName: undefined,
+        windows: (cloned.lithography.windows || []).map((w, wIdx) => ({
+          ...w,
+          id: `w_${now}_${wIdx}`,
+        })),
+      };
+    }
+
     const updated = [...flow.steps];
     updated.splice(idx + 1, 0, cloned);
-    onUpdateFlow(normalizeFlowBlocksOrder({ ...flow, steps: updated }));
+    let nextFlow = normalizeFlowBlocksOrder({ ...flow, steps: updated });
+    if (cloned.type === 'lithography') {
+      nextFlow = attachNewMaskToLithoStep(
+        nextFlow,
+        cloned.id,
+        dupMaskNameOverride ? { name: dupMaskNameOverride } : undefined
+      );
+    }
+    onUpdateFlow(nextFlow);
     onSelectStepIndex(idx + 1);
   };
 
@@ -716,7 +886,14 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       <div key={step.id} className="space-y-0.5">
         {showBeforeLine && <DropLine />}
         <div
-          draggable={!isSearchActive}
+          ref={(el) => {
+            if (el) {
+              stepCardRefs.current.set(step.id, el);
+            } else {
+              stepCardRefs.current.delete(step.id);
+            }
+          }}
+          draggable={!isFilterActive}
           onDragStart={handleStepDragStart}
           onDragOver={handleStepDragOver}
           onDrop={handleStepDrop}
@@ -731,6 +908,10 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           } ${
             isSelected
               ? 'bg-sky-950/70 border-sky-500 text-white shadow-md'
+              : step.bookmarked
+              ? step.enabled
+                ? 'bg-amber-950/20 border-amber-500/45 hover:bg-amber-950/35 hover:border-amber-400/70 text-slate-100'
+                : 'bg-slate-950/30 border-amber-500/30 opacity-65 text-slate-400'
               : step.enabled
               ? 'bg-slate-900/75 border-slate-800/90 hover:bg-slate-800/70 hover:border-slate-700 text-slate-100'
               : 'bg-slate-950/30 border-slate-800/50 opacity-60 text-slate-400'
@@ -738,7 +919,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         >
           <div className="flex items-start gap-1.5 min-w-0">
             {/* Drag handle */}
-            {!isSearchActive && (
+            {!isFilterActive && (
               <GripVertical
                 className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5 mt-0.5"
                 aria-label="Drag to reorder step"
@@ -750,6 +931,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               className={`w-5 h-5 rounded-md flex items-center justify-center font-mono text-[10px] font-bold flex-shrink-0 mt-0.5 ${
                 isSelected
                   ? 'bg-sky-500 text-white'
+                  : step.bookmarked
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                   : 'bg-slate-800 text-slate-300'
               }`}
             >
@@ -775,6 +958,21 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   {step.title}
                 </span>
                 <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                  {step.bookmarked && (
+                    <span
+                      className="inline-flex items-center gap-0.5 px-1 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/35 font-mono text-[9px] font-semibold max-w-[90px]"
+                      title={
+                        step.bookmarkLabel
+                          ? `Milestone: ${step.bookmarkLabel}`
+                          : 'Bookmarked milestone'
+                      }
+                    >
+                      <Bookmark className="w-2.5 h-2.5 fill-amber-400 text-amber-400 shrink-0" />
+                      {step.bookmarkLabel && (
+                        <span className="truncate">{step.bookmarkLabel}</span>
+                      )}
+                    </span>
+                  )}
                   {!step.enabled && (
                     <span className="px-1 py-0.2 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 font-mono text-[9px] font-bold">
                       OFF
@@ -802,7 +1000,12 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   `${
                     step.lithography?.coatMethod === 'dry-film' ? 'dry film · ' : ''
                   }${step.lithography?.polarity || 'pos'} · ${
-                    step.lithography?.maskName || `${step.lithography?.windows.length || 0} slits`
+                    step.lithography?.maskField === 'light-field' ? 'LF' : 'DF'
+                  } · ${
+                    step.lithography?.maskName ||
+                    `${step.lithography?.windows.length || 0} ${
+                      step.lithography?.maskField === 'light-field' ? 'blockers' : 'slits'
+                    }`
                   }`}
                 {step.type === 'etch' && (() => {
                   const rec = step.etch?.etchRecipeId
@@ -861,6 +1064,17 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             onClick={(e) => e.stopPropagation()}
             onDoubleClick={(e) => e.stopPropagation()}
           >
+            <button
+              onClick={() => handleToggleBookmark(globalIdx)}
+              className={`p-1 rounded hover:bg-slate-700/80 transition-colors ${
+                step.bookmarked
+                  ? 'text-amber-400 hover:text-amber-300'
+                  : 'text-slate-400 hover:text-amber-300'
+              }`}
+              title={step.bookmarked ? 'Remove Milestone Bookmark' : 'Bookmark Step as Milestone'}
+            >
+              <Bookmark className={`w-3.5 h-3.5 ${step.bookmarked ? 'fill-amber-400' : ''}`} />
+            </button>
             <button
               onClick={() => handleToggleStep(globalIdx)}
               className="p-1 rounded hover:bg-slate-700/80 text-slate-400 hover:text-slate-100 transition-colors"
@@ -1069,8 +1283,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 setStepSearchQuery('');
               }
             }}
-            placeholder="Search steps or modules..."
-            aria-label="Search process steps or modules"
+            placeholder="Search steps, modules, milestones..."
+            aria-label="Search process steps, modules, or milestones"
             className="w-full pl-7 pr-14 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition-colors"
           />
           {isSearchActive && (
@@ -1089,6 +1303,213 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             </div>
           )}
         </div>
+      </div>
+
+      {/* Milestone Bookmarks Quick-Jump Bar */}
+      <div className="border-b border-slate-800 bg-slate-950/65 shrink-0">
+        <div className="px-2.5 py-1 flex items-center justify-between gap-1.5">
+          <button
+            type="button"
+            onClick={() => setIsMilestonesExpanded((prev) => !prev)}
+            className="flex items-center gap-1.5 min-w-0 text-[10.5px] font-semibold text-slate-300 hover:text-amber-300 transition-colors"
+            title={
+              bookmarkedSteps.length > 0
+                ? 'Toggle milestone quick-jump list'
+                : 'Bookmark steps to create quick-jump milestones'
+            }
+          >
+            {bookmarkedSteps.length > 0 &&
+              (isMilestonesExpanded ? (
+                <ChevronDown className="w-3 h-3 text-slate-500 shrink-0" />
+              ) : (
+                <ChevronRight className="w-3 h-3 text-slate-500 shrink-0" />
+              ))}
+            <Bookmark
+              className={`w-3 h-3 shrink-0 ${
+                bookmarkedSteps.length > 0
+                  ? 'text-amber-400 fill-amber-400'
+                  : 'text-slate-500'
+              }`}
+            />
+            <span className="truncate">Milestones</span>
+            <span
+              className={`px-1 py-0.2 rounded font-mono text-[9.5px] ${
+                bookmarkedSteps.length > 0
+                  ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                  : 'bg-slate-800 text-slate-500'
+              }`}
+            >
+              {bookmarkedSteps.length}
+            </span>
+          </button>
+
+          <div className="flex items-center gap-1 shrink-0">
+            {activeStepIndex >= 0 && flow.steps[activeStepIndex] && (
+              <button
+                type="button"
+                onClick={() => handleToggleBookmark(activeStepIndex)}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition-colors flex items-center gap-1 ${
+                  flow.steps[activeStepIndex].bookmarked
+                    ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-amber-300 hover:border-slate-700'
+                }`}
+                title={
+                  flow.steps[activeStepIndex].bookmarked
+                    ? `Remove bookmark on Step ${activeStepIndex + 1}`
+                    : `Bookmark Step ${activeStepIndex + 1}`
+                }
+              >
+                <Bookmark
+                  className={`w-2.5 h-2.5 ${
+                    flow.steps[activeStepIndex].bookmarked ? 'fill-amber-400' : ''
+                  }`}
+                />
+                <span className="hidden sm:inline">
+                  {flow.steps[activeStepIndex].bookmarked ? 'Marked' : `Mark #${activeStepIndex + 1}`}
+                </span>
+              </button>
+            )}
+
+            {bookmarkedSteps.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowBookmarksOnly((prev) => !prev)}
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition-colors ${
+                    showBookmarksOnly
+                      ? 'bg-amber-500/20 border-amber-400/60 text-amber-200'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                  }`}
+                  title={
+                    showBookmarksOnly
+                      ? 'Show all steps in timeline'
+                      : 'Filter timeline to bookmarked milestones only'
+                  }
+                >
+                  Only
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleJumpAdjacentBookmark('prev')}
+                  className="p-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 hover:text-amber-300 hover:border-slate-700 transition-colors"
+                  title="Jump to Previous Bookmarked Milestone"
+                >
+                  <ChevronLeft className="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleJumpAdjacentBookmark('next')}
+                  className="p-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 hover:text-amber-300 hover:border-slate-700 transition-colors"
+                  title="Jump to Next Bookmarked Milestone"
+                >
+                  <ChevronRight className="w-3 h-3" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {isMilestonesExpanded && bookmarkedSteps.length > 0 && (
+          <div className="max-h-32 overflow-y-auto px-2 pb-1.5 space-y-1">
+            {bookmarkedSteps.map(({ step, idx }) => {
+              const isCurrent = idx === activeStepIndex;
+              const isEditingLabel = editingBookmarkStepId === step.id;
+              return (
+                <div
+                  key={step.id}
+                  onClick={() => {
+                    if (!isEditingLabel) jumpToStep(idx);
+                  }}
+                  className={`group/bm flex items-center justify-between gap-1.5 px-1.5 py-1 rounded-md border text-[11px] cursor-pointer transition-colors ${
+                    isCurrent
+                      ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                      : 'bg-slate-900/75 border-slate-800/80 hover:border-amber-500/40 hover:bg-slate-800/80 text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <span
+                      className={`px-1 py-0.2 rounded font-mono text-[9.5px] font-bold shrink-0 ${
+                        isCurrent
+                          ? 'bg-amber-400 text-slate-950'
+                          : 'bg-slate-800 text-amber-300'
+                      }`}
+                    >
+                      #{idx + 1}
+                    </span>
+                    {isEditingLabel ? (
+                      <div
+                        className="flex items-center gap-1 flex-1 min-w-0"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <input
+                          type="text"
+                          autoFocus
+                          value={editingBookmarkLabel}
+                          onChange={(e) => setEditingBookmarkLabel(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleSaveBookmarkLabel(step.id);
+                            if (e.key === 'Escape') {
+                              setEditingBookmarkStepId(null);
+                              setEditingBookmarkLabel('');
+                            }
+                          }}
+                          placeholder={step.title}
+                          className="w-full min-w-0 px-1.5 py-0.5 rounded bg-slate-950 border border-amber-500/60 text-[10.5px] text-white focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleSaveBookmarkLabel(step.id)}
+                          className="p-0.5 text-emerald-400 hover:text-emerald-300 shrink-0"
+                          title="Save milestone label"
+                        >
+                          <Check className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-medium leading-tight">
+                          {step.bookmarkLabel || step.title}
+                        </div>
+                        {step.bookmarkLabel && (
+                          <div className="truncate text-[9.5px] text-slate-500 leading-tight">
+                            {step.title}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {!isEditingLabel && (
+                    <div
+                      className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover/bm:opacity-100 transition-opacity"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingBookmarkStepId(step.id);
+                          setEditingBookmarkLabel(step.bookmarkLabel || '');
+                        }}
+                        className="p-0.5 rounded text-slate-400 hover:text-amber-300 hover:bg-slate-700/70"
+                        title="Rename milestone label"
+                      >
+                        <Edit2 className="w-2.5 h-2.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleBookmark(idx)}
+                        className="p-0.5 rounded text-slate-400 hover:text-rose-400 hover:bg-slate-700/70"
+                        title="Remove bookmark"
+                      >
+                        <X className="w-2.5 h-2.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Starting Substrate (Step 0) Item */}
@@ -1280,19 +1701,19 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             );
           }
 
-          const visibleTimelineItems = isSearchActive
+          const visibleTimelineItems = isFilterActive
             ? timelineItems
                 .map((item, timelineIdx) => {
                   if (item.kind === 'step') {
-                    return stepMatchesQuery(item.step, item.idx)
+                    return stepMatchesFilters(item.step, item.idx)
                       ? { item, timelineIdx, visibleSteps: null }
                       : null;
                   }
-                  if (blockMatchesQuery(item.block)) {
+                  if (!showBookmarksOnly && isSearchActive && blockMatchesQuery(item.block)) {
                     return { item, timelineIdx, visibleSteps: item.steps };
                   }
                   const matchingSteps = item.steps.filter(({ step, idx }) =>
-                    stepMatchesQuery(step, idx, item.block)
+                    stepMatchesFilters(step, idx, item.block)
                   );
                   if (matchingSteps.length === 0) return null;
                   return { item, timelineIdx, visibleSteps: matchingSteps };
@@ -1304,19 +1725,36 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 visibleSteps: item.kind === 'block' ? item.steps : null,
               }));
 
-          if (isSearchActive && visibleTimelineItems.length === 0 && !substrateMatchesSearch) {
+          if (isFilterActive && visibleTimelineItems.length === 0 && !substrateMatchesSearch) {
             return (
               <div className="p-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl bg-slate-950/30 space-y-2">
                 <div className="font-medium text-slate-300">
-                  No steps or modules match &ldquo;{stepSearchQuery.trim()}&rdquo;
+                  {showBookmarksOnly && !isSearchActive
+                    ? 'No bookmarked milestone steps yet'
+                    : isSearchActive
+                    ? <>No matching steps for &ldquo;{stepSearchQuery.trim()}&rdquo;</>
+                    : 'No matching steps'}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setStepSearchQuery('')}
-                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-[11px] font-medium transition-colors"
-                >
-                  Clear Search
-                </button>
+                <div className="flex items-center justify-center gap-2">
+                  {isSearchActive && (
+                    <button
+                      type="button"
+                      onClick={() => setStepSearchQuery('')}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 text-[11px] font-medium transition-colors"
+                    >
+                      Clear Search
+                    </button>
+                  )}
+                  {showBookmarksOnly && (
+                    <button
+                      type="button"
+                      onClick={() => setShowBookmarksOnly(false)}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 text-[11px] font-medium transition-colors"
+                    >
+                      Show All Steps
+                    </button>
+                  )}
+                </div>
               </div>
             );
           }
@@ -1596,7 +2034,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   </div>
 
                   {/* Block Steps */}
-                  {(!block.collapsed || isSearchActive) && (
+                  {(!block.collapsed || isFilterActive) && (
                     <div
                       className="p-1.5 space-y-1 bg-slate-950/20"
                       onDragOver={(e) => {

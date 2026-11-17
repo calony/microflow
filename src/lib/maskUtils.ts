@@ -3,7 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { ProcessFlow, ProcessStep, PhotomaskLevel, MaskWindow } from '../types/microfab';
+import {
+  ProcessFlow,
+  ProcessStep,
+  PhotomaskLevel,
+  MaskWindow,
+  MaskFieldPolarity,
+} from '../types/microfab';
 import { resolveResistMaterialId } from './materials';
 
 export const RETICLE_PALETTE = [
@@ -16,6 +22,32 @@ export const RETICLE_PALETTE = [
   '#6366f1', // Indigo
   '#14b8a6', // Teal
 ];
+
+export function getNextMaskLevelNumber(masks: PhotomaskLevel[]): number {
+  const maxExisting = masks.reduce((max, m) => Math.max(max, m.levelNumber || 0), 0);
+  return Math.max(masks.length, maxExisting) + 1;
+}
+
+export function formatMaskLevelTag(levelNum: number): string {
+  return String(levelNum).padStart(2, '0');
+}
+
+function buildDefaultMaskName(
+  stepTitle: string,
+  levelNum: number,
+  explicitName?: string
+): string {
+  if (explicitName && explicitName.trim()) {
+    return explicitName.trim();
+  }
+  const tag = formatMaskLevelTag(levelNum);
+  const cleaned = stepTitle
+    .replace(/photolithography/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+  return `MASK ${tag}: ${cleaned || 'LAYER'}`;
+}
 
 /**
  * Ensures that flow.masks exists and is synchronized with all lithography steps.
@@ -35,27 +67,31 @@ export function ensureFlowMasks(flow: ProcessFlow): ProcessFlow {
       exposureMethod: 'UV Contact (365nm)',
     };
 
-    let maskId = litho.maskId;
+    const maskId = litho.maskId;
     let matchingMask = maskId ? existingMasks.find((m) => m.id === maskId) : null;
 
-    if (!matchingMask) {
-      // Find by maskName if available
-      if (litho.maskName) {
-        matchingMask = existingMasks.find((m) => m.name.toLowerCase() === litho.maskName?.toLowerCase()) || null;
-      }
+    if (!matchingMask && litho.maskName) {
+      matchingMask =
+        existingMasks.find(
+          (m) =>
+            m.name.toLowerCase() === litho.maskName?.toLowerCase() &&
+            (!m.assignedStepId || m.assignedStepId === step.id)
+        ) || null;
     }
 
     if (!matchingMask) {
       // Create a new mask level for this step
-      const levelNum = existingMasks.length + 1;
+      const levelNum = getNextMaskLevelNumber(existingMasks);
+      const tag = formatMaskLevelTag(levelNum);
       const newMaskId = `mask_lvl_${Date.now()}_${levelNum}`;
       matchingMask = {
         id: newMaskId,
         levelNumber: levelNum,
-        name: litho.maskName || `MASK 0${levelNum}: ${step.title.toUpperCase().replace('PHOTOLITHOGRAPHY', '').trim() || 'LAYER'}`,
-        layerCode: `LVL-0${levelNum}`,
+        name: buildDefaultMaskName(step.title, levelNum, litho.maskName),
+        layerCode: `LVL-${tag}`,
         description: `Patterning reticle for ${step.title}`,
         polarity: litho.polarity || 'positive',
+        maskField: litho.maskField || 'dark-field',
         color: RETICLE_PALETTE[(levelNum - 1) % RETICLE_PALETTE.length],
         windows: litho.windows ? litho.windows.map((w) => ({ ...w })) : [],
         assignedStepId: step.id,
@@ -68,6 +104,8 @@ export function ensureFlowMasks(flow: ProcessFlow): ProcessFlow {
           ...litho,
           maskId: newMaskId,
           maskName: matchingMask.name,
+          maskColor: matchingMask.color,
+          maskField: matchingMask.maskField || 'dark-field',
         },
       };
     } else {
@@ -75,7 +113,14 @@ export function ensureFlowMasks(flow: ProcessFlow): ProcessFlow {
       if (!matchingMask.assignedStepId) {
         matchingMask.assignedStepId = step.id;
       }
-      if (litho.maskId !== matchingMask.id) {
+      if (!matchingMask.maskField) {
+        matchingMask.maskField = litho.maskField || 'dark-field';
+      }
+      if (
+        litho.maskId !== matchingMask.id ||
+        litho.maskColor !== matchingMask.color ||
+        litho.maskField !== matchingMask.maskField
+      ) {
         stepsUpdated = true;
         return {
           ...step,
@@ -83,6 +128,8 @@ export function ensureFlowMasks(flow: ProcessFlow): ProcessFlow {
             ...litho,
             maskId: matchingMask.id,
             maskName: matchingMask.name,
+            maskColor: matchingMask.color,
+            maskField: matchingMask.maskField,
           },
         };
       }
@@ -95,6 +142,78 @@ export function ensureFlowMasks(flow: ProcessFlow): ProcessFlow {
     ...flow,
     masks: existingMasks,
     steps: stepsUpdated ? updatedSteps : flow.steps,
+  };
+}
+
+/**
+ * Creates a brand-new PhotomaskLevel in the Reticle Manager for a newly added,
+ * duplicated, or converted photolithography step and links them 1-to-1.
+ */
+export function attachNewMaskToLithoStep(
+  flow: ProcessFlow,
+  stepId: string,
+  partial?: Partial<PhotomaskLevel>
+): ProcessFlow {
+  const targetStep = flow.steps.find((s) => s.id === stepId && s.type === 'lithography');
+  if (!targetStep) return flow;
+
+  const existingMasks = flow.masks ? flow.masks.map((m) => ({ ...m })) : [];
+  const levelNum = getNextMaskLevelNumber(existingMasks);
+  const tag = formatMaskLevelTag(levelNum);
+  const newMaskId = `mask_lvl_${Date.now()}_${levelNum}`;
+
+  const litho = targetStep.lithography || {
+    resistMaterialId: 'mat_pr_pos',
+    resistThickness: 1000,
+    polarity: 'positive',
+    windows: [],
+    sidewallAngle: 90,
+    exposureMethod: 'UV Contact (365nm)',
+  };
+
+  const newMask: PhotomaskLevel = {
+    id: newMaskId,
+    levelNumber: levelNum,
+    name: buildDefaultMaskName(targetStep.title, levelNum, partial?.name ?? litho.maskName),
+    layerCode: partial?.layerCode || `LVL-${tag}`,
+    description: partial?.description || `Patterning reticle for ${targetStep.title}`,
+    polarity: partial?.polarity || litho.polarity || 'positive',
+    maskField: partial?.maskField || litho.maskField || 'dark-field',
+    color: partial?.color || RETICLE_PALETTE[(levelNum - 1) % RETICLE_PALETTE.length],
+    windows:
+      partial?.windows && partial.windows.length > 0
+        ? partial.windows.map((w) => ({ ...w }))
+        : (litho.windows || []).map((w) => ({ ...w })),
+    assignedStepId: targetStep.id,
+  };
+
+  // Enforce 1-to-1 step assignment
+  const cleanedMasks = existingMasks.map((m) =>
+    m.assignedStepId === targetStep.id ? { ...m, assignedStepId: undefined } : m
+  );
+  cleanedMasks.push(newMask);
+
+  const updatedSteps = flow.steps.map((s) => {
+    if (s.id !== targetStep.id) return s;
+    return {
+      ...s,
+      lithography: {
+        ...litho,
+        maskId: newMask.id,
+        maskName: newMask.name,
+        maskColor: newMask.color,
+        polarity: newMask.polarity,
+        maskField: newMask.maskField || 'dark-field',
+        resistMaterialId: resolveResistMaterialId(newMask.polarity, litho.resistMaterialId),
+        windows: newMask.windows.map((w) => ({ ...w })),
+      },
+    };
+  });
+
+  return {
+    ...flow,
+    masks: cleanedMasks,
+    steps: updatedSteps,
   };
 }
 
@@ -124,6 +243,7 @@ export function updateMaskAndSyncSteps(
             ...step.lithography,
             windows: updatedMask.windows.map((w) => ({ ...w })),
             polarity: updatedMask.polarity,
+            maskField: updatedMask.maskField || step.lithography.maskField || 'dark-field',
             resistMaterialId: resolveResistMaterialId(updatedMask.polarity, step.lithography.resistMaterialId),
             maskName: updatedMask.name,
             maskId: updatedMask.id,
@@ -197,6 +317,7 @@ export function assignMaskToStep(
           maskId: mask.id,
           maskName: mask.name,
           polarity: mask.polarity,
+          maskField: mask.maskField || litho.maskField || 'dark-field',
           resistMaterialId: resolveResistMaterialId(mask.polarity, litho.resistMaterialId),
           maskColor: mask.color,
           windows: mask.windows.map((w) => ({ ...w })),
@@ -261,6 +382,7 @@ export function swapMaskAssignments(
           maskId: maskA.id,
           maskName: maskA.name,
           polarity: maskA.polarity,
+          maskField: maskA.maskField || litho.maskField || 'dark-field',
           resistMaterialId: resolveResistMaterialId(maskA.polarity, litho.resistMaterialId),
           maskColor: maskA.color,
           windows: maskA.windows.map((w) => ({ ...w })),
@@ -285,6 +407,7 @@ export function swapMaskAssignments(
           maskId: maskB.id,
           maskName: maskB.name,
           polarity: maskB.polarity,
+          maskField: maskB.maskField || litho.maskField || 'dark-field',
           resistMaterialId: resolveResistMaterialId(maskB.polarity, litho.resistMaterialId),
           maskColor: maskB.color,
           windows: maskB.windows.map((w) => ({ ...w })),
@@ -320,6 +443,7 @@ export function syncStepWindowsToMask(
     if (mask) {
       mask.windows = litho.windows.map((w) => ({ ...w }));
       mask.polarity = litho.polarity;
+      mask.maskField = litho.maskField || mask.maskField || 'dark-field';
       if (litho.maskName) mask.name = litho.maskName;
       mask.assignedStepId = step.id;
 
@@ -348,7 +472,8 @@ export function createNewMaskInFlow(
   partial?: Partial<PhotomaskLevel>
 ): { flow: ProcessFlow; newMask: PhotomaskLevel } {
   const currentMasks = flow.masks ? [...flow.masks] : [];
-  const levelNum = currentMasks.length + 1;
+  const levelNum = getNextMaskLevelNumber(currentMasks);
+  const tag = formatMaskLevelTag(levelNum);
   const id = `mask_${Date.now()}`;
 
   // Default aperture in center
@@ -358,10 +483,11 @@ export function createNewMaskInFlow(
   const newMask: PhotomaskLevel = {
     id,
     levelNumber: levelNum,
-    name: partial?.name || `MASK 0${levelNum}: CUSTOM LEVEL`,
-    layerCode: partial?.layerCode || `LVL-0${levelNum}`,
+    name: partial?.name || `MASK ${tag}: CUSTOM LEVEL`,
+    layerCode: partial?.layerCode || `LVL-${tag}`,
     description: partial?.description || 'Photolithographic pattern level',
     polarity: partial?.polarity || 'positive',
+    maskField: partial?.maskField || 'dark-field',
     color: partial?.color || RETICLE_PALETTE[(levelNum - 1) % RETICLE_PALETTE.length],
     windows: partial?.windows && partial.windows.length > 0
       ? partial.windows.map((w) => ({ ...w }))
@@ -416,7 +542,8 @@ export function deleteMaskFromFlow(
 }
 
 /**
- * Calculates authentic cleanroom lithography metrics for a mask level.
+ * Calculates authentic cleanroom lithography metrics for a mask level,
+ * accounting for both Dark-Field (blocks = apertures) and Light-Field (blocks = chrome blockers).
  */
 export function calculateMaskMetrics(
   mask: PhotomaskLevel,
@@ -424,35 +551,64 @@ export function calculateMaskMetrics(
 ) {
   const windows = mask.windows || [];
   const apertureCount = windows.length;
-  
-  let totalClearWidthNm = 0;
+  const maskField: MaskFieldPolarity = mask.maskField || 'dark-field';
+  const isLightField = maskField === 'light-field';
+
   let minFeatureSizeNm = Infinity;
 
-  // Sort windows by xStart
-  const sorted = [...windows].sort((a, b) => a.xStart - b.xStart);
+  // Sort windows by xStart and clamp to [0, waferWidth]
+  const sorted = [...windows]
+    .map((w) => ({
+      xStart: Math.max(0, Math.min(waferWidth, w.xStart)),
+      xEnd: Math.max(0, Math.min(waferWidth, w.xEnd)),
+    }))
+    .filter((w) => w.xEnd > w.xStart)
+    .sort((a, b) => a.xStart - b.xStart);
 
   for (const w of sorted) {
-    const width = Math.max(0, w.xEnd - w.xStart);
-    totalClearWidthNm += width;
+    const width = w.xEnd - w.xStart;
     if (width < minFeatureSizeNm && width > 0) {
       minFeatureSizeNm = width;
     }
   }
 
+  // Merge overlapping blocks so clear/blocked coverage never exceeds 100%
+  const merged: Array<{ xStart: number; xEnd: number }> = [];
+  for (const w of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && w.xStart <= last.xEnd) {
+      last.xEnd = Math.max(last.xEnd, w.xEnd);
+    } else {
+      merged.push({ ...w });
+    }
+  }
+
+  const coveredWidthNm = merged.reduce((sum, w) => sum + (w.xEnd - w.xStart), 0);
+
   let minSpaceNm = Infinity;
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const space = sorted[i + 1].xStart - sorted[i].xEnd;
+  for (let i = 0; i < merged.length - 1; i++) {
+    const space = merged[i + 1].xStart - merged[i].xEnd;
     if (space >= 0 && space < minSpaceNm) {
       minSpaceNm = space;
     }
   }
 
+  const totalClearWidthNm = isLightField
+    ? Math.max(0, waferWidth - coveredWidthNm)
+    : coveredWidthNm;
+  const totalBlockedWidthNm = isLightField
+    ? coveredWidthNm
+    : Math.max(0, waferWidth - coveredWidthNm);
   const clearPercentage = waferWidth > 0 ? (totalClearWidthNm / waferWidth) * 100 : 0;
 
   return {
     apertureCount,
+    isLightField,
+    maskField,
     totalClearWidthNm,
     totalClearWidthUm: (totalClearWidthNm / 1000).toFixed(2),
+    totalBlockedWidthNm,
+    totalBlockedWidthUm: (totalBlockedWidthNm / 1000).toFixed(2),
     clearPercentage: Math.min(100, Math.max(0, clearPercentage)).toFixed(1),
     minFeatureSizeNm: minFeatureSizeNm === Infinity ? 0 : Math.round(minFeatureSizeNm),
     minFeatureSizeUm: minFeatureSizeNm === Infinity ? '0.00' : (minFeatureSizeNm / 1000).toFixed(2),

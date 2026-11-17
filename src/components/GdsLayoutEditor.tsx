@@ -21,21 +21,24 @@ import {
   GDS_PATTERN_OPTIONS,
   SECTION_LINE_COLORS,
   arcIntervalToPolylineSegments,
+  ParsedGdsStream,
   computeGdsBounds,
   computeRawSectionIntervals,
   createDefaultGdsLayout,
   createSampleGdsLayout,
+  gdsLayerKey,
   getGdsShapeBounds,
   getLayoutSectionLines,
   getNextSectionLabel,
   getSectionEndLabels,
   getSectionMidpoint,
   getSectionPoints,
+  inspectGdsFile,
   moveGdsSectionLine,
   moveGdsShape,
-  parseGdsFile,
   rescaleGdsShape,
   resizePointShapeToBounds,
+  shapeMatchesLayer,
   shapeToPolygons,
   sliceGdsLayoutAlongSection,
   sliceGdsLayoutConcatenated,
@@ -43,6 +46,7 @@ import {
   withSectionPoints,
 } from '../lib/gdsUtils';
 import { createNewMaskInFlow, updateMaskAndSyncSteps } from '../lib/maskUtils';
+import { GdsTopCellModal } from './GdsTopCellModal';
 import {
   MousePointer2,
   Square,
@@ -80,6 +84,7 @@ import {
   Unlock,
   HelpCircle,
   Eraser,
+  Pencil,
 } from 'lucide-react';
 
 function getGdsPatternDefId(color: string, pattern: GdsPatternType): string {
@@ -215,6 +220,7 @@ interface NmNumberInputProps {
   step?: number;
   onChange: (val: number) => void;
   className?: string;
+  commitOnBlurOnly?: boolean;
 }
 
 const NmNumberInput: React.FC<NmNumberInputProps> = ({
@@ -224,6 +230,7 @@ const NmNumberInput: React.FC<NmNumberInputProps> = ({
   step = 50,
   onChange,
   className = '',
+  commitOnBlurOnly = false,
 }) => {
   const [text, setText] = useState<string>(String(Math.round(value)));
   const [focused, setFocused] = useState(false);
@@ -257,6 +264,14 @@ const NmNumberInput: React.FC<NmNumberInputProps> = ({
       onFocus={() => setFocused(true)}
       onChange={(e) => {
         const next = e.target.value;
+        if (commitOnBlurOnly) {
+          if (min >= 0 && next.includes('-')) {
+            setText(String(min));
+            return;
+          }
+          setText(next);
+          return;
+        }
         if (min >= 0 && next.includes('-')) {
           setText(String(min));
           onChange(min);
@@ -326,27 +341,43 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [tool, setTool] = useState<DrawTool>('rect');
   const [gridSnapNm, setGridSnapNm] = useState<number>(100);
   const [pathWidthNm, setPathWidthNm] = useState<number>(400);
-  const [activeLayerNum, setActiveLayerNum] = useState<number>(() => {
+  const [activeLayer, setActiveLayer] = useState<{ layer: number; datatype: number }>(() => {
     const mapped = layout.layers.find((l) => l.assignedMaskId === selectedMask?.id);
-    return mapped?.layer ?? layout.layers[0]?.layer ?? 1;
+    const first = mapped || layout.layers[0];
+    return { layer: first?.layer ?? 1, datatype: first?.datatype ?? 0 };
   });
+  const activeLayerNum = activeLayer.layer;
+  const activeDatatype = activeLayer.datatype;
+  const activeLayerLabel = `L${activeLayerNum}/${activeDatatype}`;
 
-  // Sync activeLayerNum when user clicks a different mask in the left reticle sidebar,
-  // and ensure activeLayerNum stays valid if layers are deleted or replaced.
+  // Sync activeLayer when user clicks a different mask in the left reticle sidebar,
+  // and ensure activeLayer stays valid if layers are deleted or replaced.
   const prevMaskIdRef = useRef<string | undefined>(selectedMask?.id);
   useEffect(() => {
     if (selectedMask?.id && selectedMask.id !== prevMaskIdRef.current) {
       prevMaskIdRef.current = selectedMask.id;
       const mapped = layout.layers.find((l) => l.assignedMaskId === selectedMask.id);
       if (mapped) {
-        setActiveLayerNum(mapped.layer);
+        setActiveLayer({ layer: mapped.layer, datatype: mapped.datatype ?? 0 });
         return;
       }
     }
-    if (layout.layers.length > 0 && !layout.layers.some((l) => l.layer === activeLayerNum)) {
-      setActiveLayerNum(layout.layers[0].layer);
+    if (
+      layout.layers.length > 0 &&
+      !layout.layers.some(
+        (l) => l.layer === activeLayer.layer && (l.datatype ?? 0) === activeLayer.datatype
+      )
+    ) {
+      const first = layout.layers[0];
+      setActiveLayer({ layer: first.layer, datatype: first.datatype ?? 0 });
     }
-  }, [selectedMask?.id, layout.layers, activeLayerNum]);
+  }, [selectedMask?.id, layout.layers, activeLayer.layer, activeLayer.datatype]);
+
+  // GDSII import top-cell picker state & inline layer name/datatype editor state
+  const [pendingGdsImport, setPendingGdsImport] = useState<ParsedGdsStream | null>(null);
+  const [editingLayerKey, setEditingLayerKey] = useState<string | null>(null);
+  const [editLayerName, setEditLayerName] = useState<string>('');
+  const [editLayerDatatype, setEditLayerDatatype] = useState<string>('0');
 
   // Selected shape / multi-click draft state
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
@@ -590,7 +621,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         id: `gds_poly_${Date.now()}`,
         type: 'polygon',
         layer: activeLayerNum,
-        datatype: 0,
+        datatype: activeDatatype,
         points: pts,
       };
       updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
@@ -600,7 +631,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         id: `gds_path_${Date.now()}`,
         type: 'path',
         layer: activeLayerNum,
-        datatype: 0,
+        datatype: activeDatatype,
         points: pts,
         pathWidth: pathWidthNm,
       };
@@ -618,11 +649,16 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
   // Hit-testing for Select tool respects current layer Z-order (topmost visible layer first)
   const findShapeAtPoint = (pt: GdsPoint): GdsShape | null => {
+    const visibleKeys = new Set(
+      layout.layers.filter((l) => l.visible).map((l) => gdsLayerKey(l.layer, l.datatype ?? 0))
+    );
     const visibleLayers = new Set(layout.layers.filter((l) => l.visible).map((l) => l.layer));
     const minHitRadius = 8 / Math.max(1e-6, pxPerNm);
     for (let i = orderedShapes.length - 1; i >= 0; i--) {
       const s = orderedShapes[i];
-      if (!visibleLayers.has(s.layer)) continue;
+      const sKey = gdsLayerKey(s.layer, s.datatype ?? 0);
+      const isLayerKnown = layerByKey.has(sKey);
+      if (isLayerKnown ? !visibleKeys.has(sKey) : !visibleLayers.has(s.layer)) continue;
 
       if (s.type === 'path' && s.points && s.points.length >= 2) {
         const hitHalfW = Math.max((s.pathWidth ?? 200) * 0.5, minHitRadius);
@@ -977,7 +1013,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             id: `gds_rect_${Date.now()}`,
             type: 'rect',
             layer: activeLayerNum,
-            datatype: 0,
+            datatype: activeDatatype,
             x: minX,
             y: minY,
             width,
@@ -993,7 +1029,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             id: `gds_circ_${Date.now()}`,
             type: 'circle',
             layer: activeLayerNum,
-            datatype: 0,
+            datatype: activeDatatype,
             cx: start.x,
             cy: start.y,
             radius,
@@ -1087,7 +1123,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     });
   };
 
-  // Import .gds binary file
+  // Import .gds binary file -> inspect cells and open top-cell picker + preview modal
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -1095,21 +1131,37 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     try {
       const buf = await file.arrayBuffer();
-      const parsed = parseGdsFile(buf, file.name, masks);
-      updateLayout(parsed);
-      setSelectedShapeId(null);
-      setDraftPoints([]);
-      if (parsed.layers.length > 0) {
-        setActiveLayerNum(parsed.layers[0].layer);
-      }
-      fitCameraToLayout(parsed);
-      onNotify?.(
-        `Imported ${parsed.shapes.length} shapes across ${parsed.layers.length} GDS layer(s) from ${file.name}.`,
-        'success'
-      );
-    } catch (err: any) {
-      onNotify?.(err?.message || 'Failed to parse GDSII file.', 'warn');
+      const parsedStream = inspectGdsFile(buf, file.name);
+      setPendingGdsImport(parsedStream);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to parse GDSII file.';
+      onNotify?.(msg, 'warn');
     }
+  };
+
+  const handleConfirmTopCellImport = (
+    loadedLayout: GdsLayoutData,
+    selectedCellName: string,
+    truncated: boolean
+  ) => {
+    updateLayout(loadedLayout);
+    setPendingGdsImport(null);
+    setSelectedShapeId(null);
+    setDraftPoints([]);
+    setEditingLayerKey(null);
+    if (loadedLayout.layers.length > 0) {
+      setActiveLayer({
+        layer: loadedLayout.layers[0].layer,
+        datatype: loadedLayout.layers[0].datatype ?? 0,
+      });
+    }
+    fitCameraToLayout(loadedLayout);
+    onNotify?.(
+      `Imported cell "${selectedCellName}" (${loadedLayout.shapes.length} shapes across ${loadedLayout.layers.length} GDS layer(s))${
+        truncated ? ' — capped at 8,000 shapes' : ''
+      }.`,
+      truncated ? 'warn' : 'success'
+    );
   };
 
   const handleLoadSample = () => {
@@ -1117,7 +1169,11 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     updateLayout(sample);
     setSelectedShapeId(null);
     setDraftPoints([]);
-    setActiveLayerNum(sample.layers[0]?.layer ?? 1);
+    setEditingLayerKey(null);
+    setActiveLayer({
+      layer: sample.layers[0]?.layer ?? 1,
+      datatype: sample.layers[0]?.datatype ?? 0,
+    });
     fitCameraToLayout(sample);
     onNotify?.('Loaded multi-layer Dual-Gate example GDS layout.', 'success');
   };
@@ -1218,7 +1274,75 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       ...layout,
       layers: [...layout.layers, newLayer],
     });
-    setActiveLayerNum(nextNum);
+    setActiveLayer({ layer: nextNum, datatype: 0 });
+  };
+
+  const handleStartEditLayer = (layer: GdsLayerInfo) => {
+    const key = gdsLayerKey(layer.layer, layer.datatype ?? 0);
+    setEditingLayerKey(key);
+    setEditLayerName(layer.name);
+    setEditLayerDatatype(String(layer.datatype ?? 0));
+  };
+
+  const handleCommitEditLayer = (targetLayer: GdsLayerInfo) => {
+    const oldDt = targetLayer.datatype ?? 0;
+    const parsedDt = parseInt(editLayerDatatype, 10);
+    if (!Number.isFinite(parsedDt) || parsedDt < 0 || parsedDt > 32767) {
+      onNotify?.('Data type must be an integer between 0 and 32767.', 'warn');
+      return;
+    }
+
+    const nextDt = parsedDt;
+    const dtChanged = nextDt !== oldDt;
+
+    if (
+      dtChanged &&
+      layout.layers.some((l) => l.layer === targetLayer.layer && (l.datatype ?? 0) === nextDt)
+    ) {
+      onNotify?.(
+        `Layer L${targetLayer.layer}/${nextDt} already exists. Choose a different data type.`,
+        'warn'
+      );
+      return;
+    }
+
+    const trimmedName = editLayerName.trim();
+    const defaultOldName = `L${targetLayer.layer}/${oldDt}`;
+    const nextName =
+      trimmedName.length > 0
+        ? dtChanged && trimmedName === defaultOldName
+          ? `L${targetLayer.layer}/${nextDt}`
+          : trimmedName
+        : `L${targetLayer.layer}/${nextDt}`;
+
+    const nextLayers = layout.layers.map((l) =>
+      l.layer === targetLayer.layer && (l.datatype ?? 0) === oldDt
+        ? { ...l, name: nextName, datatype: nextDt }
+        : l
+    );
+
+    const nextShapes = dtChanged
+      ? layout.shapes.map((s) =>
+          shapeMatchesLayer(s, targetLayer.layer, oldDt)
+            ? { ...s, datatype: nextDt }
+            : s
+        )
+      : layout.shapes;
+
+    if (dtChanged && activeLayer.layer === targetLayer.layer && activeLayer.datatype === oldDt) {
+      setActiveLayer({ layer: targetLayer.layer, datatype: nextDt });
+    }
+
+    updateLayout({
+      ...layout,
+      layers: nextLayers,
+      shapes: nextShapes,
+    });
+    setEditingLayerKey(null);
+    onNotify?.(
+      `Updated layer to L${targetLayer.layer}/${nextDt} (${nextName}).`,
+      'success'
+    );
   };
 
   const handleDeleteLayer = (layerIdx: number) => {
@@ -1228,26 +1352,37 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     }
     const target = layout.layers[layerIdx];
     if (!target) return;
+    const targetDt = target.datatype ?? 0;
 
     const nextLayers = layout.layers.filter((_, i) => i !== layerIdx);
-    const sameLayerNumExists = nextLayers.some((l) => l.layer === target.layer);
-    const removedShapesCount = sameLayerNumExists
-      ? 0
-      : layout.shapes.filter((s) => s.layer === target.layer).length;
-    const nextShapes = sameLayerNumExists
-      ? layout.shapes
-      : layout.shapes.filter((s) => s.layer !== target.layer);
+    const removedShapesCount = layout.shapes.filter((s) =>
+      shapeMatchesLayer(s, target.layer, targetDt)
+    ).length;
+    const nextShapes = layout.shapes.filter(
+      (s) => !shapeMatchesLayer(s, target.layer, targetDt)
+    );
 
     if (selectedShapeId) {
       const sel = layout.shapes.find((s) => s.id === selectedShapeId);
-      if (sel && !sameLayerNumExists && sel.layer === target.layer) {
+      if (sel && shapeMatchesLayer(sel, target.layer, targetDt)) {
         setSelectedShapeId(null);
         setShowArrayTool(false);
       }
     }
 
-    if (activeLayerNum === target.layer && !sameLayerNumExists && nextLayers.length > 0) {
-      setActiveLayerNum(nextLayers[0].layer);
+    if (
+      activeLayer.layer === target.layer &&
+      activeLayer.datatype === targetDt &&
+      nextLayers.length > 0
+    ) {
+      setActiveLayer({
+        layer: nextLayers[0].layer,
+        datatype: nextLayers[0].datatype ?? 0,
+      });
+    }
+
+    if (editingLayerKey === gdsLayerKey(target.layer, targetDt)) {
+      setEditingLayerKey(null);
     }
 
     updateLayout({
@@ -1258,21 +1393,26 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     onNotify?.(
       removedShapesCount > 0
-        ? `Deleted layer L${target.layer}/${target.datatype} and ${removedShapesCount} shape(s).`
-        : `Deleted layer L${target.layer}/${target.datatype}.`,
+        ? `Deleted layer L${target.layer}/${targetDt} and ${removedShapesCount} shape(s).`
+        : `Deleted layer L${target.layer}/${targetDt}.`,
       'success'
     );
   };
 
   const handleClearLayerObjects = (targetLayer: GdsLayerInfo) => {
-    const removedCount = layout.shapes.filter((s) => s.layer === targetLayer.layer).length;
+    const targetDt = targetLayer.datatype ?? 0;
+    const removedCount = layout.shapes.filter((s) =>
+      shapeMatchesLayer(s, targetLayer.layer, targetDt)
+    ).length;
     if (removedCount === 0) return;
 
-    const nextShapes = layout.shapes.filter((s) => s.layer !== targetLayer.layer);
+    const nextShapes = layout.shapes.filter(
+      (s) => !shapeMatchesLayer(s, targetLayer.layer, targetDt)
+    );
 
     if (selectedShapeId) {
       const sel = layout.shapes.find((s) => s.id === selectedShapeId);
-      if (sel && sel.layer === targetLayer.layer) {
+      if (sel && shapeMatchesLayer(sel, targetLayer.layer, targetDt)) {
         setSelectedShapeId(null);
         setShowArrayTool(false);
       }
@@ -1284,7 +1424,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     });
 
     onNotify?.(
-      `Cleared ${removedCount} object(s) from layer L${targetLayer.layer}/${targetLayer.datatype}.`,
+      `Cleared ${removedCount} object(s) from layer L${targetLayer.layer}/${targetDt}.`,
       'success'
     );
   };
@@ -1378,8 +1518,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
   const activeLayerCut = useMemo(() => {
     if (!sectionLine) return { cutLength: 0, intervals: [] };
-    return computeRawSectionIntervals(layout.shapes, activeLayerNum, sectionLine);
-  }, [layout.shapes, activeLayerNum, sectionLine]);
+    return computeRawSectionIntervals(layout.shapes, activeLayerNum, sectionLine, activeDatatype);
+  }, [layout.shapes, activeLayerNum, activeDatatype, sectionLine]);
 
   const previewSlice = useMemo(() => {
     if (!sectionLine) {
@@ -1397,7 +1537,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         orderedConcatSections,
         concatConfig.gapNm,
         Boolean(sectionLine.resizeWaferToCut),
-        waferWidth
+        waferWidth,
+        activeDatatype
       );
       return {
         windows: res.windows,
@@ -1410,7 +1551,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       layout.shapes,
       activeLayerNum,
       sectionLine,
-      waferWidth
+      waferWidth,
+      activeDatatype
     );
     return {
       windows: res.windows,
@@ -1424,6 +1566,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     orderedConcatSections,
     layout.shapes,
     activeLayerNum,
+    activeDatatype,
     sectionLine,
     waferWidth,
   ]);
@@ -1450,15 +1593,16 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       windows,
     });
     onUpdateFlow(updatedFlow);
+    const featWord = destMask.maskField === 'light-field' ? 'blocker(s)' : 'aperture(s)';
     if (isConcat) {
       const seq = orderedConcatSections.map((s) => s.label).join(' → ');
       onNotify?.(
-        `Generated ${windows.length} concatenated aperture(s) on "${destMask.name}" from [${seq}] (gap ${concatConfig.gapNm} nm).`,
+        `Generated ${windows.length} concatenated ${featWord} on "${destMask.name}" from [${seq}] (gap ${concatConfig.gapNm} nm).`,
         'success'
       );
     } else {
       onNotify?.(
-        `Generated ${windows.length} aperture(s) on "${destMask.name}" from GDS Layer ${activeLayerNum} (${sectionLine.label}).`,
+        `Generated ${windows.length} ${featWord} on "${destMask.name}" from GDS ${activeLayerLabel} (${sectionLine.label}).`,
         'success'
       );
     }
@@ -1486,13 +1630,15 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           orderedConcatSections,
           concatConfig.gapNm,
           Boolean(sectionLine.resizeWaferToCut),
-          waferWidth
+          waferWidth,
+          mapped[0].datatype ?? 0
         ).totalLength
       : sliceGdsLayoutAlongSection(
           layout.shapes,
           mapped[0].layer,
           sectionLine,
-          waferWidth
+          waferWidth,
+          mapped[0].datatype ?? 0
         ).cutLength;
 
     if (totalLength <= 10) {
@@ -1508,6 +1654,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     for (const gdsLayer of mapped) {
       const mask = (updatedFlow.masks || []).find((m) => m.id === gdsLayer.assignedMaskId);
       if (!mask) continue;
+      const gDt = gdsLayer.datatype ?? 0;
       const windows = useConcat
         ? sliceGdsLayoutConcatenated(
             layout.shapes,
@@ -1515,13 +1662,15 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             orderedConcatSections,
             concatConfig.gapNm,
             Boolean(sectionLine.resizeWaferToCut),
-            waferWidth
+            waferWidth,
+            gDt
           ).windows
         : sliceGdsLayoutAlongSection(
             layout.shapes,
             gdsLayer.layer,
             sectionLine,
-            waferWidth
+            waferWidth,
+            gDt
           ).windows;
       totalWins += windows.length;
       updatedFlow = updateMaskAndSyncSteps(updatedFlow, {
@@ -1542,7 +1691,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
   // Auto-create reticles for unmapped GDS layers
   const unmappedWithShapes = layout.layers.filter(
-    (l) => !l.assignedMaskId && layout.shapes.some((s) => s.layer === l.layer)
+    (l) => !l.assignedMaskId && layout.shapes.some((s) => shapeMatchesLayer(s, l.layer, l.datatype ?? 0))
   );
   const handleCreateReticlesFromUnmapped = () => {
     if (unmappedWithShapes.length === 0) return;
@@ -1551,6 +1700,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     const useConcat = concatConfig.enabled && orderedConcatSections.length > 0;
 
     for (const gLayer of unmappedWithShapes) {
+      const gDt = gLayer.datatype ?? 0;
       const windows = !sectionLine
         ? []
         : useConcat
@@ -1560,22 +1710,26 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             orderedConcatSections,
             concatConfig.gapNm,
             Boolean(sectionLine.resizeWaferToCut),
-            waferWidth
+            waferWidth,
+            gDt
           ).windows
         : sliceGdsLayoutAlongSection(
             layout.shapes,
             gLayer.layer,
             sectionLine,
-            waferWidth
+            waferWidth,
+            gDt
           ).windows;
       const { flow: f2, newMask } = createNewMaskInFlow(nextFlow, {
         name: `GDS ${gLayer.name}`,
-        layerCode: `GDS-${gLayer.layer}`,
+        layerCode: `GDS-${gLayer.layer}/${gDt}`,
         color: gLayer.color,
         windows: windows.length > 0 ? windows : [],
       });
       nextFlow = f2;
-      const targetLayer = nextLayers.find((x) => x.layer === gLayer.layer);
+      const targetLayer = nextLayers.find(
+        (x) => x.layer === gLayer.layer && (x.datatype ?? 0) === gDt
+      );
       if (targetLayer) targetLayer.assignedMaskId = newMask.id;
     }
 
@@ -1619,11 +1773,31 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     return { xs, ys };
   }, [camera, svgSize.w, svgSize.h, gridStepNm]);
 
-  const layerByNum = useMemo(() => {
-    const map = new Map<number, GdsLayerInfo>();
-    for (const l of layout.layers) map.set(l.layer, l);
+  const layerByKey = useMemo(() => {
+    const map = new Map<string, GdsLayerInfo>();
+    for (const l of layout.layers) {
+      map.set(gdsLayerKey(l.layer, l.datatype ?? 0), l);
+    }
     return map;
   }, [layout.layers]);
+
+  const layerByNum = useMemo(() => {
+    const map = new Map<number, GdsLayerInfo>();
+    for (const l of layout.layers) {
+      if (!map.has(l.layer)) map.set(l.layer, l);
+    }
+    return map;
+  }, [layout.layers]);
+
+  const getLayerForShape = useCallback(
+    (shape: GdsShape): GdsLayerInfo | undefined => {
+      return (
+        layerByKey.get(gdsLayerKey(shape.layer, shape.datatype ?? 0)) ||
+        layerByNum.get(shape.layer)
+      );
+    },
+    [layerByKey, layerByNum]
+  );
 
   const orderedShapes = useMemo(
     () => sortShapesByLayerOrder(layout.shapes, layout.layers),
@@ -1642,13 +1816,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       addSpec(l.color || '#38bdf8', l.pattern || 'diagonal-right');
     }
     for (const s of layout.shapes) {
-      const lInfo = layerByNum.get(s.layer);
+      const lInfo = getLayerForShape(s);
       const color = lInfo?.color || '#38bdf8';
       const pat = s.pattern || lInfo?.pattern || 'diagonal-right';
       addSpec(color, pat);
     }
     return Array.from(map.values());
-  }, [layout.layers, layout.shapes, layerByNum]);
+  }, [layout.layers, layout.shapes, getLayerForShape]);
 
   const handleMoveLayerOrder = (idx: number, dir: -1 | 1) => {
     const swapIdx = idx + dir;
@@ -1673,7 +1847,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   };
 
   const selectedShape = layout.shapes.find((s) => s.id === selectedShapeId) || null;
-  const activeLayerInfo = layerByNum.get(activeLayerNum) || layout.layers[0];
+  const activeLayerInfo =
+    layerByKey.get(gdsLayerKey(activeLayerNum, activeDatatype)) ||
+    layerByNum.get(activeLayerNum) ||
+    layout.layers[0];
 
   const handleToggleArrayTool = () => {
     if (!showArrayTool && selectedShape) {
@@ -2256,7 +2433,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             {/* Rendered GDS Shapes (painted bottom-to-top per layer stack order) */}
             <g>
               {orderedShapes.map((shape) => {
-                const layerInfo = layerByNum.get(shape.layer);
+                const layerInfo = getLayerForShape(shape);
                 if (layerInfo && !layerInfo.visible) return null;
                 const color = layerInfo?.color || '#38bdf8';
                 const effectivePattern: GdsPatternType =
@@ -2299,7 +2476,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             {/* Selected Shape Bounding Box & 8 Interactive Resize Handles */}
             {selectedShape &&
               !dragBox &&
-              layerByNum.get(selectedShape.layer)?.visible !== false &&
+              getLayerForShape(selectedShape)?.visible !== false &&
               (() => {
                 const b = getGdsShapeBounds(selectedShape);
                 const tl = worldToScreen(b.minX, b.minY + b.height);
@@ -2489,7 +2666,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                     if (c === 0 && r === 0) return null;
                     const ghost = moveGdsShape(selectedShape, c * arrayPitchX, r * arrayPitchY);
                     const gPolys = shapeToPolygons(ghost);
-                    const gColor = layerByNum.get(selectedShape.layer)?.color || '#38bdf8';
+                    const gColor = getLayerForShape(selectedShape)?.color || '#38bdf8';
                     return (
                       <g key={`arr_ghost_${c}_${r}`}>
                         {gPolys.map((poly, pIdx) => {
@@ -2551,7 +2728,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               const cutIntervals = showIntervals
                 ? isActiveCut
                   ? activeLayerCut
-                  : computeRawSectionIntervals(layout.shapes, activeLayerNum, cut)
+                  : computeRawSectionIntervals(layout.shapes, activeLayerNum, cut, activeDatatype)
                 : { cutLength: 0, intervals: [] };
 
               const startLineDrag = (e: React.PointerEvent<Element>) => {
@@ -2827,7 +3004,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 pattern={activeLayerInfo.pattern || 'diagonal-right'}
                 size={11}
               />
-              <span className="font-bold">L{activeLayerInfo.layer}</span>
+              <span className="font-bold">
+                L{activeLayerInfo.layer}/{activeLayerInfo.datatype ?? 0}
+              </span>
               <span className="text-slate-400 truncate max-w-[80px]">{activeLayerInfo.name}</span>
             </button>
           )}
@@ -2981,8 +3160,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
           <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
             {layout.layers.map((layer, layerIdx) => {
-              const isActive = layer.layer === activeLayerNum;
-              const shapeCount = layout.shapes.filter((s) => s.layer === layer.layer).length;
+              const layerDt = layer.datatype ?? 0;
+              const layerKey = gdsLayerKey(layer.layer, layerDt);
+              const isActive =
+                layer.layer === activeLayerNum && layerDt === activeDatatype;
+              const isEditing = editingLayerKey === layerKey;
+              const shapeCount = layout.shapes.filter((s) =>
+                shapeMatchesLayer(s, layer.layer, layerDt)
+              ).length;
               const layerPattern: GdsPatternType = layer.pattern || 'diagonal-right';
               const isDragging = draggingLayerIdx === layerIdx;
               const isDropTarget =
@@ -2991,8 +3176,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 draggingLayerIdx !== layerIdx;
               return (
                 <div
-                  key={`${layer.layer}_${layer.datatype}`}
-                  onClick={() => setActiveLayerNum(layer.layer)}
+                  key={layerKey}
+                  onClick={() =>
+                    setActiveLayer({ layer: layer.layer, datatype: layerDt })
+                  }
                   onDragOver={(e) => {
                     e.preventDefault();
                     if (draggingLayerIdx !== null && dragOverLayerIdx !== layerIdx) {
@@ -3012,15 +3199,22 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   } ${isDragging ? 'opacity-50' : ''}`}
                 >
                   <div
-                    draggable
-                    onDragStart={() => setDraggingLayerIdx(layerIdx)}
+                    draggable={!isEditing}
+                    onDragStart={() => !isEditing && setDraggingLayerIdx(layerIdx)}
                     onDragEnd={() => {
                       setDraggingLayerIdx(null);
                       setDragOverLayerIdx(null);
                     }}
                     className="flex items-center justify-between gap-1"
                   >
-                    <div className="flex items-center gap-1.5 min-w-0">
+                    <div
+                      className="flex items-center gap-1.5 min-w-0 flex-1"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        handleStartEditLayer(layer);
+                      }}
+                      title="Double-click to edit layer name & data type"
+                    >
                       <span
                         title="Drag to reorder GDS layer"
                         className="shrink-0 cursor-grab active:cursor-grabbing text-slate-500 hover:text-slate-300"
@@ -3029,7 +3223,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                       </span>
                       <PatternSwatch color={layer.color} pattern={layerPattern} size={13} />
                       <span className="font-mono text-[11px] font-bold text-slate-200 shrink-0">
-                        L{layer.layer}/{layer.datatype}
+                        L{layer.layer}/{layerDt}
                       </span>
                       <span className="text-[10px] text-slate-400 truncate">{layer.name}</span>
                     </div>
@@ -3041,6 +3235,20 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                       <span className="text-[10px] font-mono text-slate-500 mr-0.5">
                         {shapeCount}
                       </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          isEditing ? setEditingLayerKey(null) : handleStartEditLayer(layer)
+                        }
+                        className={`p-0.5 transition-colors ${
+                          isEditing
+                            ? 'text-sky-400 hover:text-sky-300'
+                            : 'text-slate-400 hover:text-sky-300'
+                        }`}
+                        title="Edit layer name & data type"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
                       <button
                         type="button"
                         disabled={layerIdx === 0}
@@ -3065,7 +3273,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                           updateLayout({
                             ...layout,
                             layers: layout.layers.map((l) =>
-                              l.layer === layer.layer ? { ...l, visible: !l.visible } : l
+                              l.layer === layer.layer && (l.datatype ?? 0) === layerDt
+                                ? { ...l, visible: !l.visible }
+                                : l
                             ),
                           })
                         }
@@ -3081,8 +3291,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         className="p-0.5 text-slate-400 hover:text-amber-300 disabled:opacity-25 disabled:pointer-events-none transition-colors"
                         title={
                           shapeCount === 0
-                            ? `Layer L${layer.layer}/${layer.datatype} has no objects to clear`
-                            : `Clear all ${shapeCount} object(s) from L${layer.layer}/${layer.datatype}`
+                            ? `Layer L${layer.layer}/${layerDt} has no objects to clear`
+                            : `Clear all ${shapeCount} object(s) from L${layer.layer}/${layerDt}`
                         }
                       >
                         <Eraser className="w-3 h-3" />
@@ -3096,14 +3306,75 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                           layout.layers.length <= 1
                             ? 'At least one GDS layer is required'
                             : shapeCount > 0
-                            ? `Delete layer L${layer.layer}/${layer.datatype} and its ${shapeCount} shape(s)`
-                            : `Delete layer L${layer.layer}/${layer.datatype}`
+                            ? `Delete layer L${layer.layer}/${layerDt} and its ${shapeCount} shape(s)`
+                            : `Delete layer L${layer.layer}/${layerDt}`
                         }
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>
                     </div>
                   </div>
+
+                  {/* Inline Layer Name & Data Type Editor */}
+                  {isEditing && (
+                    <div
+                      className="p-1.5 rounded-md bg-slate-900 border border-sky-500/40 space-y-1.5"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="grid grid-cols-5 gap-1 items-end">
+                        <label className="col-span-3 space-y-0.5">
+                          <span className="text-[9px] text-slate-400 block">Layer Name</span>
+                          <input
+                            type="text"
+                            autoFocus
+                            value={editLayerName}
+                            onChange={(e) => setEditLayerName(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleCommitEditLayer(layer);
+                              else if (e.key === 'Escape') setEditingLayerKey(null);
+                            }}
+                            placeholder={`L${layer.layer}/${layerDt}`}
+                            className="w-full px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 text-[10px] text-slate-100 focus:outline-none focus:border-sky-500"
+                          />
+                        </label>
+                        <label className="col-span-2 space-y-0.5">
+                          <span className="text-[9px] text-slate-400 block">
+                            Data Type (L{layer.layer})
+                          </span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={32767}
+                            step={1}
+                            value={editLayerDatatype}
+                            onChange={(e) => setEditLayerDatatype(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleCommitEditLayer(layer);
+                              else if (e.key === 'Escape') setEditingLayerKey(null);
+                            }}
+                            className="w-full px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 font-mono text-[10px] text-sky-300 focus:outline-none focus:border-sky-500"
+                          />
+                        </label>
+                      </div>
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          type="button"
+                          onClick={() => setEditingLayerKey(null)}
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[9.5px]"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCommitEditLayer(layer)}
+                          className="flex items-center gap-0.5 px-2 py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[9.5px] font-semibold"
+                        >
+                          <Check className="w-2.5 h-2.5" />
+                          <span>Apply</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Link GDS Layer -> Reticle Mask & Fill Pattern */}
                   <div
@@ -3117,7 +3388,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         updateLayout({
                           ...layout,
                           layers: layout.layers.map((l) =>
-                            l.layer === layer.layer ? { ...l, assignedMaskId: val } : l
+                            l.layer === layer.layer && (l.datatype ?? 0) === layerDt
+                              ? { ...l, assignedMaskId: val }
+                              : l
                           ),
                         });
                       }}
@@ -3138,7 +3411,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         updateLayout({
                           ...layout,
                           layers: layout.layers.map((l) =>
-                            l.layer === layer.layer ? { ...l, pattern: nextPat } : l
+                            l.layer === layer.layer && (l.datatype ?? 0) === layerDt
+                              ? { ...l, pattern: nextPat }
+                              : l
                           ),
                         });
                       }}
@@ -3174,7 +3449,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 <span className="font-semibold text-white capitalize flex items-center gap-1.5">
                   <span
                     className="w-2 h-2 rounded-full"
-                    style={{ backgroundColor: layerByNum.get(selectedShape.layer)?.color || '#38bdf8' }}
+                    style={{
+                      backgroundColor: getLayerForShape(selectedShape)?.color || '#38bdf8',
+                    }}
                   />
                   <span>{selectedShape.type} Properties</span>
                 </span>
@@ -3297,30 +3574,81 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 </div>
               )}
 
-              {/* Layer Assignment */}
+              {/* Layer & Data Type Assignment */}
               <div className="grid grid-cols-3 gap-1.5 items-center">
                 <span className="text-[10px] text-slate-400">GDS Layer</span>
                 <select
-                  value={selectedShape.layer}
-                  onChange={(e) =>
+                  value={gdsLayerKey(selectedShape.layer, selectedShape.datatype ?? 0)}
+                  onChange={(e) => {
+                    const [lStr, dtStr] = e.target.value.split(':');
+                    const nextL = parseInt(lStr, 10);
+                    const nextDt = parseInt(dtStr, 10);
                     handleUpdateShape({
                       ...selectedShape,
-                      layer: parseInt(e.target.value, 10),
-                    })
-                  }
+                      layer: Number.isFinite(nextL) ? nextL : selectedShape.layer,
+                      datatype: Number.isFinite(nextDt) ? nextDt : 0,
+                    });
+                  }}
                   className="col-span-2 px-1.5 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-200 focus:outline-none focus:border-sky-500"
                 >
-                  {layout.layers.map((l) => (
-                    <option key={l.layer} value={l.layer}>
-                      L{l.layer}/{l.datatype} · {l.name}
-                    </option>
-                  ))}
+                  {layout.layers.map((l) => {
+                    const dt = l.datatype ?? 0;
+                    const key = gdsLayerKey(l.layer, dt);
+                    return (
+                      <option key={key} value={key}>
+                        L{l.layer}/{dt} · {l.name}
+                      </option>
+                    );
+                  })}
                 </select>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5 items-center">
+                <span className="text-[10px] text-slate-400">Data Type</span>
+                <div className="col-span-2 flex items-center gap-1.5">
+                  <NmNumberInput
+                    value={selectedShape.datatype ?? 0}
+                    min={0}
+                    max={32767}
+                    step={1}
+                    commitOnBlurOnly={true}
+                    onChange={(nextDt) => {
+                      const safeDt = Math.max(0, Math.min(32767, Math.round(nextDt)));
+                      const nextShape: GdsShape = { ...selectedShape, datatype: safeDt };
+                      const nextKey = gdsLayerKey(selectedShape.layer, safeDt);
+                      const exists = layout.layers.some(
+                        (l) => gdsLayerKey(l.layer, l.datatype ?? 0) === nextKey
+                      );
+                      if (exists) {
+                        handleUpdateShape(nextShape);
+                      } else {
+                        const idx = layout.layers.length;
+                        const newLayer: GdsLayerInfo = {
+                          layer: selectedShape.layer,
+                          datatype: safeDt,
+                          name: `L${selectedShape.layer}/${safeDt}`,
+                          color: GDS_LAYER_PALETTE[idx % GDS_LAYER_PALETTE.length],
+                          visible: true,
+                          pattern:
+                            DEFAULT_GDS_LAYER_PATTERNS[idx % DEFAULT_GDS_LAYER_PATTERNS.length],
+                        };
+                        updateLayout({
+                          ...layout,
+                          layers: [...layout.layers, newLayer],
+                          shapes: layout.shapes.map((s) =>
+                            s.id === selectedShape.id ? nextShape : s
+                          ),
+                        });
+                      }
+                    }}
+                    className="w-full px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[10px] text-sky-300 focus:outline-none focus:border-sky-500"
+                  />
+                </div>
               </div>
 
               {/* Fill Pattern Assignment (Shape override or Layer default) */}
               {(() => {
-                const shapeLayer = layerByNum.get(selectedShape.layer);
+                const shapeLayer = getLayerForShape(selectedShape);
                 const layerDefPat: GdsPatternType = shapeLayer?.pattern || 'diagonal-right';
                 const layerDefLabel =
                   GDS_PATTERN_OPTIONS.find((o) => o.id === layerDefPat)?.shortLabel || '45° /';
@@ -3885,7 +4213,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
               <div className="p-1.5 rounded-lg bg-slate-900/90 border border-sky-500/35 flex items-center justify-between gap-1.5">
                 <span className="font-mono text-[10px] text-sky-300 shrink-0">
-                  L{activeLayerNum} Target (Generate):
+                  {activeLayerLabel} Target (Generate):
                 </span>
                 <select
                   value={targetMaskId}
@@ -4223,7 +4551,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 {(previewSlice.cutLength / 1000).toFixed(2)} µm
               </span>
               <span className="text-[11px] font-mono text-sky-300">
-                · Layer {activeLayerNum}: {previewSlice.windows.length} aperture(s)
+                · {activeLayerLabel}: {previewSlice.windows.length} aperture(s)
               </span>
 
               <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer ml-2">
@@ -4250,10 +4578,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               {/* Single-layer Target + Generate Mask Apertures grouped together */}
               <div
                 className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950/90 border border-sky-500/35 text-[11px]"
-                title={`Target reticle applies ONLY to Generate Mask Apertures (slices active GDS Layer ${activeLayerNum})`}
+                title={`Target reticle applies ONLY to Generate Mask Apertures (slices active GDS ${activeLayerLabel})`}
               >
                 <span className="font-mono text-sky-300 font-semibold shrink-0">
-                  L{activeLayerNum} Target:
+                  {activeLayerLabel} Target:
                 </span>
                 <select
                   value={targetMaskId}
@@ -4273,10 +4601,15 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   disabled={!sectionLine || masks.length === 0}
                   onClick={handleApplyToSingleMask}
                   className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:pointer-events-none text-white text-xs font-semibold transition-colors shadow-sm shrink-0"
-                  title={`Slice active GDS Layer ${activeLayerNum} into the selected Target mask`}
+                  title={`Slice active GDS ${activeLayerLabel} into the selected Target mask`}
                 >
                   <Check className="w-3.5 h-3.5" />
-                  <span>Generate Mask Apertures</span>
+                  <span>
+                    {(masks.find((m) => m.id === targetMaskId) || selectedMask)?.maskField ===
+                    'light-field'
+                      ? 'Generate Mask Blockers'
+                      : 'Generate Mask Apertures'}
+                  </span>
                 </button>
               </div>
 
@@ -4410,10 +4743,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               <div className="p-3 rounded-xl bg-sky-950/25 border border-sky-500/35 space-y-1">
                 <div className="font-semibold text-sky-300 flex items-center gap-1.5">
                   <Check className="w-3.5 h-3.5" />
-                  <span>2. Single-Layer Mode: L{activeLayerNum} Target + Generate Mask Apertures</span>
+                  <span>2. Single-Layer Mode: {activeLayerLabel} Target + Generate Mask Apertures</span>
                 </div>
                 <p className="text-slate-300">
-                  The <strong className="text-sky-200">L{activeLayerNum} Target</strong> dropdown applies{' '}
+                  The <strong className="text-sky-200">{activeLayerLabel} Target</strong> dropdown applies{' '}
                   <strong className="text-white">only</strong> to <strong className="text-sky-200">Generate Mask Apertures</strong>.
                   It slices only the currently selected GDS layer along the active section cut (or concatenated cuts) and writes
                   the apertures to that chosen Target reticle — even if the layer is unmapped.
@@ -4451,6 +4784,16 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Top Cell Selection & Preview Modal on GDSII Import */}
+      {pendingGdsImport && (
+        <GdsTopCellModal
+          parsedStream={pendingGdsImport}
+          existingMasks={masks}
+          onConfirm={handleConfirmTopCellImport}
+          onCancel={() => setPendingGdsImport(null)}
+        />
       )}
     </div>
   );

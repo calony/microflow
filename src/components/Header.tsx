@@ -19,6 +19,7 @@ import {
   Menu,
   X,
   FlaskConical,
+  Info,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -32,6 +33,7 @@ interface HeaderProps {
   onOpenMaskLevels: () => void;
   onOpenRunSheet: () => void;
   onOpenMultiStepView: () => void;
+  onOpenAbout: () => void;
   onExportJson: () => void;
   onImportJson: (json: ProcessFlow) => void;
   leftSidebarOpen?: boolean;
@@ -51,6 +53,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMaskLevels,
   onOpenRunSheet,
   onOpenMultiStepView,
+  onOpenAbout,
   onExportJson,
   onImportJson,
   leftSidebarOpen = true,
@@ -307,6 +310,16 @@ export const Header: React.FC<HeaderProps> = ({
               <Download className="w-3.5 h-3.5" />
             </button>
           </div>
+
+          <button
+            type="button"
+            onClick={onOpenAbout}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+            title="App dependencies, local privacy & no-AI disclaimer"
+          >
+            <Info className="w-3.5 h-3.5 text-sky-400" />
+            <span>About this app</span>
+          </button>
         </div>
 
         {/* Mobile & Tablet Tools Dropdown (< xl) */}
@@ -416,6 +429,20 @@ export const Header: React.FC<HeaderProps> = ({
               >
                 <Download className="w-4 h-4 text-slate-400" />
                 <span>Export Recipe JSON</span>
+              </button>
+
+              <div className="my-1 border-t border-slate-800" />
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenAbout();
+                }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+              >
+                <Info className="w-4 h-4 text-sky-400" />
+                <span>About this app</span>
               </button>
             </div>
           )}

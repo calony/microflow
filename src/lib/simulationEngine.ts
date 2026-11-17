@@ -874,6 +874,7 @@ function applyLithographySide(
 ): void {
   const cfg = step.lithography;
   const polarity = cfg?.polarity ?? 'positive';
+  const maskField = cfg?.maskField ?? 'dark-field';
   const resistMatId = resolveResistMaterialId(polarity, cfg?.resistMaterialId);
   const resistThickness = cfg?.resistThickness ?? 1000;
   const windows = cfg?.windows ?? [];
@@ -955,7 +956,9 @@ function applyLithographySide(
     }
   }
 
-  // 2. Exposure & Development
+  // 2. Exposure (Mask Field Polarity) & Development (Resist Tone)
+  // Dark-field: windows = clear apertures (exposed inside windows).
+  // Light-field: windows = opaque chrome blockers (exposed outside windows).
   const isDissolved: boolean[] = new Array(columns.length).fill(false);
 
   for (let i = 0; i < columns.length; i++) {
@@ -969,11 +972,8 @@ function applyLithographySide(
       }
     }
 
-    if (polarity === 'positive') {
-      isDissolved[i] = inWindow;
-    } else {
-      isDissolved[i] = !inWindow;
-    }
+    const isExposed = maskField === 'light-field' ? !inWindow : inWindow;
+    isDissolved[i] = polarity === 'positive' ? isExposed : !isExposed;
   }
 
   // 3. Sidewall angle shaping (tapered < 90° or retrograde undercut > 90°)
@@ -1114,10 +1114,8 @@ function applyEtchSide(
   const linkedRecipe = cfg?.etchRecipeId
     ? getEtchRecipeById(etchLibrary, cfg.etchRecipeId)
     : undefined;
-  const activeRecipe =
-    cfg?.rateMode === 'time-rate' && linkedRecipe ? linkedRecipe : undefined;
+  const activeRecipe = linkedRecipe;
   const isRateDriven = Boolean(activeRecipe);
-  const etchTimeMin = Math.max(0.001, (cfg?.etchTimeSec ?? 60) / 60);
   const depth = cfg?.depth ?? step.thickness ?? 200;
   const targetMatId = cfg?.targetMaterialId ?? 'all';
   const isotropy =
@@ -1126,17 +1124,23 @@ function applyEtchSide(
   const sidewallAngle = cfg?.sidewallAngle ?? 90;
   const dx = totalWidth / columns.length;
 
-  if (!isRateDriven && depth <= 0) return;
-  if (isRateDriven && etchTimeMin <= 0) return;
-
-  const maskEtchTimeMin = (() => {
+  const etchTimeMin = (() => {
     if (!linkedRecipe) return 0;
-    if (isRateDriven) return etchTimeMin;
+    if (cfg?.rateMode === 'time-rate') {
+      return Math.max(0.001, (cfg?.etchTimeSec ?? 60) / 60);
+    }
+    if (depth <= 0) return 0;
     const refMatId =
-      targetMatId !== 'all' ? targetMatId : linkedRecipe.primaryMaterialId;
+      cfg?.referenceMaterialId ||
+      (targetMatId !== 'all' ? targetMatId : linkedRecipe.primaryMaterialId);
     const refRate = getEtchRateNmMin(linkedRecipe, refMatId);
     return refRate > 0 ? depth / refRate : 0;
   })();
+
+  if (!isRateDriven && depth <= 0) return;
+  if (isRateDriven && etchTimeMin <= 0) return;
+
+  const maskEtchTimeMin = linkedRecipe ? etchTimeMin : 0;
 
   // 1. Identify which columns have exposed target material at the active surface
   const isColumnExposed: boolean[] = new Array(columns.length).fill(false);
