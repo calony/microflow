@@ -18,6 +18,7 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
+  Minimize2,
   Ruler,
   Download,
   Maximize,
@@ -25,6 +26,9 @@ import {
   Search,
   Layers,
   EyeOff,
+  PictureInPicture2,
+  ArrowUpRight,
+  X,
 } from 'lucide-react';
 
 interface CrossSectionCanvasProps {
@@ -39,6 +43,13 @@ interface CrossSectionCanvasProps {
   totalSteps?: number;
   activeStepTitle?: string;
   activeStepSide?: ProcessSide;
+  finalMesh?: CrossSectionMesh | null;
+  finalPolygons?: RenderedPolygon[];
+  finalStepNumber?: number;
+  finalStepTitle?: string;
+  showFinalInset?: boolean;
+  onToggleFinalInset?: () => void;
+  onSelectFinalStep?: () => void;
 }
 
 export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
@@ -53,6 +64,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   totalSteps,
   activeStepTitle,
   activeStepSide,
+  finalMesh,
+  finalPolygons,
+  finalStepNumber,
+  finalStepTitle,
+  showFinalInset = false,
+  onToggleFinalInset,
+  onSelectFinalStep,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -128,6 +146,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   const [showGrid, setShowGrid] = useState<boolean>(true);
   const [renderMode, setRenderMode] = useState<'hatch' | 'solid'>('hatch');
   const [showLegend, setShowLegend] = useState<boolean>(true);
+  const [insetExpanded, setInsetExpanded] = useState<boolean>(false);
 
   const legendMaterials = useMemo(() => {
     const seen = new Set<string>();
@@ -762,7 +781,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Download high-res SVG of active canvas
   const handleExportSingleSvg = () => {
-    const svgEl = containerRef.current?.querySelector('svg');
+    const svgEl = svgRef.current || containerRef.current?.querySelector('svg');
     if (!svgEl) return;
     const serializer = new XMLSerializer();
     const svgString = serializer.serializeToString(svgEl);
@@ -921,6 +940,29 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             <Layers className="w-3.5 h-3.5" />
             <span className="hidden md:inline">Legend</span>
           </button>
+
+          {/* Final Step Inset Preview Toggle */}
+          {onToggleFinalInset && finalStepNumber !== undefined && (
+            <button
+              type="button"
+              onClick={onToggleFinalInset}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+                showFinalInset
+                  ? 'bg-emerald-600/20 border-emerald-500/50 text-emerald-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+              }`}
+              title={
+                stepNumber !== undefined && stepNumber >= finalStepNumber
+                  ? 'Final step inset preview (active when viewing an earlier step)'
+                  : showFinalInset
+                  ? 'Hide final process step inset'
+                  : 'Show inset preview of final process step'
+              }
+            >
+              <PictureInPicture2 className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Final Inset</span>
+            </button>
+          )}
 
           {/* Caliper Measurement tool */}
           <button
@@ -1453,6 +1495,242 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             </button>
           </div>
         )}
+
+        {/* Floating Final Process Step Inset (Top-Right when intermediate step is selected) */}
+        {showFinalInset &&
+          finalMesh &&
+          finalPolygons &&
+          finalPolygons.length > 0 &&
+          finalStepNumber !== undefined &&
+          stepNumber !== undefined &&
+          stepNumber < finalStepNumber && (() => {
+            const insetVbW = 320;
+            const insetVbH = 176;
+            const padX = 14;
+            const padY = 14;
+            const availW = insetVbW - padX * 2;
+            const availH = insetVbH - padY * 2;
+
+            let fMinX = 0;
+            let fMaxX = waferWidth;
+            let fMinY = finalMesh.minY ?? 0;
+            let fMaxY = Math.max(finalMesh.maxY ?? 3000, 2500);
+            for (const poly of finalPolygons) {
+              if (poly.xMin < fMinX) fMinX = poly.xMin;
+              if (poly.xMax > fMaxX) fMaxX = poly.xMax;
+              if (poly.yMin < fMinY) fMinY = poly.yMin;
+              if (poly.yMax > fMaxY) fMaxY = poly.yMax;
+              for (const p of poly.points) {
+                if (p.x < fMinX) fMinX = p.x;
+                if (p.x > fMaxX) fMaxX = p.x;
+                if (p.y < fMinY) fMinY = p.y;
+                if (p.y > fMaxY) fMaxY = p.y;
+              }
+            }
+
+            const fSpanX = Math.max(100, fMaxX - fMinX);
+            const fSpanY = Math.max(300, fMaxY - fMinY);
+            const rawSx = availW / fSpanX;
+            const rawSy = (availH * 0.65 * (zScale / 2.0)) / fSpanY;
+            const rawWaferH = fSpanY * rawSy;
+            const fitFactor = rawWaferH > availH ? availH / rawWaferH : 1;
+            const insetSx = rawSx * fitFactor;
+            const insetSy = rawSy * fitFactor;
+            const insetOffsetX = (insetVbW - fSpanX * insetSx) / 2 - fMinX * insetSx;
+            const insetCenterY = insetVbH / 2 + (fSpanY * insetSy) / 2;
+
+            const toInset = (x: number, y: number) => ({
+              x: insetOffsetX + x * insetSx,
+              y: insetCenterY - (y - fMinY) * insetSy,
+            });
+
+            const buildInsetPath = (pts: { x: number; y: number }[]) => {
+              if (pts.length < 3) return '';
+              const first = toInset(pts[0].x, pts[0].y);
+              let d = `M ${first.x.toFixed(1)} ${first.y.toFixed(1)}`;
+              for (let i = 1; i < pts.length; i++) {
+                const pt = toInset(pts[i].x, pts[i].y);
+                d += ` L ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
+              }
+              return d + ' Z';
+            };
+
+            // Main canvas visible world bounds for zoomed-in ROI indicator
+            const visLeftWx = ((0 - pan.x) / zoom - effectivePaddingX) / scaleX;
+            const visRightWx = ((svgWidth - pan.x) / zoom - effectivePaddingX) / scaleX;
+            const visTopWy =
+              effectiveMinY + (effectiveDatumScreenY - (0 - pan.y) / zoom) / scaleY;
+            const visBotWy =
+              effectiveMinY + (effectiveDatumScreenY - (svgHeight - pan.y) / zoom) / scaleY;
+            const showRoiBox =
+              lockedMetrics !== null &&
+              (visRightWx - visLeftWx < fSpanX * 0.88 || visTopWy - visBotWy < fSpanY * 0.88);
+            const roiX1 = Math.max(fMinX, Math.min(fMaxX, visLeftWx));
+            const roiX2 = Math.max(fMinX, Math.min(fMaxX, visRightWx));
+            const roiY1 = Math.max(fMinY, Math.min(fMaxY, visBotWy));
+            const roiY2 = Math.max(fMinY, Math.min(fMaxY, visTopWy));
+            const roiP1 = toInset(roiX1, roiY2);
+            const roiP2 = toInset(roiX2, roiY1);
+            const datumLeft = toInset(fMinX, fMinY);
+            const datumRight = toInset(fMaxX, fMinY);
+
+            return (
+              <div
+                onPointerDown={(e) => e.stopPropagation()}
+                onWheel={(e) => e.stopPropagation()}
+                className={`absolute top-3 right-3 z-20 flex flex-col bg-slate-900/92 backdrop-blur-md border border-emerald-500/40 rounded-xl shadow-2xl overflow-hidden transition-all ${
+                  insetExpanded
+                    ? 'w-72 sm:w-96'
+                    : 'w-52 sm:w-64'
+                }`}
+              >
+                {/* Inset Header */}
+                <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 bg-slate-950/85 border-b border-slate-800 text-[11px]">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                    <span className="px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[9px] font-semibold shrink-0">
+                      FINAL
+                    </span>
+                    <span className="text-slate-300 font-mono text-[10px] shrink-0">
+                      {finalStepNumber}/{totalSteps}
+                    </span>
+                    {finalStepTitle && (
+                      <span className="text-slate-400 truncate text-[10px]" title={finalStepTitle}>
+                        {finalStepTitle}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-0.5 shrink-0">
+                    {onSelectFinalStep && (
+                      <button
+                        type="button"
+                        onClick={onSelectFinalStep}
+                        className="p-1 rounded text-slate-400 hover:text-emerald-300 hover:bg-slate-800 transition-colors"
+                        title={`Jump to final step (${finalStepNumber}/${totalSteps})`}
+                      >
+                        <ArrowUpRight className="w-3 h-3" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setInsetExpanded((v) => !v)}
+                      className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                      title={insetExpanded ? 'Compact inset' : 'Expand inset'}
+                    >
+                      {insetExpanded ? (
+                        <Minimize2 className="w-3 h-3" />
+                      ) : (
+                        <Maximize2 className="w-3 h-3" />
+                      )}
+                    </button>
+                    {onToggleFinalInset && (
+                      <button
+                        type="button"
+                        onClick={onToggleFinalInset}
+                        className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors"
+                        title="Hide final step inset"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Inset Mini Cross-Section SVG */}
+                <div
+                  className={`relative w-full bg-[#060a12] ${
+                    insetExpanded ? 'h-44 sm:h-52' : 'h-28 sm:h-36'
+                  }`}
+                >
+                  <svg
+                    viewBox={`0 0 ${insetVbW} ${insetVbH}`}
+                    className="w-full h-full block pointer-events-none"
+                    preserveAspectRatio="xMidYMid meet"
+                  >
+                    <SvgPatterns materials={materials} idPrefix="final-inset-" />
+
+                    {/* Final step layer polygons */}
+                    <g>
+                      {finalPolygons.map((poly) => {
+                        const mat = getMaterialById(materials, poly.materialId);
+                        const d = buildInsetPath(poly.points);
+                        if (!d) return null;
+                        return (
+                          <path
+                            key={poly.id}
+                            d={d}
+                            fill={
+                              renderMode === 'hatch'
+                                ? `url(#final-inset-mat-fill-${mat.id})`
+                                : mat.color
+                            }
+                            stroke={mat.strokeColor || '#1e293b'}
+                            strokeWidth="0.9"
+                          />
+                        );
+                      })}
+                    </g>
+
+                    {/* Mounted tape frames if present on final step */}
+                    {finalMesh.mountedFrames &&
+                      finalMesh.mountedFrames.map((frame, fIdx) => {
+                        const leftX = toInset(0, 0).x;
+                        const rightX = toInset(waferWidth, 0).x;
+                        const yTopPx = toInset(0, frame.yTop).y;
+                        const yBotPx = toInset(0, frame.yBottom).y;
+                        const yMinPx = Math.min(yTopPx, yBotPx);
+                        const clampH = Math.max(3, Math.abs(yBotPx - yTopPx));
+                        return (
+                          <g key={`inset_frame_${fIdx}_${frame.side}`}>
+                            <rect
+                              x={leftX - 8}
+                              y={yMinPx}
+                              width={8}
+                              height={clampH}
+                              fill="#0284c7"
+                              fillOpacity="0.65"
+                            />
+                            <rect
+                              x={rightX}
+                              y={yMinPx}
+                              width={8}
+                              height={clampH}
+                              fill="#0284c7"
+                              fillOpacity="0.65"
+                            />
+                          </g>
+                        );
+                      })}
+
+                    {/* Datum reference line */}
+                    <line
+                      x1={datumLeft.x}
+                      y1={datumLeft.y}
+                      x2={datumRight.x}
+                      y2={datumRight.y}
+                      stroke="#475569"
+                      strokeWidth="0.9"
+                    />
+
+                    {/* Zoomed-in region indicator matching current main viewport */}
+                    {showRoiBox && roiX2 > roiX1 && roiY2 > roiY1 && (
+                      <rect
+                        x={roiP1.x}
+                        y={roiP1.y}
+                        width={Math.max(4, roiP2.x - roiP1.x)}
+                        height={Math.max(4, roiP2.y - roiP1.y)}
+                        fill="rgba(56, 189, 248, 0.14)"
+                        stroke="#38bdf8"
+                        strokeWidth="1.2"
+                        strokeDasharray="3 2"
+                        rx="1.5"
+                      />
+                    )}
+                  </svg>
+                </div>
+              </div>
+            );
+          })()}
 
         {/* FLOATING QUICK-ACTION HUD (Bottom-Right) - Always accessible on canvas */}
         <div className="absolute bottom-3 right-3 z-10 flex items-center gap-1 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 shadow-2xl rounded-xl p-1 text-xs">

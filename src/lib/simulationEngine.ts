@@ -222,16 +222,16 @@ function applyStep(
 
     case 'strip':
     case 'liftoff': {
-      applyStripOrLiftoff(columns, step, materials, side);
+      applyStripOrLiftoff(columns, step, materials, side, scallopWalls);
       break;
     }
 
     case 'cmp': {
       if (side === 'front' || side === 'both') {
-        applyCmpSide(columns, step, 'front');
+        applyCmpSide(columns, step, 'front', scallopWalls);
       }
       if (side === 'back' || side === 'both') {
-        applyCmpSide(columns, step, 'back');
+        applyCmpSide(columns, step, 'back', scallopWalls);
       }
       break;
     }
@@ -1352,12 +1352,21 @@ function applyEtchSide(
     }
   }
 
+  const rawEtchType = cfg?.etchType || 'rie';
+  const supportsPositiveTaper =
+    rawEtchType === 'wet-koh' ||
+    rawEtchType === 'rie' ||
+    rawEtchType === 'drie-bosch' ||
+    rawEtchType === 'ion-beam';
+  const isReentrant =
+    sidewallAngle > 90.5 &&
+    (rawEtchType === 'rie' || rawEtchType === 'drie-bosch');
   const isCrystallographic =
-    cfg?.etchType === 'wet-koh' || sidewallAngle < 89.5;
+    rawEtchType === 'wet-koh' || (supportsPositiveTaper && sidewallAngle < 89.5);
   const etchDepthPerCol = new Float64Array(baseDepthPerCol);
 
-  // Tapered / crystallographic sidewalls (e.g. KOH 54.74°):
-  // Non-zero isotropy shifts the sloped crystal wall laterally outward by U = D * isotropy
+  // Tapered / crystallographic sidewalls (e.g. KOH 54.74° or positive-taper dry etch < 89.5°):
+  // Non-zero isotropy shifts the sloped wall laterally outward by U = D * isotropy
   // while preserving the target sidewall angle.
   if (isCrystallographic) {
     const clampedAngle = Math.max(15, Math.min(89.5, sidewallAngle));
@@ -1366,22 +1375,49 @@ function applyEtchSide(
 
     for (let i = 0; i < columns.length; i++) {
       if (!isColumnExposed[i]) continue;
+      const col = columns[i];
+      const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
       const localDepth = baseDepthPerCol[i];
       const lateralUndercut = localDepth * Math.max(0, isotropy);
 
+      // Only count an unexposed neighbor as a shadowing mask wall if it stands at or above
+      // this column's surface elevation (so lower exposed etch-stop terraces don't leave mesa spikes).
       let stepsLeft = 0;
-      while (i - stepsLeft >= 0 && isColumnExposed[i - stepsLeft]) {
+      let leftMaskFound = false;
+      while (i - stepsLeft >= 0) {
+        const k = i - stepsLeft;
+        if (!isColumnExposed[k]) {
+          if (columns[k].segments.length > 0) {
+            const kSurfY =
+              targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
+            if (targetSide === 'front' ? kSurfY >= surfaceY - 1 : kSurfY <= surfaceY + 1) {
+              leftMaskFound = true;
+            }
+          }
+          break;
+        }
         stepsLeft++;
       }
+
       let stepsRight = 0;
-      while (i + stepsRight < columns.length && isColumnExposed[i + stepsRight]) {
+      let rightMaskFound = false;
+      while (i + stepsRight < columns.length) {
+        const k = i + stepsRight;
+        if (!isColumnExposed[k]) {
+          if (columns[k].segments.length > 0) {
+            const kSurfY =
+              targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
+            if (targetSide === 'front' ? kSurfY >= surfaceY - 1 : kSurfY <= surfaceY + 1) {
+              rightMaskFound = true;
+            }
+          }
+          break;
+        }
         stepsRight++;
       }
 
-      const distToLeftEdge =
-        i - stepsLeft < 0 ? Infinity : (stepsLeft - 0.5) * dx;
-      const distToRightEdge =
-        i + stepsRight >= columns.length ? Infinity : (stepsRight - 0.5) * dx;
+      const distToLeftEdge = leftMaskFound ? (stepsLeft - 0.5) * dx : Infinity;
+      const distToRightEdge = rightMaskFound ? (stepsRight - 0.5) * dx : Infinity;
       const nearestEdgeDist = Math.min(distToLeftEdge, distToRightEdge);
 
       if (Number.isFinite(nearestEdgeDist)) {
@@ -1441,28 +1477,123 @@ function applyEtchSide(
     verticalEtchFloor[i] = reachedY;
   }
 
-  // 4. 2D Lateral Wavefront (Crystallographic angled undercut for KOH, or Huygens circular for RIE/Wet)
+  // 4. 2D Lateral Wavefront (Barrier-aware interval propagation for KOH & RIE/Wet)
   const finalFrontReachY = new Float64Array(columns.length);
-  const openAmbientReachY = new Float64Array(columns.length);
-  const lateralReachY = new Float64Array(columns.length);
-  const hasLateralUndercut = new Uint8Array(columns.length);
+  interface LateralReachWindow {
+    winBot: number;
+    winTop: number;
+    reachY: number;
+  }
+  const colLateralWindows: (LateralReachWindow[] | undefined)[] = new Array(
+    columns.length
+  );
 
   for (let j = 0; j < columns.length; j++) {
-    const col = columns[j];
-    const surfaceY =
-      col.segments.length === 0
-        ? 0
-        : targetSide === 'front'
-        ? getTopY(col)
-        : getBottomY(col);
     finalFrontReachY[j] = verticalEtchFloor[j];
-    openAmbientReachY[j] = surfaceY;
-    lateralReachY[j] = surfaceY;
   }
 
-  const isReentrant =
-    sidewallAngle > 90.5 &&
-    (cfg?.etchType === 'rie' || cfg?.etchType === 'drie-bosch');
+  const isBarrierSegment = (seg: MaterialSegment): boolean => {
+    const mat = getMaterialById(materials, seg.materialId);
+    if (
+      mat.category === 'photoresist' &&
+      cfg?.etchType !== 'ashing' &&
+      targetMatId !== seg.materialId
+    ) {
+      return true;
+    }
+    if (stopLayerId && seg.materialId === stopLayerId) return true;
+    if (targetMatId !== 'all' && seg.materialId !== targetMatId) return true;
+    if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) {
+      return true;
+    }
+    return false;
+  };
+
+  const subtractBarrierInterval = (
+    intervals: [number, number][],
+    barBot: number,
+    barTop: number
+  ): [number, number][] => {
+    if (barTop <= barBot || intervals.length === 0) return intervals;
+    const next: [number, number][] = [];
+    for (const [a, b] of intervals) {
+      if (barTop <= a || barBot >= b) {
+        next.push([a, b]);
+      } else {
+        if (a < barBot) next.push([a, barBot]);
+        if (barTop < b) next.push([barTop, b]);
+      }
+    }
+    return next;
+  };
+
+  const subtractColBarriers = (
+    intervals: [number, number][],
+    col: ColumnProfile
+  ): [number, number][] => {
+    let curr = intervals;
+    for (const seg of col.segments) {
+      if (curr.length === 0) break;
+      if (isBarrierSegment(seg)) {
+        curr = subtractBarrierInterval(curr, seg.yBottom, seg.yTop);
+      }
+    }
+    return curr;
+  };
+
+  const mergeInterval = (
+    intervals: [number, number][],
+    addBot: number,
+    addTop: number
+  ): [number, number][] => {
+    if (addTop <= addBot) return intervals;
+    const combined = [...intervals, [addBot, addTop] as [number, number]].sort(
+      (a, b) => a[0] - b[0]
+    );
+    const merged: [number, number][] = [combined[0]];
+    for (let k = 1; k < combined.length; k++) {
+      const prev = merged[merged.length - 1];
+      const curr = combined[k];
+      if (curr[0] <= prev[1] + 1e-4) {
+        prev[1] = Math.max(prev[1], curr[1]);
+      } else {
+        merged.push(curr);
+      }
+    }
+    return merged;
+  };
+
+  const addLateralWindow = (
+    colIdx: number,
+    winBot: number,
+    winTop: number,
+    reachY: number
+  ) => {
+    if (targetSide === 'front') {
+      if (reachY >= winTop) return;
+    } else {
+      if (reachY <= winBot) return;
+    }
+    let list = colLateralWindows[colIdx];
+    if (!list) {
+      list = [];
+      colLateralWindows[colIdx] = list;
+    }
+    for (const existing of list) {
+      if (
+        Math.abs(existing.winBot - winBot) < 1e-4 &&
+        Math.abs(existing.winTop - winTop) < 1e-4
+      ) {
+        if (targetSide === 'front') {
+          if (reachY < existing.reachY) existing.reachY = reachY;
+        } else {
+          if (reachY > existing.reachY) existing.reachY = reachY;
+        }
+        return;
+      }
+    }
+    list.push({ winBot, winTop, reachY });
+  };
 
   if (isotropy > 0 && isCrystallographic) {
     const clampedAngle = Math.max(15, Math.min(89.5, sidewallAngle));
@@ -1484,17 +1615,7 @@ function applyEtchSide(
       let rem = localDepth;
       let maxReachedY = yAirI;
       for (const seg of orderedSegsI) {
-        const mat = getMaterialById(materials, seg.materialId);
-        if (
-          mat.category === 'photoresist' &&
-          cfg?.etchType !== 'ashing' &&
-          targetMatId !== seg.materialId
-        ) {
-          break;
-        }
-        if (stopLayerId && seg.materialId === stopLayerId) break;
-        if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
-        if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) break;
+        if (isBarrierSegment(seg)) break;
         const h = seg.yTop - seg.yBottom;
         if (rem >= h) {
           rem -= h;
@@ -1513,67 +1634,89 @@ function applyEtchSide(
         i < columns.length - 1 && !isColumnExposed[i + 1];
       const colRadius = Math.ceil(lateralUndercut / dx + 0.5);
 
-      // 4A. Mask undercut preserving crystallographic sidewallAngle
+      // 4A. Mask undercut preserving crystallographic sidewallAngle (barrier-aware)
       if (isLeftMaskEdge) {
         const maskEdgeX = i * dx;
+        let activeIntervals: [number, number][] =
+          targetSide === 'front'
+            ? [[maxReachedY, Infinity]]
+            : [[-Infinity, maxReachedY]];
+        activeIntervals = subtractColBarriers(activeIntervals, colI);
+
         for (let stepCols = 1; stepCols <= colRadius; stepCols++) {
           const j = i - stepCols;
-          if (j < 0 || isColumnExposed[j]) break;
+          if (j < 0 || isColumnExposed[j] || activeIntervals.length === 0) break;
           const distUnderMask = maskEdgeX - columns[j].x;
           const remainingRun = lateralUndercut - distUnderMask;
           if (remainingRun <= 0) break;
+
+          activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+          if (activeIntervals.length === 0) break;
 
           const undercutDepth = Math.min(maxEtchableSpan, remainingRun * tanAngle);
           if (undercutDepth <= 0) continue;
 
           if (targetSide === 'front') {
-            if (yAirI < openAmbientReachY[j]) openAmbientReachY[j] = yAirI;
-            const targetY = yAirI - undercutDepth;
-            if (targetY < lateralReachY[j]) {
-              lateralReachY[j] = targetY;
-              hasLateralUndercut[j] = 1;
+            const rawTargetY = yAirI - undercutDepth;
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.max(winBot, rawTargetY);
+              if (winTop === Infinity && reachY < finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
             }
-            if (targetY < finalFrontReachY[j]) finalFrontReachY[j] = targetY;
           } else {
-            if (yAirI > openAmbientReachY[j]) openAmbientReachY[j] = yAirI;
-            const targetY = yAirI + undercutDepth;
-            if (targetY > lateralReachY[j]) {
-              lateralReachY[j] = targetY;
-              hasLateralUndercut[j] = 1;
+            const rawTargetY = yAirI + undercutDepth;
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.min(winTop, rawTargetY);
+              if (winBot === -Infinity && reachY > finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
             }
-            if (targetY > finalFrontReachY[j]) finalFrontReachY[j] = targetY;
           }
         }
       }
 
       if (isRightMaskEdge) {
         const maskEdgeX = (i + 1) * dx;
+        let activeIntervals: [number, number][] =
+          targetSide === 'front'
+            ? [[maxReachedY, Infinity]]
+            : [[-Infinity, maxReachedY]];
+        activeIntervals = subtractColBarriers(activeIntervals, colI);
+
         for (let stepCols = 1; stepCols <= colRadius; stepCols++) {
           const j = i + stepCols;
-          if (j >= columns.length || isColumnExposed[j]) break;
+          if (j >= columns.length || isColumnExposed[j] || activeIntervals.length === 0) break;
           const distUnderMask = columns[j].x - maskEdgeX;
           const remainingRun = lateralUndercut - distUnderMask;
           if (remainingRun <= 0) break;
+
+          activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+          if (activeIntervals.length === 0) break;
 
           const undercutDepth = Math.min(maxEtchableSpan, remainingRun * tanAngle);
           if (undercutDepth <= 0) continue;
 
           if (targetSide === 'front') {
-            if (yAirI < openAmbientReachY[j]) openAmbientReachY[j] = yAirI;
-            const targetY = yAirI - undercutDepth;
-            if (targetY < lateralReachY[j]) {
-              lateralReachY[j] = targetY;
-              hasLateralUndercut[j] = 1;
+            const rawTargetY = yAirI - undercutDepth;
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.max(winBot, rawTargetY);
+              if (winTop === Infinity && reachY < finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
             }
-            if (targetY < finalFrontReachY[j]) finalFrontReachY[j] = targetY;
           } else {
-            if (yAirI > openAmbientReachY[j]) openAmbientReachY[j] = yAirI;
-            const targetY = yAirI + undercutDepth;
-            if (targetY > lateralReachY[j]) {
-              lateralReachY[j] = targetY;
-              hasLateralUndercut[j] = 1;
+            const rawTargetY = yAirI + undercutDepth;
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.min(winTop, rawTargetY);
+              if (winBot === -Infinity && reachY > finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
             }
-            if (targetY > finalFrontReachY[j]) finalFrontReachY[j] = targetY;
           }
         }
       }
@@ -1582,6 +1725,12 @@ function applyEtchSide(
       const vReachI = verticalEtchFloor[i];
       for (const dir of [-1, 1] as const) {
         const wallEdgeX = dir === -1 ? i * dx : (i + 1) * dx;
+        let activeIntervals: [number, number][] =
+          targetSide === 'front'
+            ? [[vReachI, Infinity]]
+            : [[-Infinity, vReachI]];
+        activeIntervals = subtractColBarriers(activeIntervals, colI);
+
         for (let stepCols = 1; stepCols <= colRadius; stepCols++) {
           const j = i + dir * stepCols;
           if (j < 0 || j >= columns.length || !isColumnExposed[j]) break;
@@ -1591,17 +1740,28 @@ function applyEtchSide(
             targetSide === 'front' ? yAirJ > yAirI + 1 : yAirJ < yAirI - 1;
           if (!standsTaller) break;
 
+          activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+          if (activeIntervals.length === 0) break;
+
           const distIntoWall = Math.abs(columns[j].x - wallEdgeX);
           const remainingRun = lateralUndercut - distIntoWall;
           if (remainingRun <= 0) break;
 
           const extraDrop = remainingRun * tanAngle;
           if (targetSide === 'front') {
-            const targetY = Math.max(vReachI, verticalEtchFloor[j] - extraDrop);
-            if (targetY < finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+            const rawTargetY = Math.max(vReachI, verticalEtchFloor[j] - extraDrop);
+            const topOpen = activeIntervals.find((iv) => iv[1] === Infinity);
+            if (topOpen) {
+              const targetY = Math.max(topOpen[0], rawTargetY);
+              if (targetY < finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+            }
           } else {
-            const targetY = Math.min(vReachI, verticalEtchFloor[j] + extraDrop);
-            if (targetY > finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+            const rawTargetY = Math.min(vReachI, verticalEtchFloor[j] + extraDrop);
+            const botOpen = activeIntervals.find((iv) => iv[0] === -Infinity);
+            if (botOpen) {
+              const targetY = Math.min(botOpen[1], rawTargetY);
+              if (targetY > finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+            }
           }
         }
       }
@@ -1628,50 +1788,100 @@ function applyEtchSide(
       const effectiveRx = effectiveRz * isotropy;
       if (effectiveRx <= 0) continue;
 
-      const colRadius = Math.ceil(effectiveRx / dx);
-      const startJ = Math.max(0, i - colRadius);
-      const endJ = Math.min(columns.length - 1, i + colRadius);
+      const colRadius = Math.ceil(effectiveRx / dx + 0.5);
+      let baseIntervals: [number, number][] =
+        targetSide === 'front'
+          ? [[vReachI, Infinity]]
+          : [[-Infinity, vReachI]];
+      baseIntervals = subtractColBarriers(baseIntervals, colI);
+      if (baseIntervals.length === 0) continue;
 
-      for (let j = startJ; j <= endJ; j++) {
-        if (j === i) continue;
-        const distX = Math.abs(j - i) * dx;
-        if (distX > effectiveRx) continue;
+      for (const dir of [-1, 1] as const) {
+        let activeIntervals = baseIntervals;
 
-        const normX = distX / effectiveRx;
-        const curveDrop =
-          effectiveRz * Math.sqrt(Math.max(0, 1 - normX * normX));
+        for (let stepCols = 1; stepCols <= colRadius; stepCols++) {
+          const j = i + dir * stepCols;
+          if (j < 0 || j >= columns.length) break;
+          const distX = (stepCols - 0.5) * dx;
+          if (distX > effectiveRx) break;
 
-        if (targetSide === 'front') {
-          if (yAirI < openAmbientReachY[j]) {
-            openAmbientReachY[j] = yAirI;
-          }
-          const curvedY =
-            vReachI < yAirI
-              ? Math.max(vReachI, yAirI - curveDrop)
-              : yAirI;
-          if (curvedY < finalFrontReachY[j]) {
-            finalFrontReachY[j] = curvedY;
-          }
-          if (isColumnExposed[i] && curvedY < lateralReachY[j]) {
-            lateralReachY[j] = curvedY;
-            hasLateralUndercut[j] = 1;
-          }
-        } else {
-          if (yAirI > openAmbientReachY[j]) {
-            openAmbientReachY[j] = yAirI;
-          }
-          const curvedY =
-            vReachI > yAirI
-              ? Math.min(vReachI, yAirI + curveDrop)
-              : yAirI;
-          if (curvedY > finalFrontReachY[j]) {
-            finalFrontReachY[j] = curvedY;
-          }
-          if (isColumnExposed[i] && curvedY > lateralReachY[j]) {
-            lateralReachY[j] = curvedY;
-            hasLateralUndercut[j] = 1;
+          activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+          if (activeIntervals.length === 0) break;
+
+          const normX = distX / effectiveRx;
+          const curveDrop =
+            effectiveRz * Math.sqrt(Math.max(0, 1 - normX * normX));
+
+          if (targetSide === 'front') {
+            const rawCurvedY =
+              vReachI < yAirI
+                ? Math.max(vReachI, yAirI - curveDrop)
+                : yAirI;
+            // Expand along any contiguous etchable segment already reached by the wavefront
+            // (e.g., top poly rising slightly beneath a sloped mask ceiling) without crossing barriers.
+            if (vReachI < yAirI) {
+              const upperCurveY = yAirI + curveDrop;
+              for (const seg of columns[j].segments) {
+                if (isBarrierSegment(seg)) continue;
+                const overlapsReached = activeIntervals.some(([a, b]) => {
+                  const ovBot = Math.max(seg.yBottom, a);
+                  const ovTop = Math.min(seg.yTop, b);
+                  return ovTop > ovBot && rawCurvedY < ovTop;
+                });
+                if (overlapsReached) {
+                  const expandTop = Math.min(seg.yTop, upperCurveY);
+                  const expandBot = Math.max(seg.yBottom, rawCurvedY);
+                  activeIntervals = mergeInterval(activeIntervals, expandBot, expandTop);
+                }
+              }
+            }
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.max(winBot, rawCurvedY);
+              if (winTop === Infinity && reachY < finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
+            }
+          } else {
+            const rawCurvedY =
+              vReachI > yAirI
+                ? Math.min(vReachI, yAirI + curveDrop)
+                : yAirI;
+            if (vReachI > yAirI) {
+              const lowerCurveY = yAirI - curveDrop;
+              for (const seg of columns[j].segments) {
+                if (isBarrierSegment(seg)) continue;
+                const overlapsReached = activeIntervals.some(([a, b]) => {
+                  const ovBot = Math.max(seg.yBottom, a);
+                  const ovTop = Math.min(seg.yTop, b);
+                  return ovTop > ovBot && rawCurvedY > ovBot;
+                });
+                if (overlapsReached) {
+                  const expandBot = Math.max(seg.yBottom, lowerCurveY);
+                  const expandTop = Math.min(seg.yTop, rawCurvedY);
+                  activeIntervals = mergeInterval(activeIntervals, expandBot, expandTop);
+                }
+              }
+            }
+            for (const [winBot, winTop] of activeIntervals) {
+              const reachY = Math.min(winTop, rawCurvedY);
+              if (winBot === -Infinity && reachY > finalFrontReachY[j]) {
+                finalFrontReachY[j] = reachY;
+              }
+              addLateralWindow(j, winBot, winTop, reachY);
+            }
           }
         }
+      }
+    }
+  }
+
+  // Snapshot protected resist columns BEFORE Step 5 so burn-through never double-subtracts lateral undercut
+  const preMaskSegments: (MaterialSegment[] | undefined)[] = new Array(columns.length);
+  if (linkedRecipe && maskEtchTimeMin > 0) {
+    for (let j = 0; j < columns.length; j++) {
+      if (wasProtectedResistCol[j]) {
+        preMaskSegments[j] = columns[j].segments.map((s) => ({ ...s }));
       }
     }
   }
@@ -1686,23 +1896,21 @@ function applyEtchSide(
     if (col.segments.length === 0) continue;
 
     const targetReach = finalFrontReachY[j];
-    const ambientReach = openAmbientReachY[j];
-    const latReach = lateralReachY[j];
+    const latWindows = colLateralWindows[j];
+    const hasLatWindows = latWindows !== undefined && latWindows.length > 0;
     const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
 
     if (
       targetSide === 'front' &&
       targetReach >= surfaceY &&
-      ambientReach >= surfaceY &&
-      !hasLateralUndercut[j]
+      !hasLatWindows
     ) {
       continue;
     }
     if (
       targetSide === 'back' &&
       targetReach <= surfaceY &&
-      ambientReach <= surfaceY &&
-      !hasLateralUndercut[j]
+      !hasLatWindows
     ) {
       continue;
     }
@@ -1721,14 +1929,10 @@ function applyEtchSide(
         cfg?.etchType !== 'ashing' &&
         targetMatId !== seg.materialId
       ) {
+        blockedBelow = true;
         processedSegments.push(seg);
         continue;
       }
-
-      const isLaterallyExposed =
-        targetSide === 'front'
-          ? seg.yTop > ambientReach
-          : seg.yBottom < ambientReach;
 
       if (stopLayerId && seg.materialId === stopLayerId) {
         blockedBelow = true;
@@ -1743,30 +1947,67 @@ function applyEtchSide(
       }
 
       if (targetMatId !== 'all' && seg.materialId !== targetMatId) {
-        if (!isLaterallyExposed) {
-          blockedBelow = true;
-        }
+        blockedBelow = true;
         processedSegments.push(seg);
         continue;
       }
 
-      // When vertically blocked by an overlying hardmask cap, lateral undercut from adjacent
-      // exposed columns can still etch segments whose elevation meets the opening entry window.
-      const canUndercutBeneathCap =
-        hasLateralUndercut[j] &&
-        (targetSide === 'front'
-          ? ambientReach > seg.yBottom && latReach < seg.yTop
-          : ambientReach < seg.yTop && latReach > seg.yBottom);
+      if (blockedBelow) {
+        // Vertically blocked by an overlying mask, non-target layer, or etch stop:
+        // only lateral wavefront windows that survived all barriers up to this elevation can etch.
+        if (!hasLatWindows || !latWindows) {
+          processedSegments.push(seg);
+          continue;
+        }
 
-      const effectiveReach = blockedBelow
-        ? canUndercutBeneathCap
-          ? latReach
-          : isLaterallyExposed
-          ? ambientReach
-          : targetSide === 'front'
-          ? seg.yTop
-          : seg.yBottom
-        : targetReach;
+        let keptPieces: [number, number][] = [[seg.yBottom, seg.yTop]];
+        for (const w of latWindows) {
+          if (w.winBot >= seg.yTop || w.winTop <= seg.yBottom) continue;
+          const cutBot =
+            targetSide === 'front' ? Math.max(w.winBot, w.reachY) : w.winBot;
+          const cutTop =
+            targetSide === 'front' ? w.winTop : Math.min(w.winTop, w.reachY);
+          if (cutTop > cutBot) {
+            keptPieces = subtractBarrierInterval(keptPieces, cutBot, cutTop);
+            if (keptPieces.length === 0) break;
+          }
+        }
+
+        const origH = seg.yTop - seg.yBottom;
+        const keptH = keptPieces.reduce((sum, [a, b]) => sum + Math.max(0, b - a), 0);
+        const removed = origH - keptH;
+        if (removed > 0.5) {
+          etchedDelta[j] += removed;
+          if (targetSide === 'front') {
+            if (Number.isNaN(etchedTopY[j])) etchedTopY[j] = seg.yTop;
+            const lowestTop =
+              keptPieces.length > 0
+                ? keptPieces[keptPieces.length - 1][1]
+                : seg.yBottom;
+            etchedFloorY[j] = Math.max(seg.yBottom, lowestTop);
+          } else {
+            if (Number.isNaN(etchedTopY[j])) etchedTopY[j] = seg.yBottom;
+            const highestBot =
+              keptPieces.length > 0 ? keptPieces[0][0] : seg.yTop;
+            etchedFloorY[j] = Math.min(seg.yTop, highestBot);
+          }
+        }
+
+        const orderedPieces =
+          targetSide === 'front' ? [...keptPieces].reverse() : keptPieces;
+        for (const [pBot, pTop] of orderedPieces) {
+          if (pTop - pBot > 0.5) {
+            processedSegments.push({
+              ...seg,
+              yBottom: pBot,
+              yTop: pTop,
+            });
+          }
+        }
+        continue;
+      }
+
+      const effectiveReach = targetReach;
 
       if (targetSide === 'front') {
         if (effectiveReach < seg.yTop) {
@@ -1815,10 +2056,124 @@ function applyEtchSide(
       targetSide === 'front' ? processedSegments.reverse() : processedSegments;
   }
 
-  // 6. Record Bosch DRIE sidewall scallop geometry & re-entrant wall profiles for 2D polygon rendering
+  // Invalidate any stale pre-existing scallop/re-entrant walls whose shoulder was etched/re-shaped
+  if (scallopWalls && scallopWalls.length > 0) {
+    for (let wIdx = scallopWalls.length - 1; wIdx >= 0; wIdx--) {
+      const w = scallopWalls[wIdx];
+      if (w.targetSide !== targetSide) continue;
+      const shoulderCol = columns[w.colTop];
+      if (!shoulderCol || shoulderCol.segments.length === 0 || etchedDelta[w.colTop] > 5) {
+        scallopWalls.splice(wIdx, 1);
+      } else {
+        const surf = targetSide === 'front' ? getTopY(shoulderCol) : getBottomY(shoulderCol);
+        if (targetSide === 'front' ? surf <= w.yBot + 10 : surf >= w.yBot - 10) {
+          scallopWalls.splice(wIdx, 1);
+        }
+      }
+    }
+  }
+
+  // 6. Photoresist mask consumption (and burn-through clamping before sidewall wall generation)
+  if (linkedRecipe && maskEtchTimeMin > 0) {
+    const burnedThroughCols = applyPhotoresistMaskConsumption(
+      columns,
+      wasProtectedResistCol,
+      materials,
+      linkedRecipe,
+      maskEtchTimeMin,
+      targetSide,
+      targetMatId,
+      stopLayerId,
+      preMaskSegments
+    );
+
+    // If a mask burned completely through and lowered its substrate, ensure adjacent exposed
+    // tapered trench columns don't finish shallower than the burned-through shoulder.
+    if (isCrystallographic && burnedThroughCols.some(Boolean)) {
+      for (let i = 0; i < columns.length; i++) {
+        if (!isColumnExposed[i] || columns[i].segments.length === 0) continue;
+        let adjBurnY = targetSide === 'front' ? Infinity : -Infinity;
+        for (const neighbor of [i - 1, i + 1]) {
+          if (
+            neighbor >= 0 &&
+            neighbor < columns.length &&
+            burnedThroughCols[neighbor] &&
+            columns[neighbor].segments.length > 0
+          ) {
+            const ny =
+              targetSide === 'front'
+                ? getTopY(columns[neighbor])
+                : getBottomY(columns[neighbor]);
+            if (targetSide === 'front') {
+              if (ny < adjBurnY) adjBurnY = ny;
+            } else {
+              if (ny > adjBurnY) adjBurnY = ny;
+            }
+          }
+        }
+        const curY =
+          targetSide === 'front' ? getTopY(columns[i]) : getBottomY(columns[i]);
+        const needsClamp =
+          targetSide === 'front'
+            ? Number.isFinite(adjBurnY) && curY > adjBurnY + 0.5
+            : Number.isFinite(adjBurnY) && curY < adjBurnY - 0.5;
+        if (needsClamp) {
+          const orderedSegs =
+            targetSide === 'front'
+              ? [...columns[i].segments].reverse()
+              : [...columns[i].segments];
+          const nextSegs: MaterialSegment[] = [];
+          let hitBarrier = false;
+          for (let idxS = 0; idxS < orderedSegs.length; idxS++) {
+            const seg = orderedSegs[idxS];
+            if (hitBarrier || isBarrierSegment(seg)) {
+              hitBarrier = true;
+              nextSegs.push(seg);
+              continue;
+            }
+            if (targetSide === 'front') {
+              if (seg.yTop <= adjBurnY) {
+                nextSegs.push(seg);
+              } else if (seg.yBottom < adjBurnY) {
+                const removed = seg.yTop - adjBurnY;
+                etchedDelta[i] += removed;
+                etchedFloorY[i] = adjBurnY;
+                nextSegs.push({ ...seg, yTop: adjBurnY });
+              } else {
+                etchedDelta[i] += seg.yTop - seg.yBottom;
+                etchedFloorY[i] = seg.yBottom;
+              }
+            } else {
+              if (seg.yBottom >= adjBurnY) {
+                nextSegs.push(seg);
+              } else if (seg.yTop > adjBurnY) {
+                const removed = adjBurnY - seg.yBottom;
+                etchedDelta[i] += removed;
+                etchedFloorY[i] = adjBurnY;
+                nextSegs.push({ ...seg, yBottom: adjBurnY });
+              } else {
+                etchedDelta[i] += seg.yTop - seg.yBottom;
+                etchedFloorY[i] = seg.yTop;
+              }
+            }
+          }
+          columns[i].segments =
+            targetSide === 'front' ? nextSegs.reverse() : nextSegs;
+        }
+      }
+    }
+  }
+
+  // 7. Record Bosch DRIE sidewall scallops, re-entrant (> 90.5°) walls, and sub-column positive dry-etch taper (< 89.5°)
   const shouldEmitScallops =
-    cfg?.etchType === 'drie-bosch' && Boolean(cfg?.scallopEffect);
-  if ((shouldEmitScallops || isReentrant) && scallopWalls) {
+    rawEtchType === 'drie-bosch' && Boolean(cfg?.scallopEffect);
+  const isDryPosTaper =
+    (rawEtchType === 'rie' ||
+      rawEtchType === 'drie-bosch' ||
+      rawEtchType === 'ion-beam') &&
+    sidewallAngle < 89.5;
+
+  if ((shouldEmitScallops || isReentrant || isDryPosTaper) && scallopWalls) {
     const rawScallopDepth = shouldEmitScallops
       ? Math.max(5, Math.min(300, cfg?.scallopDepth ?? 45))
       : 0;
@@ -1828,6 +2183,18 @@ function applyEtchSide(
     const tanReentrantOverhang = isReentrant
       ? Math.tan(((Math.min(135, sidewallAngle) - 90) * Math.PI) / 180)
       : 0;
+
+    const hasEtchableInSpan = (
+      col: ColumnProfile,
+      spanBot: number,
+      spanTop: number
+    ): boolean => {
+      for (const seg of col.segments) {
+        if (Math.min(seg.yTop, spanTop) <= Math.max(seg.yBottom, spanBot) + 1) continue;
+        if (!isBarrierSegment(seg)) return true;
+      }
+      return false;
+    };
 
     let idx = 0;
     while (idx < columns.length) {
@@ -1845,28 +2212,38 @@ function applyEtchSide(
       // Left trench wall
       if (runStart > 0 && columns[runStart - 1].segments.length > 0) {
         const colTop = runStart - 1;
-        const yTopEntry = etchedTopY[runStart];
+        const colTopSurface =
+          targetSide === 'front'
+            ? getTopY(columns[colTop])
+            : getBottomY(columns[colTop]);
+        const yTopEntry =
+          targetSide === 'front'
+            ? Math.min(etchedTopY[runStart], colTopSurface)
+            : Math.max(etchedTopY[runStart], colTopSurface);
 
+        // Find the immediate local trench floor where the sidewall finishes descending
         let bestFloor = etchedFloorY[runStart];
-        for (let c = runStart; c <= mid; c++) {
+        let colBot = runStart;
+        let flatCount = 0;
+        for (let c = runStart + 1; c <= mid; c++) {
           if (Number.isNaN(etchedFloorY[c])) continue;
           if (
             targetSide === 'front'
-              ? etchedFloorY[c] < bestFloor
-              : etchedFloorY[c] > bestFloor
+              ? etchedFloorY[c] < bestFloor - 1.5
+              : etchedFloorY[c] > bestFloor + 1.5
           ) {
             bestFloor = etchedFloorY[c];
-          }
-        }
-
-        let colBot = runStart;
-        for (let c = runStart; c <= mid; c++) {
-          if (
-            !Number.isNaN(etchedFloorY[c]) &&
-            Math.abs(etchedFloorY[c] - bestFloor) <= 1.5
-          ) {
             colBot = c;
+            flatCount = 0;
+          } else if (
+            targetSide === 'front'
+              ? etchedFloorY[c] > bestFloor + 1.5
+              : etchedFloorY[c] < bestFloor - 1.5
+          ) {
             break;
+          } else {
+            flatCount++;
+            if (flatCount >= 2) break;
           }
         }
         const yBotFloor = etchedFloorY[colBot];
@@ -1874,52 +2251,97 @@ function applyEtchSide(
           targetSide === 'front' ? yTopEntry - yBotFloor : yBotFloor - yTopEntry;
         const shoulderStandsTaller =
           targetSide === 'front'
-            ? getTopY(columns[colTop]) > yBotFloor + 10
-            : getBottomY(columns[colTop]) < yBotFloor - 10;
+            ? colTopSurface > yBotFloor + 10
+            : colTopSurface < yBotFloor - 10;
 
         if (
           Number.isFinite(wallHeight) &&
           wallHeight > 15 &&
           shoulderStandsTaller
         ) {
-          // Measure solid width to the left to prevent adjacent trench self-intersection
+          const spanMin = Math.min(yTopEntry, yBotFloor);
+          const spanMax = Math.max(yTopEntry, yBotFloor);
+          const colTopEtchable = hasEtchableInSpan(columns[colTop], spanMin, spanMax);
+
+          // Measure solid etchable width to the left to prevent adjacent trench / narrow pillar self-intersection
           let solidLeftCols = 0;
-          for (let k = colTop; k >= 0; k--) {
-            if (etchedDelta[k] > 5 || columns[k].segments.length === 0) break;
+          let k = colTop;
+          for (; k >= 0; k--) {
+            if (
+              etchedDelta[k] > 5 ||
+              columns[k].segments.length === 0 ||
+              !hasEtchableInSpan(columns[k], spanMin, spanMax)
+            ) {
+              break;
+            }
             solidLeftCols++;
           }
+          const oppositeIsTrench =
+            k >= 0 && (etchedDelta[k] > 5 || columns[k].segments.length === 0);
           const solidLeftWidth = solidLeftCols * dx;
+          const budgetWidth = oppositeIsTrench
+            ? solidLeftWidth * 0.48
+            : solidLeftWidth * 0.92;
           const safeDepth = shouldEmitScallops
-            ? Math.min(rawScallopDepth, solidLeftWidth * 0.35)
+            ? Math.min(rawScallopDepth, budgetWidth * 0.35, wallHeight * 0.5)
             : 0;
 
           const baseMaskEdgeX = (colTop + 1) * dx;
+          const effectiveIsoDepth = Math.max(
+            wallHeight,
+            Math.min(baseDepthPerCol[colBot] || refDepthForScale, wallHeight * 2)
+          );
           const undercutShift = isReentrant
-            ? Math.min(
-                solidLeftWidth * 0.3,
-                wallHeight * Math.max(0, isotropy)
-              )
+            ? colTopEtchable
+              ? Math.min(
+                  budgetWidth * 0.35,
+                  effectiveIsoDepth * Math.max(0, isotropy)
+                )
+              : 0
             : 0;
-          const xTop = baseMaskEdgeX - undercutShift;
 
+          let xTop: number;
           let xBot: number;
+
           if (isReentrant) {
-            const maxAvailLeft = Math.max(
-              0,
-              solidLeftWidth - undercutShift - safeDepth - dx * 0.25
-            );
+            xTop = baseMaskEdgeX - undercutShift;
+            const maxAvailLeft = colTopEtchable
+              ? Math.max(0, budgetWidth - undercutShift - safeDepth - dx * 0.1)
+              : 0;
             const reentrantRun = Math.min(
               maxAvailLeft,
               wallHeight * tanReentrantOverhang
             );
             xBot = xTop - reentrantRun;
           } else if (sidewallAngle >= 89.5) {
+            xTop = baseMaskEdgeX;
             xBot = colBot === runStart ? xTop : colBot * dx;
           } else {
+            let maskEdgeCol = runStart;
+            for (let c = runStart; c <= runEnd; c++) {
+              if (isColumnExposed[c]) {
+                maskEdgeCol = c;
+                break;
+              }
+            }
+            const rawMaskEdgeX = maskEdgeCol * dx;
+            const nominalUndercut =
+              (baseDepthPerCol[maskEdgeCol] || wallHeight) * Math.max(0, isotropy);
+            const actualUndercut = colTopEtchable
+              ? Math.min(nominalUndercut, budgetWidth * 0.85)
+              : 0;
+            const minXTop = colTop * dx + dx * 0.1;
+            xTop = colTopEtchable
+              ? Math.min(rawMaskEdgeX, Math.max(minXTop, rawMaskEdgeX - actualUndercut))
+              : baseMaskEdgeX;
             xBot = Math.min((colBot + 1) * dx, xTop + wallHeight / tanPosAngle);
           }
 
-          if (safeDepth > 1 || (isReentrant && xTop - xBot > 1)) {
+          if (
+            safeDepth > 1 ||
+            (isReentrant && Math.abs(xTop - xBot) > 1) ||
+            (isDryPosTaper && Math.abs(xBot - xTop) > 1)
+          ) {
             scallopWalls.push({
               stepId: step.id,
               targetSide,
@@ -1941,28 +2363,37 @@ function applyEtchSide(
       // Right trench wall
       if (runEnd < columns.length - 1 && columns[runEnd + 1].segments.length > 0) {
         const colTop = runEnd + 1;
-        const yTopEntry = etchedTopY[runEnd];
+        const colTopSurface =
+          targetSide === 'front'
+            ? getTopY(columns[colTop])
+            : getBottomY(columns[colTop]);
+        const yTopEntry =
+          targetSide === 'front'
+            ? Math.min(etchedTopY[runEnd], colTopSurface)
+            : Math.max(etchedTopY[runEnd], colTopSurface);
 
         let bestFloor = etchedFloorY[runEnd];
-        for (let c = runEnd; c >= mid; c--) {
+        let colBot = runEnd;
+        let flatCount = 0;
+        for (let c = runEnd - 1; c >= mid; c--) {
           if (Number.isNaN(etchedFloorY[c])) continue;
           if (
             targetSide === 'front'
-              ? etchedFloorY[c] < bestFloor
-              : etchedFloorY[c] > bestFloor
+              ? etchedFloorY[c] < bestFloor - 1.5
+              : etchedFloorY[c] > bestFloor + 1.5
           ) {
             bestFloor = etchedFloorY[c];
-          }
-        }
-
-        let colBot = runEnd;
-        for (let c = runEnd; c >= mid; c--) {
-          if (
-            !Number.isNaN(etchedFloorY[c]) &&
-            Math.abs(etchedFloorY[c] - bestFloor) <= 1.5
-          ) {
             colBot = c;
+            flatCount = 0;
+          } else if (
+            targetSide === 'front'
+              ? etchedFloorY[c] > bestFloor + 1.5
+              : etchedFloorY[c] < bestFloor - 1.5
+          ) {
             break;
+          } else {
+            flatCount++;
+            if (flatCount >= 2) break;
           }
         }
         const yBotFloor = etchedFloorY[colBot];
@@ -1970,51 +2401,97 @@ function applyEtchSide(
           targetSide === 'front' ? yTopEntry - yBotFloor : yBotFloor - yTopEntry;
         const shoulderStandsTaller =
           targetSide === 'front'
-            ? getTopY(columns[colTop]) > yBotFloor + 10
-            : getBottomY(columns[colTop]) < yBotFloor - 10;
+            ? colTopSurface > yBotFloor + 10
+            : colTopSurface < yBotFloor - 10;
 
         if (
           Number.isFinite(wallHeight) &&
           wallHeight > 15 &&
           shoulderStandsTaller
         ) {
+          const spanMin = Math.min(yTopEntry, yBotFloor);
+          const spanMax = Math.max(yTopEntry, yBotFloor);
+          const colTopEtchable = hasEtchableInSpan(columns[colTop], spanMin, spanMax);
+
           let solidRightCols = 0;
-          for (let k = colTop; k < columns.length; k++) {
-            if (etchedDelta[k] > 5 || columns[k].segments.length === 0) break;
+          let k = colTop;
+          for (; k < columns.length; k++) {
+            if (
+              etchedDelta[k] > 5 ||
+              columns[k].segments.length === 0 ||
+              !hasEtchableInSpan(columns[k], spanMin, spanMax)
+            ) {
+              break;
+            }
             solidRightCols++;
           }
+          const oppositeIsTrench =
+            k < columns.length &&
+            (etchedDelta[k] > 5 || columns[k].segments.length === 0);
           const solidRightWidth = solidRightCols * dx;
+          const budgetWidth = oppositeIsTrench
+            ? solidRightWidth * 0.48
+            : solidRightWidth * 0.92;
           const safeDepth = shouldEmitScallops
-            ? Math.min(rawScallopDepth, solidRightWidth * 0.35)
+            ? Math.min(rawScallopDepth, budgetWidth * 0.35, wallHeight * 0.5)
             : 0;
 
           const baseMaskEdgeX = colTop * dx;
+          const effectiveIsoDepth = Math.max(
+            wallHeight,
+            Math.min(baseDepthPerCol[colBot] || refDepthForScale, wallHeight * 2)
+          );
           const undercutShift = isReentrant
-            ? Math.min(
-                solidRightWidth * 0.3,
-                wallHeight * Math.max(0, isotropy)
-              )
+            ? colTopEtchable
+              ? Math.min(
+                  budgetWidth * 0.35,
+                  effectiveIsoDepth * Math.max(0, isotropy)
+                )
+              : 0
             : 0;
-          const xTop = baseMaskEdgeX + undercutShift;
 
+          let xTop: number;
           let xBot: number;
+
           if (isReentrant) {
-            const maxAvailRight = Math.max(
-              0,
-              solidRightWidth - undercutShift - safeDepth - dx * 0.25
-            );
+            xTop = baseMaskEdgeX + undercutShift;
+            const maxAvailRight = colTopEtchable
+              ? Math.max(0, budgetWidth - undercutShift - safeDepth - dx * 0.1)
+              : 0;
             const reentrantRun = Math.min(
               maxAvailRight,
               wallHeight * tanReentrantOverhang
             );
             xBot = xTop + reentrantRun;
           } else if (sidewallAngle >= 89.5) {
+            xTop = baseMaskEdgeX;
             xBot = colBot === runEnd ? xTop : (colBot + 1) * dx;
           } else {
+            let maskEdgeCol = runEnd;
+            for (let c = runEnd; c >= runStart; c--) {
+              if (isColumnExposed[c]) {
+                maskEdgeCol = c;
+                break;
+              }
+            }
+            const rawMaskEdgeX = (maskEdgeCol + 1) * dx;
+            const nominalUndercut =
+              (baseDepthPerCol[maskEdgeCol] || wallHeight) * Math.max(0, isotropy);
+            const actualUndercut = colTopEtchable
+              ? Math.min(nominalUndercut, budgetWidth * 0.85)
+              : 0;
+            const maxXTop = (colTop + 1) * dx - dx * 0.1;
+            xTop = colTopEtchable
+              ? Math.max(rawMaskEdgeX, Math.min(maxXTop, rawMaskEdgeX + actualUndercut))
+              : baseMaskEdgeX;
             xBot = Math.max(colBot * dx, xTop - wallHeight / tanPosAngle);
           }
 
-          if (safeDepth > 1 || (isReentrant && xBot - xTop > 1)) {
+          if (
+            safeDepth > 1 ||
+            (isReentrant && Math.abs(xBot - xTop) > 1) ||
+            (isDryPosTaper && Math.abs(xTop - xBot) > 1)
+          ) {
             scallopWalls.push({
               stepId: step.id,
               targetSide,
@@ -2034,20 +2511,6 @@ function applyEtchSide(
       }
     }
   }
-
-  // 7. Photoresist mask consumption (and optional burn-through) from linked Etch Rate Library recipe
-  if (linkedRecipe && maskEtchTimeMin > 0) {
-    applyPhotoresistMaskConsumption(
-      columns,
-      wasProtectedResistCol,
-      materials,
-      linkedRecipe,
-      maskEtchTimeMin,
-      targetSide,
-      targetMatId,
-      stopLayerId
-    );
-  }
 }
 
 function applyPhotoresistMaskConsumption(
@@ -2058,82 +2521,124 @@ function applyPhotoresistMaskConsumption(
   maskEtchTimeMin: number,
   targetSide: 'front' | 'back',
   targetMatId: string,
-  stopLayerId?: string
-): void {
-  if (maskEtchTimeMin <= 0) return;
+  stopLayerId?: string,
+  preMaskSegments?: (MaterialSegment[] | undefined)[]
+): Uint8Array {
+  const burnedThroughCols = new Uint8Array(columns.length);
+  if (maskEtchTimeMin <= 0) return burnedThroughCols;
 
   for (let j = 0; j < columns.length; j++) {
     if (!wasProtectedResistCol[j]) continue;
     const col = columns[j];
     if (col.segments.length === 0) continue;
 
-    const orderedSegments =
-      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
-    const remainingSegments: MaterialSegment[] = [];
+    // 1. Compute resist consumption and post-depletion vertical burn-through reach from pre-etch stack
+    const refSegs = preMaskSegments?.[j] ?? col.segments;
+    const orderedRef =
+      targetSide === 'front' ? [...refSegs].reverse() : [...refSegs];
     let remTime = maskEtchTimeMin;
     let maskDepleted = false;
+    let burnThroughReachY =
+      targetSide === 'front' ? getTopY(col) : getBottomY(col);
 
-    for (const seg of orderedSegments) {
-      if (remTime <= 0) {
-        remainingSegments.push(seg);
-        continue;
-      }
-
+    for (const seg of orderedRef) {
+      if (remTime <= 0) break;
       const mat = getMaterialById(materials, seg.materialId);
       const isResist = mat.category === 'photoresist';
-
       if (!maskDepleted && !isResist) {
         remTime = 0;
-        remainingSegments.push(seg);
-        continue;
+        break;
       }
-
       if (maskDepleted) {
         if (stopLayerId && seg.materialId === stopLayerId) {
           remTime = 0;
-          remainingSegments.push(seg);
-          continue;
+          break;
         }
         if (targetMatId !== 'all' && seg.materialId !== targetMatId) {
           remTime = 0;
-          remainingSegments.push(seg);
-          continue;
+          break;
         }
       }
-
       const rate = getEtchRateNmMin(recipe, seg.materialId);
       if (rate <= 0) {
         remTime = 0;
+        break;
+      }
+      const segH = seg.yTop - seg.yBottom;
+      if (segH <= 0) continue;
+      const timeToClear = segH / rate;
+      if (remTime >= timeToClear) {
+        remTime -= timeToClear;
+        if (isResist) maskDepleted = true;
+        burnThroughReachY = targetSide === 'front' ? seg.yBottom : seg.yTop;
+      } else {
+        const loss = remTime * rate;
+        remTime = 0;
+        burnThroughReachY =
+          targetSide === 'front' ? seg.yTop - loss : seg.yBottom + loss;
+      }
+    }
+
+    // 2. Apply resist thinning & non-double-counted burn-through reach onto actual post-Step-5 column
+    const orderedActual =
+      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+    const remainingSegments: MaterialSegment[] = [];
+    let resistRemTime = maskEtchTimeMin;
+
+    for (const seg of orderedActual) {
+      const mat = getMaterialById(materials, seg.materialId);
+      const isResist = mat.category === 'photoresist';
+
+      if (isResist) {
+        if (resistRemTime <= 0) {
+          remainingSegments.push(seg);
+          continue;
+        }
+        const rate = getEtchRateNmMin(recipe, seg.materialId);
+        if (rate <= 0) {
+          resistRemTime = 0;
+          remainingSegments.push(seg);
+          continue;
+        }
+        const segH = seg.yTop - seg.yBottom;
+        const timeToClear = segH / rate;
+        if (resistRemTime >= timeToClear) {
+          resistRemTime -= timeToClear;
+          // Resist segment completely consumed
+        } else {
+          const loss = resistRemTime * rate;
+          resistRemTime = 0;
+          if (targetSide === 'front') {
+            if (seg.yTop - loss > seg.yBottom + 0.5) {
+              remainingSegments.push({ ...seg, yTop: seg.yTop - loss });
+            }
+          } else {
+            if (seg.yBottom + loss < seg.yTop - 0.5) {
+              remainingSegments.push({ ...seg, yBottom: seg.yBottom + loss });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (!maskDepleted) {
         remainingSegments.push(seg);
         continue;
       }
 
-      const segH = seg.yTop - seg.yBottom;
-      if (segH <= 0) continue;
-      const timeToClear = segH / rate;
-
-      if (remTime >= timeToClear) {
-        remTime -= timeToClear;
-        if (isResist) {
-          maskDepleted = true;
+      burnedThroughCols[j] = 1;
+      // Only clamp non-resist segments that still extend past burnThroughReachY (avoid double-counting undercut)
+      if (targetSide === 'front') {
+        if (seg.yTop <= burnThroughReachY) {
+          remainingSegments.push(seg);
+        } else if (seg.yBottom < burnThroughReachY - 0.5) {
+          remainingSegments.push({ ...seg, yTop: burnThroughReachY });
         }
       } else {
-        const loss = remTime * rate;
-        remTime = 0;
-        if (targetSide === 'front') {
-          if (seg.yTop - loss > seg.yBottom + 0.5) {
-            remainingSegments.push({
-              ...seg,
-              yTop: seg.yTop - loss,
-            });
-          }
-        } else {
-          if (seg.yBottom + loss < seg.yTop - 0.5) {
-            remainingSegments.push({
-              ...seg,
-              yBottom: seg.yBottom + loss,
-            });
-          }
+        if (seg.yBottom >= burnThroughReachY) {
+          remainingSegments.push(seg);
+        } else if (seg.yTop > burnThroughReachY + 0.5) {
+          remainingSegments.push({ ...seg, yBottom: burnThroughReachY });
         }
       }
     }
@@ -2141,17 +2646,51 @@ function applyPhotoresistMaskConsumption(
     col.segments =
       targetSide === 'front' ? remainingSegments.reverse() : remainingSegments;
   }
+
+  return burnedThroughCols;
 }
 
 /**
  * Handles Resist Strip, Metal Lift-off, and Sacrificial Layer Release
  * respecting front, back, or both sides.
  */
+function pruneWallsAfterStrip(
+  columns: ColumnProfile[],
+  scallopWalls?: ScallopWall[]
+): void {
+  if (!scallopWalls || scallopWalls.length === 0) return;
+  for (let i = scallopWalls.length - 1; i >= 0; i--) {
+    const w = scallopWalls[i];
+    const col = columns[w.colTop];
+    if (!col || col.segments.length === 0) {
+      scallopWalls.splice(i, 1);
+      continue;
+    }
+    const surf = w.targetSide === 'front' ? getTopY(col) : getBottomY(col);
+    if (w.targetSide === 'front') {
+      if (surf <= w.yBot + 10) {
+        scallopWalls.splice(i, 1);
+      } else if (surf < w.yTop - 0.5) {
+        w.xTop = evalWallXAtY(w, surf);
+        w.yTop = surf;
+      }
+    } else {
+      if (surf >= w.yBot - 10) {
+        scallopWalls.splice(i, 1);
+      } else if (surf > w.yTop + 0.5) {
+        w.xTop = evalWallXAtY(w, surf);
+        w.yTop = surf;
+      }
+    }
+  }
+}
+
 function applyStripOrLiftoff(
   columns: ColumnProfile[],
   step: ProcessStep,
   materials: Material[],
-  side: 'front' | 'back' | 'both'
+  side: 'front' | 'back' | 'both',
+  scallopWalls?: ScallopWall[]
 ): void {
   const cfg = step.strip;
   const stripType =
@@ -2167,6 +2706,7 @@ function applyStripOrLiftoff(
         return seg.side !== 'back';
       });
     }
+    pruneWallsAfterStrip(columns, scallopWalls);
     return;
   }
 
@@ -2210,6 +2750,7 @@ function applyStripOrLiftoff(
         col.segments = keptReversed.reverse();
       }
     }
+    pruneWallsAfterStrip(columns, scallopWalls);
     return;
   }
 
@@ -2223,6 +2764,7 @@ function applyStripOrLiftoff(
       return seg.side !== 'back';
     });
   }
+  pruneWallsAfterStrip(columns, scallopWalls);
 }
 
 /**
@@ -2231,7 +2773,8 @@ function applyStripOrLiftoff(
 function applyCmpSide(
   columns: ColumnProfile[],
   step: ProcessStep,
-  targetSide: 'front' | 'back'
+  targetSide: 'front' | 'back',
+  scallopWalls?: ScallopWall[]
 ): void {
   const cfg = step.cmp;
   const mode = cfg?.mode ?? 'polish-depth';
@@ -2280,6 +2823,20 @@ function applyCmpSide(
       }
       col.segments = newSegs;
     }
+    if (scallopWalls && scallopWalls.length > 0) {
+      for (let i = scallopWalls.length - 1; i >= 0; i--) {
+        const w = scallopWalls[i];
+        if (w.targetSide !== 'front') continue;
+        if (polishPlaneY < w.yTop - 0.5) {
+          if (polishPlaneY <= w.yBot + 10) {
+            scallopWalls.splice(i, 1);
+          } else {
+            w.xTop = evalWallXAtY(w, polishPlaneY);
+            w.yTop = polishPlaneY;
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -2326,6 +2883,20 @@ function applyCmpSide(
       }
     }
     col.segments = newSegs;
+  }
+  if (scallopWalls && scallopWalls.length > 0) {
+    for (let i = scallopWalls.length - 1; i >= 0; i--) {
+      const w = scallopWalls[i];
+      if (w.targetSide !== 'back') continue;
+      if (polishPlaneY > w.yTop + 0.5) {
+        if (polishPlaneY >= w.yBot - 10) {
+          scallopWalls.splice(i, 1);
+        } else {
+          w.xTop = evalWallXAtY(w, polishPlaneY);
+          w.yTop = polishPlaneY;
+        }
+      }
+    }
   }
 }
 
@@ -2936,8 +3507,17 @@ export function buildRenderPolygons(
     const leftEdgeWall = scallopWalls.find(
       (w) =>
         w.wallSide === 'right' &&
-        (w.colTop === reg.startCol || Math.abs(w.xTop - xStart) < dx * 0.6) &&
-        (w.isReentrant || Math.abs(w.xBot - xStart) < dx * 0.6) &&
+        (w.colTop === reg.startCol ||
+          (w.targetSide === 'front' &&
+            reg.startCol > w.colBot &&
+            reg.endCol >= w.colTop &&
+            reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
+            reg.bottomYs[0] < w.yTop - 5) ||
+          (w.targetSide === 'back' &&
+            reg.startCol > w.colBot &&
+            reg.endCol >= w.colTop &&
+            reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
+            reg.topYs[0] > w.yTop + 5)) &&
         Math.min(reg.topYs[0], Math.max(w.yTop, w.yBot)) -
           Math.max(reg.bottomYs[0], Math.min(w.yTop, w.yBot)) >
           5
@@ -2945,20 +3525,54 @@ export function buildRenderPolygons(
 
     let leftTopTrimX = -Infinity;
     let leftBottomTrimX = -Infinity;
+    let topStartIdx = 0;
     if (leftEdgeWall) {
-      const yMinWall = Math.min(leftEdgeWall.yTop, leftEdgeWall.yBot);
-      const yMaxWall = Math.max(leftEdgeWall.yTop, leftEdgeWall.yBot);
-      const yA = Math.max(reg.bottomYs[0], yMinWall);
-      const yB = Math.min(reg.topYs[0], yMaxWall);
-      if (yA > reg.bottomYs[0] + 0.5) {
-        pts.push({ x: xStart, y: reg.bottomYs[0] });
-      }
-      pts.push(...sampleScallopWallPoints(leftEdgeWall, yA, yB, true));
-      leftBottomTrimX = evalWallXAtY(leftEdgeWall, yA);
-      leftTopTrimX = evalWallXAtY(leftEdgeWall, yB);
-      if (yB < reg.topYs[0] - 0.5) {
-        pts.push({ x: xStart, y: reg.topYs[0] });
-        leftTopTrimX = -Infinity;
+      const spansPartialRightWall =
+        leftEdgeWall.colTop > reg.startCol && leftEdgeWall.colBot < reg.startCol;
+      const topLocalIdx = Math.max(0, leftEdgeWall.colTop - reg.startCol);
+
+      if (leftEdgeWall.targetSide === 'front' && spansPartialRightWall) {
+        const yA = Math.max(leftEdgeWall.yBot, reg.bottomYs[0]);
+        const yB = Math.min(leftEdgeWall.yTop, reg.topYs[topLocalIdx]);
+        const xWallBot = evalWallXAtY(leftEdgeWall, yA);
+        if (yA > reg.bottomYs[0] + 0.5) {
+          pts.push({ x: xWallBot, y: reg.bottomYs[0] });
+        }
+        pts.push(...sampleScallopWallPoints(leftEdgeWall, yA, yB, true));
+        leftBottomTrimX = xWallBot;
+        leftTopTrimX = evalWallXAtY(leftEdgeWall, yB);
+        topStartIdx = topLocalIdx;
+      } else if (
+        leftEdgeWall.targetSide === 'back' &&
+        (spansPartialRightWall ||
+          (reg.startCol === leftEdgeWall.colTop && reg.startCol > leftEdgeWall.colBot))
+      ) {
+        // Backside right wall exiting top/left of this partial region is traced upward by
+        // backRightWall in the bottom loop, ending at yEnd on the top or left boundary.
+        const yEnd = Math.min(leftEdgeWall.yBot, reg.topYs[0]);
+        if (yEnd < reg.topYs[0] - 0.5) {
+          pts.push({ x: xStart, y: yEnd });
+          pts.push({ x: xStart, y: reg.topYs[0] });
+        } else {
+          const xEndTop = evalWallXAtY(leftEdgeWall, reg.topYs[0]);
+          pts.push({ x: xEndTop, y: reg.topYs[0] });
+          leftTopTrimX = xEndTop;
+        }
+      } else {
+        const yMinWall = Math.min(leftEdgeWall.yTop, leftEdgeWall.yBot);
+        const yMaxWall = Math.max(leftEdgeWall.yTop, leftEdgeWall.yBot);
+        const yA = Math.max(reg.bottomYs[0], yMinWall);
+        const yB = Math.min(reg.topYs[0], yMaxWall);
+        if (yA > reg.bottomYs[0] + 0.5) {
+          pts.push({ x: xStart, y: reg.bottomYs[0] });
+        }
+        pts.push(...sampleScallopWallPoints(leftEdgeWall, yA, yB, true));
+        leftBottomTrimX = evalWallXAtY(leftEdgeWall, yA);
+        leftTopTrimX = evalWallXAtY(leftEdgeWall, yB);
+        if (yB < reg.topYs[0] - 0.5) {
+          pts.push({ x: xStart, y: reg.topYs[0] });
+          leftTopTrimX = -Infinity;
+        }
       }
     } else {
       pts.push({ x: xStart, y: reg.bottomYs[0] });
@@ -2970,8 +3584,7 @@ export function buildRenderPolygons(
     const rightEdgeWall = scallopWalls.find(
       (w) =>
         w.wallSide === 'left' &&
-        (w.colTop === reg.endCol || Math.abs(w.xTop - xEnd) < dx * 0.6) &&
-        (w.isReentrant || Math.abs(w.xBot - xEnd) < dx * 0.6) &&
+        w.colTop === reg.endCol &&
         Math.min(reg.topYs[lastIdx], Math.max(w.yTop, w.yBot)) -
           Math.max(reg.bottomYs[lastIdx], Math.min(w.yTop, w.yBot)) >
           5
@@ -2979,7 +3592,9 @@ export function buildRenderPolygons(
 
     // Top surface left to right
     let minTopXAllowed = leftTopTrimX;
-    for (let i = 0; i < reg.topYs.length; i++) {
+    let handledRightEdgeByWall = false;
+    let botStartTrimMaxX = Infinity;
+    for (let i = topStartIdx; i < reg.topYs.length; i++) {
       const colIdx = reg.startCol + i;
 
       // Check for frontside left trench wall starting at colTop
@@ -2988,29 +3603,57 @@ export function buildRenderPolygons(
           w.targetSide === 'front' &&
           w.wallSide === 'left' &&
           w.colTop === colIdx &&
-          reg.endCol >= w.colBot &&
           reg.topYs[i] > w.yBot + 5 &&
           reg.bottomYs[i] < w.yTop - 5
       );
       if (frontLeftWall) {
         const yStart = Math.min(frontLeftWall.yTop, reg.topYs[i]);
-        const botLocalIdx = frontLeftWall.colBot - reg.startCol;
-        const yEnd = Math.max(frontLeftWall.yBot, reg.topYs[botLocalIdx]);
-        if (yStart - yEnd > 5) {
-          const xWallStart = evalWallXAtY(frontLeftWall, yStart);
-          while (
-            pts.length > 2 &&
-            pts[pts.length - 1].x >= xWallStart - 0.1 &&
-            Math.abs(pts[pts.length - 1].y - yStart) < 5
-          ) {
-            pts.pop();
+        if (reg.endCol >= frontLeftWall.colBot) {
+          const botLocalIdx = frontLeftWall.colBot - reg.startCol;
+          const yEnd = Math.max(frontLeftWall.yBot, reg.topYs[botLocalIdx]);
+          if (yStart - yEnd > 5) {
+            const xWallStart = evalWallXAtY(frontLeftWall, yStart);
+            while (
+              pts.length > 2 &&
+              pts[pts.length - 1].x >= xWallStart - 0.1 &&
+              Math.abs(pts[pts.length - 1].y - yStart) < 5
+            ) {
+              pts.pop();
+            }
+            const wallPts = sampleScallopWallPoints(frontLeftWall, yStart, yEnd, true);
+            if (wallPts.length > 0) {
+              pts.push(...wallPts);
+              if (reg.topYs[botLocalIdx] < frontLeftWall.yBot - 1) {
+                pts.push({ x: frontLeftWall.xBot, y: reg.topYs[botLocalIdx] });
+              }
+              minTopXAllowed = -Infinity;
+              i = Math.max(i, botLocalIdx - 1);
+              continue;
+            }
           }
-          const wallPts = sampleScallopWallPoints(frontLeftWall, yStart, yEnd, true);
-          if (wallPts.length > 0) {
-            pts.push(...wallPts);
-            minTopXAllowed = -Infinity;
-            i = Math.max(i, botLocalIdx - 1);
-            continue;
+        } else {
+          // Wall exits through the bottom / end of this partial upper region (multi-layer or through-wafer)
+          const yEnd = Math.max(frontLeftWall.yBot, reg.bottomYs[lastIdx]);
+          if (yStart - yEnd > 5) {
+            const xWallStart = evalWallXAtY(frontLeftWall, yStart);
+            while (
+              pts.length > 2 &&
+              pts[pts.length - 1].x >= xWallStart - 0.1 &&
+              Math.abs(pts[pts.length - 1].y - yStart) < 5
+            ) {
+              pts.pop();
+            }
+            const wallPts = sampleScallopWallPoints(frontLeftWall, yStart, yEnd, true);
+            if (wallPts.length > 0) {
+              pts.push(...wallPts);
+              const xWallEnd = evalWallXAtY(frontLeftWall, yEnd);
+              if (yEnd > reg.bottomYs[lastIdx] + 0.5) {
+                pts.push({ x: xWallEnd, y: reg.bottomYs[lastIdx] });
+              }
+              botStartTrimMaxX = xWallEnd;
+              handledRightEdgeByWall = true;
+              break;
+            }
           }
         }
       }
@@ -3047,8 +3690,11 @@ export function buildRenderPolygons(
     }
 
     // Right boundary edge (x = (reg.endCol + 1) * dx): goes top -> bottom
-    let rightBottomTrimX = Infinity;
-    if (rightEdgeWall) {
+    let rightBottomTrimX = botStartTrimMaxX;
+    let botStartIdx = lastIdx;
+    if (handledRightEdgeByWall) {
+      // Right edge already traced seamlessly via frontLeftWall exit
+    } else if (rightEdgeWall) {
       const yMinWall = Math.min(rightEdgeWall.yTop, rightEdgeWall.yBot);
       const yMaxWall = Math.max(rightEdgeWall.yTop, rightEdgeWall.yBot);
       const yA = Math.min(reg.topYs[lastIdx], yMaxWall);
@@ -3071,12 +3717,51 @@ export function buildRenderPolygons(
         rightBottomTrimX = Infinity;
       }
     } else {
-      pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+      // Check if a backside left wall exits cleanly through the right edge of a partial backside region
+      const partialBackLeftRightEdge = scallopWalls.find(
+        (w) =>
+          w.targetSide === 'back' &&
+          w.wallSide === 'left' &&
+          reg.endCol < w.colBot &&
+          reg.startCol <= w.colTop &&
+          reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
+          reg.topYs[lastIdx] > w.yTop + 5
+      );
+      if (partialBackLeftRightEdge) {
+        const yB = Math.min(partialBackLeftRightEdge.yBot, reg.topYs[lastIdx]);
+        const xWallTop = evalWallXAtY(partialBackLeftRightEdge, yB);
+        while (
+          pts.length > 2 &&
+          pts[pts.length - 1].x >= xWallTop - 0.1 &&
+          Math.abs(pts[pts.length - 1].y - yB) < 5
+        ) {
+          pts.pop();
+        }
+        if (yB < reg.topYs[lastIdx] - 0.5) {
+          pts.push({ x: xEnd, y: reg.topYs[lastIdx] });
+        }
+        const yBotClip = Math.max(
+          partialBackLeftRightEdge.yTop,
+          reg.bottomYs[partialBackLeftRightEdge.colTop - reg.startCol]
+        );
+        pts.push(
+          ...sampleScallopWallPoints(
+            partialBackLeftRightEdge,
+            yB,
+            yBotClip,
+            true
+          )
+        );
+        rightBottomTrimX = evalWallXAtY(partialBackLeftRightEdge, yBotClip);
+        botStartIdx = partialBackLeftRightEdge.colTop - reg.startCol;
+      } else {
+        pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+      }
     }
 
     // Bottom surface right to left
     let maxBotXAllowed = rightBottomTrimX;
-    for (let i = lastIdx; i >= 0; i--) {
+    for (let i = botStartIdx; i >= 0; i--) {
       const colIdx = reg.startCol + i;
 
       // Backside right trench wall (iterating right-to-left: meets colTop first, goes up to colBot)
@@ -3085,28 +3770,53 @@ export function buildRenderPolygons(
           w.targetSide === 'back' &&
           w.wallSide === 'right' &&
           w.colTop === colIdx &&
-          reg.startCol <= w.colBot &&
-          reg.bottomYs[w.colBot - reg.startCol] > w.yTop + 5
+          reg.topYs[i] > w.yTop + 5 &&
+          reg.bottomYs[i] < w.yBot - 5
       );
       if (backRightWall) {
-        const botLocalIdx = backRightWall.colBot - reg.startCol;
         const yStart = Math.max(backRightWall.yTop, reg.bottomYs[i]);
-        const yEnd = Math.min(backRightWall.yBot, reg.bottomYs[botLocalIdx]);
-        if (yEnd - yStart > 5) {
-          const xWallStart = evalWallXAtY(backRightWall, yStart);
-          while (
-            pts.length > 2 &&
-            pts[pts.length - 1].x <= xWallStart + 0.1 &&
-            Math.abs(pts[pts.length - 1].y - yStart) < 5
-          ) {
-            pts.pop();
+        if (reg.startCol <= backRightWall.colBot) {
+          const botLocalIdx = backRightWall.colBot - reg.startCol;
+          const yEnd = Math.min(backRightWall.yBot, reg.bottomYs[botLocalIdx]);
+          if (yEnd - yStart > 5) {
+            const xWallStart = evalWallXAtY(backRightWall, yStart);
+            while (
+              pts.length > 2 &&
+              pts[pts.length - 1].x <= xWallStart + 0.1 &&
+              Math.abs(pts[pts.length - 1].y - yStart) < 5
+            ) {
+              pts.pop();
+            }
+            const wallPts = sampleScallopWallPoints(backRightWall, yStart, yEnd, true);
+            if (wallPts.length > 0) {
+              pts.push(...wallPts);
+              if (reg.bottomYs[botLocalIdx] > backRightWall.yBot + 1) {
+                pts.push({ x: backRightWall.xBot, y: reg.bottomYs[botLocalIdx] });
+              }
+              maxBotXAllowed = Infinity;
+              i = Math.min(i, botLocalIdx + 1);
+              continue;
+            }
           }
-          const wallPts = sampleScallopWallPoints(backRightWall, yStart, yEnd, true);
-          if (wallPts.length > 0) {
-            pts.push(...wallPts);
-            maxBotXAllowed = Infinity;
-            i = Math.min(i, botLocalIdx + 1);
-            continue;
+        } else {
+          const yEnd = Math.min(backRightWall.yBot, reg.topYs[0]);
+          if (yEnd - yStart > 5) {
+            const xWallStart = evalWallXAtY(backRightWall, yStart);
+            while (
+              pts.length > 2 &&
+              pts[pts.length - 1].x <= xWallStart + 0.1 &&
+              Math.abs(pts[pts.length - 1].y - yStart) < 5
+            ) {
+              pts.pop();
+            }
+            const wallPts = sampleScallopWallPoints(backRightWall, yStart, yEnd, true);
+            if (wallPts.length > 0) {
+              pts.push(...wallPts);
+              if (yEnd < reg.topYs[0] - 0.5) {
+                pts.push({ x: xStart, y: yEnd });
+              }
+              break;
+            }
           }
         }
       }
@@ -3130,6 +3840,67 @@ export function buildRenderPolygons(
             pts.push(...wallPts);
             maxBotXAllowed = evalWallXAtY(backLeftWall, yEnd);
             i = Math.min(i, topLocalIdx + 1);
+            continue;
+          }
+        }
+      }
+
+      // Hug underlying frontside re-entrant trench walls cleanly when filling/coating a cavity
+      const underlyingFrontLeft = scallopWalls.find(
+        (w) =>
+          w.targetSide === 'front' &&
+          w.wallSide === 'left' &&
+          w.isReentrant &&
+          w.stepId !== reg.stepId &&
+          w.colBot === colIdx &&
+          reg.startCol <= w.colTop &&
+          reg.bottomYs[w.colTop - reg.startCol] >= w.yTop - 5 &&
+          reg.bottomYs[i] <= w.yBot + 5
+      );
+      if (underlyingFrontLeft) {
+        const topLocalIdx = underlyingFrontLeft.colTop - reg.startCol;
+        const yStart = Math.max(underlyingFrontLeft.yBot, reg.bottomYs[i]);
+        const yEnd = Math.min(underlyingFrontLeft.yTop, reg.bottomYs[topLocalIdx]);
+        if (yEnd - yStart > 5) {
+          const wallPts = sampleScallopWallPoints(underlyingFrontLeft, yStart, yEnd, true);
+          if (wallPts.length > 0) {
+            pts.push(...wallPts);
+            maxBotXAllowed = evalWallXAtY(underlyingFrontLeft, yEnd);
+            i = Math.min(i, topLocalIdx + 1);
+            continue;
+          }
+        }
+      }
+
+      const underlyingFrontRight = scallopWalls.find(
+        (w) =>
+          w.targetSide === 'front' &&
+          w.wallSide === 'right' &&
+          w.isReentrant &&
+          w.stepId !== reg.stepId &&
+          w.colTop === colIdx &&
+          reg.startCol <= w.colBot &&
+          reg.bottomYs[i] >= w.yTop - 5 &&
+          reg.bottomYs[w.colBot - reg.startCol] <= w.yBot + 5
+      );
+      if (underlyingFrontRight) {
+        const botLocalIdx = underlyingFrontRight.colBot - reg.startCol;
+        const yStart = Math.min(underlyingFrontRight.yTop, reg.bottomYs[i]);
+        const yEnd = Math.max(underlyingFrontRight.yBot, reg.bottomYs[botLocalIdx]);
+        if (yStart - yEnd > 5) {
+          const xWallStart = evalWallXAtY(underlyingFrontRight, yStart);
+          while (
+            pts.length > 2 &&
+            pts[pts.length - 1].x <= xWallStart + 0.1 &&
+            Math.abs(pts[pts.length - 1].y - yStart) < 5
+          ) {
+            pts.pop();
+          }
+          const wallPts = sampleScallopWallPoints(underlyingFrontRight, yStart, yEnd, true);
+          if (wallPts.length > 0) {
+            pts.push(...wallPts);
+            maxBotXAllowed = Infinity;
+            i = Math.min(i, botLocalIdx + 1);
             continue;
           }
         }

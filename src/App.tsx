@@ -121,6 +121,13 @@ export default function App() {
     typeof window !== 'undefined' ? window.innerWidth >= 1024 : true
   );
   const [isMaskTrackMinimized, setIsMaskTrackMinimized] = useState<boolean>(false);
+  const [showFinalInset, setShowFinalInset] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('microflow_show_final_inset') === 'true';
+    } catch {
+      return false;
+    }
+  });
 
   // Save to localStorage on changes
   useEffect(() => {
@@ -138,6 +145,14 @@ export default function App() {
       // ignore
     }
   }, [thicknessUnit]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('microflow_show_final_inset', String(showFinalInset));
+    } catch {
+      // ignore
+    }
+  }, [showFinalInset]);
 
   // Handle Playback animation with adjustable speed
   useEffect(() => {
@@ -185,6 +200,27 @@ export default function App() {
   const activePolygons = useMemo(() => {
     return buildRenderPolygons(activeMesh, flow.materials);
   }, [activeMesh, flow.materials]);
+
+  // Identify the last enabled process step for optional Final Step Inset preview
+  const finalEnabledStepIndex = useMemo(() => {
+    for (let i = flow.steps.length - 1; i >= 0; i--) {
+      if (flow.steps[i].enabled !== false) return i;
+    }
+    return -1;
+  }, [flow.steps]);
+
+  const isIntermediateStep =
+    finalEnabledStepIndex >= 0 && activeStepIndex < finalEnabledStepIndex;
+
+  const finalMesh = useMemo(() => {
+    if (!showFinalInset || !isIntermediateStep) return null;
+    return simulateCrossSection(flow, finalEnabledStepIndex);
+  }, [showFinalInset, isIntermediateStep, flow, finalEnabledStepIndex]);
+
+  const finalPolygons = useMemo(() => {
+    if (!finalMesh) return [];
+    return buildRenderPolygons(finalMesh, flow.materials);
+  }, [finalMesh, flow.materials]);
 
   const isSubstrateActive = activeStepIndex === -1;
   const activeStep = !isSubstrateActive ? flow.steps[activeStepIndex] : undefined;
@@ -569,6 +605,24 @@ export default function App() {
                   : activeStep?.title
               }
               activeStepSide={isSubstrateActive ? undefined : activeStep?.side}
+              finalMesh={finalMesh}
+              finalPolygons={finalPolygons}
+              finalStepNumber={
+                finalEnabledStepIndex >= 0 ? finalEnabledStepIndex + 1 : undefined
+              }
+              finalStepTitle={
+                finalEnabledStepIndex >= 0
+                  ? flow.steps[finalEnabledStepIndex]?.title
+                  : undefined
+              }
+              showFinalInset={showFinalInset}
+              onToggleFinalInset={() => setShowFinalInset((prev) => !prev)}
+              onSelectFinalStep={() => {
+                if (finalEnabledStepIndex >= 0) {
+                  setActiveStepIndex(finalEnabledStepIndex);
+                  setIsPlaying(false);
+                }
+              }}
             />
           </div>
         </main>

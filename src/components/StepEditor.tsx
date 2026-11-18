@@ -2111,6 +2111,15 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             sidewallAngle:
                               nextEtchType === 'wet-koh'
                                 ? 54.74
+                                : nextEtchType === 'wet-isotropic' || nextEtchType === 'ashing'
+                                ? 90
+                                : nextEtchType === 'ion-beam'
+                                ? Math.min(
+                                    90,
+                                    step.etch?.sidewallAngle === 54.74
+                                      ? 85
+                                      : step.etch?.sidewallAngle ?? 85
+                                  )
                                 : step.etch?.sidewallAngle === 54.74
                                 ? 90
                                 : step.etch?.sidewallAngle ?? 90,
@@ -2219,13 +2228,15 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   />
                 </div>
 
-                {/* Sidewall Taper Angle for RIE and DRIE */}
-                {(['rie', 'drie-bosch'].includes(step.etch?.etchType || 'rie')) && (
+                {/* Sidewall Taper Angle for RIE, DRIE, and Ion Beam Milling */}
+                {(['rie', 'drie-bosch', 'ion-beam'].includes(step.etch?.etchType || 'rie')) && (
                   <div className="pt-2.5 border-t border-slate-800 space-y-2">
                     <div className="flex justify-between text-[11px] text-slate-400">
                       <span>Sidewall Taper Angle</span>
                       {(() => {
-                        const angleVal = step.etch?.sidewallAngle ?? 90;
+                        const isIonBeam = step.etch?.etchType === 'ion-beam';
+                        const rawAngle = step.etch?.sidewallAngle ?? (isIonBeam ? 85 : 90);
+                        const angleVal = isIonBeam ? Math.min(90, rawAngle) : rawAngle;
                         return (
                           <span className="font-mono text-amber-400">
                             {angleVal}°{' '}
@@ -2240,10 +2251,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     </div>
                     <input
                       type="range"
-                      min="80"
-                      max="100"
+                      min={step.etch?.etchType === 'ion-beam' ? '75' : '80'}
+                      max={step.etch?.etchType === 'ion-beam' ? '90' : '100'}
                       step="0.5"
-                      value={Math.max(80, Math.min(100, step.etch?.sidewallAngle ?? 90))}
+                      value={
+                        step.etch?.etchType === 'ion-beam'
+                          ? Math.max(75, Math.min(90, step.etch?.sidewallAngle ?? 85))
+                          : Math.max(80, Math.min(100, step.etch?.sidewallAngle ?? 90))
+                      }
                       onChange={(e) =>
                         handleUpdate({
                           etch: {
@@ -2261,9 +2276,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       className="w-full accent-amber-500"
                     />
                     <div className="flex items-center justify-between gap-1">
-                      {[80, 85, 88, 90, 95, 100].map((presetAngle) => {
-                        const active =
-                          Math.abs((step.etch?.sidewallAngle ?? 90) - presetAngle) < 0.25;
+                      {(step.etch?.etchType === 'ion-beam'
+                        ? [75, 80, 85, 88, 90]
+                        : [80, 85, 88, 90, 95, 100]
+                      ).map((presetAngle) => {
+                        const currentA =
+                          step.etch?.sidewallAngle ??
+                          (step.etch?.etchType === 'ion-beam' ? 85 : 90);
+                        const active = Math.abs(currentA - presetAngle) < 0.25;
                         return (
                           <button
                             key={presetAngle}
