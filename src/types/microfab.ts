@@ -49,6 +49,7 @@ export interface Material {
   refractiveIndex?: number;
   notes?: string;
   isCustom?: boolean;
+  crystallineAnisotropic?: boolean; // Etches along crystal planes (e.g. {111} 54.74°) in KOH / TMAH
 }
 
 export interface MaskWindow {

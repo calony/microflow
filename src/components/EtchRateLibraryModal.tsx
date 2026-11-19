@@ -18,7 +18,7 @@ import {
   formatEtchRate,
   formatDurationCompact,
 } from '../lib/etchRates';
-import { getMaterialById } from '../lib/materials';
+import { getMaterialById, isCrystallineKohMaterial } from '../lib/materials';
 import { ThicknessUnit, formatThickness } from '../lib/units';
 import {
   Plus,
@@ -766,6 +766,22 @@ export const EtchRateLibraryModal: React.FC<EtchRateLibraryModalProps> = ({
                                   {isPrimary && (
                                     <span className="px-1 rounded bg-amber-500/20 text-[9px] font-mono text-amber-300">
                                       REF
+                                    </span>
+                                  )}
+                                  {inspected.etchType === 'wet-koh' && rate > 0 && (
+                                    <span
+                                      className={`px-1 rounded text-[9px] font-mono ${
+                                        isCrystallineKohMaterial(mat)
+                                          ? 'bg-sky-500/20 text-sky-300'
+                                          : 'bg-slate-800 text-slate-400'
+                                      }`}
+                                      title={
+                                        isCrystallineKohMaterial(mat)
+                                          ? 'Etches anisotropically along {111} crystal planes'
+                                          : 'Etches isotropically in KOH / TMAH'
+                                      }
+                                    >
+                                      {isCrystallineKohMaterial(mat) ? '{111}' : 'Iso'}
                                     </span>
                                   )}
                                 </div>

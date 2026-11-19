@@ -18,6 +18,7 @@ export const DEFAULT_MATERIALS: Material[] = [
     density: 2.33,
     refractiveIndex: 3.88,
     notes: 'Single-crystal Czochralski silicon wafer, p-type boron doped',
+    crystallineAnisotropic: true,
   },
   {
     id: 'mat_si_n',
@@ -30,6 +31,7 @@ export const DEFAULT_MATERIALS: Material[] = [
     density: 2.33,
     refractiveIndex: 3.88,
     notes: 'Phosphorus doped n-type silicon region / well',
+    crystallineAnisotropic: true,
   },
   {
     id: 'mat_poly_si',
@@ -312,6 +314,23 @@ export const CARRIER_TAPE_IDS = new Set([
   'mat_uv_tape',
   'mat_bg_tape',
 ]);
+
+export const CRYSTALLINE_ANISOTROPIC_MATERIAL_IDS = new Set([
+  'mat_si_sub',
+  'mat_si_n',
+]);
+
+/**
+ * Returns true if a material etches anisotropically along crystal planes (e.g. Si {111} at 54.74°)
+ * in alkaline wet etches (KOH / TMAH). Amorphous dielectrics, metals, polymers, and polysilicon
+ * do not have long-range crystal orientation and therefore etch isotropically when attacked.
+ */
+export function isCrystallineKohMaterial(mat: Material): boolean {
+  if (typeof mat.crystallineAnisotropic === 'boolean') {
+    return mat.crystallineAnisotropic;
+  }
+  return CRYSTALLINE_ANISOTROPIC_MATERIAL_IDS.has(mat.id);
+}
 
 export function resolveResistMaterialId(
   polarity: 'positive' | 'negative' = 'positive',

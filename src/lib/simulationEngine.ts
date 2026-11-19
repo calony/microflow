@@ -15,7 +15,12 @@ import {
   MountedTapeFrame,
   EtchRecipe,
 } from '../types/microfab';
-import { getMaterialById, resolveResistMaterialId, CARRIER_TAPE_IDS } from './materials';
+import {
+  getMaterialById,
+  resolveResistMaterialId,
+  CARRIER_TAPE_IDS,
+  isCrystallineKohMaterial,
+} from './materials';
 import { getEtchRecipeById, getEtchRateNmMin } from './etchRates';
 
 const DEFAULT_SAMPLE_COLUMNS = 300;
@@ -1335,8 +1340,59 @@ function applyEtchSide(
     }
   }
 
-  // Convex corner acceleration for isotropic etching (wet-isotropic or isotropy >= 0.15)
-  const isIsotropicEtch = cfg?.etchType === 'wet-isotropic' || isotropy >= 0.15;
+  const rawEtchType = cfg?.etchType || 'rie';
+  const isKohEtch = rawEtchType === 'wet-koh';
+  const isCrystalMat = (materialId: string): boolean => {
+    if (!isKohEtch) return true;
+    return isCrystallineKohMaterial(getMaterialById(materials, materialId));
+  };
+
+  const isBarrierSegment = (seg: MaterialSegment): boolean => {
+    const mat = getMaterialById(materials, seg.materialId);
+    if (
+      mat.category === 'photoresist' &&
+      cfg?.etchType !== 'ashing' &&
+      targetMatId !== seg.materialId
+    ) {
+      return true;
+    }
+    if (stopLayerId && seg.materialId === stopLayerId) return true;
+    if (targetMatId !== 'all' && seg.materialId !== targetMatId) return true;
+    if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) {
+      return true;
+    }
+    return false;
+  };
+
+  const computeVerticalReach = (colIdx: number, budget: number): number => {
+    const col = columns[colIdx];
+    if (col.segments.length === 0) return 0;
+    const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
+    if (budget <= 0 || !isColumnExposed[colIdx]) return surfaceY;
+
+    const ordered =
+      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+    let rem = budget;
+    let reachedY = surfaceY;
+    for (const seg of ordered) {
+      if (isBarrierSegment(seg)) break;
+      const segH = seg.yTop - seg.yBottom;
+      if (rem >= segH) {
+        rem -= segH;
+        reachedY = targetSide === 'front' ? seg.yBottom : seg.yTop;
+      } else {
+        reachedY =
+          targetSide === 'front' ? seg.yTop - rem : seg.yBottom + rem;
+        rem = 0;
+        break;
+      }
+    }
+    return reachedY;
+  };
+
+  // Convex corner acceleration for isotropic etching (wet-isotropic, isotropy >= 0.15, or isotropic materials in wet-koh)
+  const isIsotropicEtch =
+    cfg?.etchType === 'wet-isotropic' || isotropy >= 0.15 || isKohEtch;
   if (cfg?.convexCornerEffect && isIsotropicEtch) {
     const cornerBoostStrength = Math.max(0.05, cfg.convexCornerStrength ?? 0.6);
     const cornerFactors = computeConvexCornerFactors(
@@ -1346,13 +1402,18 @@ function applyEtchSide(
       refDepthForScale
     );
     for (let i = 0; i < columns.length; i++) {
-      if (isColumnExposed[i] && cornerFactors[i] > 0) {
-        baseDepthPerCol[i] *= 1 + cornerBoostStrength * cornerFactors[i];
+      if (!isColumnExposed[i] || cornerFactors[i] <= 0) continue;
+      if (isKohEtch && isotropy < 0.15 && columns[i].segments.length > 0) {
+        const surfSeg =
+          targetSide === 'front'
+            ? columns[i].segments[columns[i].segments.length - 1]
+            : columns[i].segments[0];
+        if (surfSeg && isCrystalMat(surfSeg.materialId)) continue;
       }
+      baseDepthPerCol[i] *= 1 + cornerBoostStrength * cornerFactors[i];
     }
   }
 
-  const rawEtchType = cfg?.etchType || 'rie';
   const supportsPositiveTaper =
     rawEtchType === 'wet-koh' ||
     rawEtchType === 'rie' ||
@@ -1368,7 +1429,7 @@ function applyEtchSide(
   // Tapered / crystallographic sidewalls (e.g. KOH 54.74° or positive-taper dry etch < 89.5°):
   // Non-zero isotropy shifts the sloped wall laterally outward by U = D * isotropy
   // while preserving the target sidewall angle.
-  if (isCrystallographic) {
+  if (isCrystallographic && !isKohEtch) {
     const clampedAngle = Math.max(15, Math.min(89.5, sidewallAngle));
     const angleRad = (clampedAngle * Math.PI) / 180;
     const tanAngle = Math.tan(angleRad);
@@ -1425,6 +1486,134 @@ function applyEtchSide(
         etchDepthPerCol[i] = Math.min(localDepth, effHorizontalRun * tanAngle);
       }
     }
+  } else if (isCrystallographic && isKohEtch) {
+    // KOH / TMAH crystallographic clamping applies strictly to crystalline materials (e.g. Si <100>, Si:P);
+    // non-crystalline layers (poly-Si, Al, SiO2, quartz) etch vertically & isotropically without crystal facets.
+    const clampedAngle = Math.max(15, Math.min(89.5, sidewallAngle));
+    const tanAngle = Math.tan((clampedAngle * Math.PI) / 180);
+    const rawVerticalFloor = new Float64Array(columns.length);
+    for (let k = 0; k < columns.length; k++) {
+      rawVerticalFloor[k] = computeVerticalReach(k, baseDepthPerCol[k]);
+    }
+
+    for (let i = 0; i < columns.length; i++) {
+      if (!isColumnExposed[i] || baseDepthPerCol[i] <= 0) continue;
+      const col = columns[i];
+      const ordered =
+        targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+      let rem = baseDepthPerCol[i];
+      let allowedDepth = 0;
+      let inCrystalBlock = false;
+      let crystalBlockStartDepth = 0;
+      let crystalBlockAllowance = Infinity;
+
+      for (const seg of ordered) {
+        if (isBarrierSegment(seg) || rem <= 0) break;
+        const segH = seg.yTop - seg.yBottom;
+        const want = Math.min(rem, segH);
+
+        if (!isCrystalMat(seg.materialId)) {
+          inCrystalBlock = false;
+          crystalBlockAllowance = Infinity;
+          allowedDepth += want;
+          rem -= want;
+          continue;
+        }
+
+        if (!inCrystalBlock) {
+          inCrystalBlock = true;
+          crystalBlockStartDepth = allowedDepth;
+          const crystalSurfY = targetSide === 'front' ? seg.yTop : seg.yBottom;
+
+          let stepsLeft = 1;
+          let leftMaskFound = false;
+          while (i - stepsLeft >= 0) {
+            const k = i - stepsLeft;
+            if (!isColumnExposed[k]) {
+              if (columns[k].segments.length > 0) {
+                const kSurfY =
+                  targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
+                if (
+                  targetSide === 'front'
+                    ? kSurfY >= crystalSurfY - 1
+                    : kSurfY <= crystalSurfY + 1
+                ) {
+                  leftMaskFound = true;
+                }
+              }
+              break;
+            } else if (columns[k].segments.length > 0) {
+              const kRawFloor = rawVerticalFloor[k];
+              if (
+                targetSide === 'front'
+                  ? kRawFloor > crystalSurfY + 1
+                  : kRawFloor < crystalSurfY - 1
+              ) {
+                leftMaskFound = true;
+                break;
+              }
+            }
+            stepsLeft++;
+          }
+
+          let stepsRight = 1;
+          let rightMaskFound = false;
+          while (i + stepsRight < columns.length) {
+            const k = i + stepsRight;
+            if (!isColumnExposed[k]) {
+              if (columns[k].segments.length > 0) {
+                const kSurfY =
+                  targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
+                if (
+                  targetSide === 'front'
+                    ? kSurfY >= crystalSurfY - 1
+                    : kSurfY <= crystalSurfY + 1
+                ) {
+                  rightMaskFound = true;
+                }
+              }
+              break;
+            } else if (columns[k].segments.length > 0) {
+              const kRawFloor = rawVerticalFloor[k];
+              if (
+                targetSide === 'front'
+                  ? kRawFloor > crystalSurfY + 1
+                  : kRawFloor < crystalSurfY - 1
+              ) {
+                rightMaskFound = true;
+                break;
+              }
+            }
+            stepsRight++;
+          }
+
+          const distToLeftEdge = leftMaskFound ? (stepsLeft - 0.5) * dx : Infinity;
+          const distToRightEdge = rightMaskFound ? (stepsRight - 0.5) * dx : Infinity;
+          const nearestEdgeDist = Math.min(distToLeftEdge, distToRightEdge);
+
+          if (Number.isFinite(nearestEdgeDist)) {
+            const lateralUndercut = rem * Math.max(0, isotropy);
+            crystalBlockAllowance = (nearestEdgeDist + lateralUndercut) * tanAngle;
+          } else {
+            crystalBlockAllowance = Infinity;
+          }
+        }
+
+        const remAllowance = Math.max(
+          0,
+          crystalBlockAllowance - (allowedDepth - crystalBlockStartDepth)
+        );
+        const crystalCap = Math.min(want, remAllowance);
+        allowedDepth += crystalCap;
+        if (crystalCap < segH - 1e-4) {
+          rem = 0;
+          break;
+        }
+        rem -= crystalCap;
+      }
+
+      etchDepthPerCol[i] = allowedDepth;
+    }
   }
 
   // Bosch DRIE sidewall scallops are modeled geometrically along the etched trench walls after step 5.
@@ -1432,49 +1621,7 @@ function applyEtchSide(
   // 3. Determine vertical etch reach per column before applying 2D lateral wavefront
   const verticalEtchFloor = new Float64Array(columns.length);
   for (let i = 0; i < columns.length; i++) {
-    const col = columns[i];
-    if (col.segments.length === 0) {
-      verticalEtchFloor[i] = 0;
-      continue;
-    }
-    const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
-    const budget = etchDepthPerCol[i];
-    if (budget <= 0 || !isColumnExposed[i]) {
-      verticalEtchFloor[i] = surfaceY;
-      continue;
-    }
-
-    const orderedSegments =
-      targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
-    let remaining = budget;
-    let reachedY = surfaceY;
-
-    for (const seg of orderedSegments) {
-      const mat = getMaterialById(materials, seg.materialId);
-      if (
-        mat.category === 'photoresist' &&
-        cfg?.etchType !== 'ashing' &&
-        targetMatId !== seg.materialId
-      ) {
-        break;
-      }
-      if (stopLayerId && seg.materialId === stopLayerId) break;
-      if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
-      if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) break;
-
-      const segHeight = seg.yTop - seg.yBottom;
-      if (remaining >= segHeight) {
-        remaining -= segHeight;
-        reachedY = targetSide === 'front' ? seg.yBottom : seg.yTop;
-      } else {
-        reachedY =
-          targetSide === 'front' ? seg.yTop - remaining : seg.yBottom + remaining;
-        remaining = 0;
-        break;
-      }
-    }
-
-    verticalEtchFloor[i] = reachedY;
+    verticalEtchFloor[i] = computeVerticalReach(i, etchDepthPerCol[i]);
   }
 
   // 4. 2D Lateral Wavefront (Barrier-aware interval propagation for KOH & RIE/Wet)
@@ -1483,6 +1630,7 @@ function applyEtchSide(
     winBot: number;
     winTop: number;
     reachY: number;
+    kind: 'all' | 'crystal' | 'isotropic';
   }
   const colLateralWindows: (LateralReachWindow[] | undefined)[] = new Array(
     columns.length
@@ -1491,23 +1639,6 @@ function applyEtchSide(
   for (let j = 0; j < columns.length; j++) {
     finalFrontReachY[j] = verticalEtchFloor[j];
   }
-
-  const isBarrierSegment = (seg: MaterialSegment): boolean => {
-    const mat = getMaterialById(materials, seg.materialId);
-    if (
-      mat.category === 'photoresist' &&
-      cfg?.etchType !== 'ashing' &&
-      targetMatId !== seg.materialId
-    ) {
-      return true;
-    }
-    if (stopLayerId && seg.materialId === stopLayerId) return true;
-    if (targetMatId !== 'all' && seg.materialId !== targetMatId) return true;
-    if (activeRecipe && getEtchRateNmMin(activeRecipe, seg.materialId) <= 0) {
-      return true;
-    }
-    return false;
-  };
 
   const subtractBarrierInterval = (
     intervals: [number, number][],
@@ -1567,7 +1698,8 @@ function applyEtchSide(
     colIdx: number,
     winBot: number,
     winTop: number,
-    reachY: number
+    reachY: number,
+    kind: 'all' | 'crystal' | 'isotropic' = 'all'
   ) => {
     if (targetSide === 'front') {
       if (reachY >= winTop) return;
@@ -1581,6 +1713,7 @@ function applyEtchSide(
     }
     for (const existing of list) {
       if (
+        existing.kind === kind &&
         Math.abs(existing.winBot - winBot) < 1e-4 &&
         Math.abs(existing.winTop - winTop) < 1e-4
       ) {
@@ -1592,7 +1725,7 @@ function applyEtchSide(
         return;
       }
     }
-    list.push({ winBot, winTop, reachY });
+    list.push({ winBot, winTop, reachY, kind });
   };
 
   if (isotropy > 0 && isCrystallographic) {
@@ -1605,29 +1738,66 @@ function applyEtchSide(
       if (colI.segments.length === 0) continue;
 
       const yAirI = targetSide === 'front' ? getTopY(colI) : getBottomY(colI);
-      const localDepth = baseDepthPerCol[i];
-      const lateralUndercut = localDepth * isotropy;
-      if (lateralUndercut <= 0) continue;
+      let yCrystalAirI = yAirI;
+      let localCrystalDepth = baseDepthPerCol[i];
+      let maxReachedY = yAirI;
 
-      // Max vertical penetration allowed by stopLayerId / targetMatId at source column i
       const orderedSegsI =
         targetSide === 'front' ? [...colI.segments].reverse() : [...colI.segments];
-      let rem = localDepth;
-      let maxReachedY = yAirI;
-      for (const seg of orderedSegsI) {
-        if (isBarrierSegment(seg)) break;
-        const h = seg.yTop - seg.yBottom;
-        if (rem >= h) {
-          rem -= h;
-          maxReachedY = targetSide === 'front' ? seg.yBottom : seg.yTop;
-        } else {
-          maxReachedY =
-            targetSide === 'front' ? seg.yTop - rem : seg.yBottom + rem;
-          rem = 0;
-          break;
+
+      if (isKohEtch) {
+        let rem = baseDepthPerCol[i];
+        let foundCrystal = false;
+        let crystalDepthAccum = 0;
+        let lastCrystalReach = yAirI;
+        for (const seg of orderedSegsI) {
+          if (isBarrierSegment(seg) || rem <= 0) break;
+          const h = seg.yTop - seg.yBottom;
+          const used = Math.min(rem, h);
+          if (!isCrystalMat(seg.materialId)) {
+            if (foundCrystal) break;
+            rem -= used;
+            continue;
+          }
+          if (!foundCrystal) {
+            foundCrystal = true;
+            yCrystalAirI = targetSide === 'front' ? seg.yTop : seg.yBottom;
+          }
+          crystalDepthAccum += used;
+          if (used >= h) {
+            lastCrystalReach = targetSide === 'front' ? seg.yBottom : seg.yTop;
+            rem -= h;
+          } else {
+            lastCrystalReach =
+              targetSide === 'front' ? seg.yTop - used : seg.yBottom + used;
+            rem = 0;
+            break;
+          }
+        }
+        if (!foundCrystal || crystalDepthAccum <= 0) continue;
+        localCrystalDepth = crystalDepthAccum;
+        maxReachedY = lastCrystalReach;
+      } else {
+        let rem = baseDepthPerCol[i];
+        for (const seg of orderedSegsI) {
+          if (isBarrierSegment(seg)) break;
+          const h = seg.yTop - seg.yBottom;
+          if (rem >= h) {
+            rem -= h;
+            maxReachedY = targetSide === 'front' ? seg.yBottom : seg.yTop;
+          } else {
+            maxReachedY =
+              targetSide === 'front' ? seg.yTop - rem : seg.yBottom + rem;
+            rem = 0;
+            break;
+          }
         }
       }
-      const maxEtchableSpan = Math.abs(maxReachedY - yAirI);
+
+      const lateralUndercut = localCrystalDepth * isotropy;
+      if (lateralUndercut <= 0) continue;
+      const maxEtchableSpan = Math.abs(maxReachedY - yCrystalAirI);
+      const winKind: 'all' | 'crystal' = isKohEtch ? 'crystal' : 'all';
 
       const isLeftMaskEdge = i > 0 && !isColumnExposed[i - 1];
       const isRightMaskEdge =
@@ -1657,22 +1827,22 @@ function applyEtchSide(
           if (undercutDepth <= 0) continue;
 
           if (targetSide === 'front') {
-            const rawTargetY = yAirI - undercutDepth;
+            const rawTargetY = yCrystalAirI - undercutDepth;
             for (const [winBot, winTop] of activeIntervals) {
               const reachY = Math.max(winBot, rawTargetY);
-              if (winTop === Infinity && reachY < finalFrontReachY[j]) {
+              if (!isKohEtch && winTop === Infinity && reachY < finalFrontReachY[j]) {
                 finalFrontReachY[j] = reachY;
               }
-              addLateralWindow(j, winBot, winTop, reachY);
+              addLateralWindow(j, winBot, winTop, reachY, winKind);
             }
           } else {
-            const rawTargetY = yAirI + undercutDepth;
+            const rawTargetY = yCrystalAirI + undercutDepth;
             for (const [winBot, winTop] of activeIntervals) {
               const reachY = Math.min(winTop, rawTargetY);
-              if (winBot === -Infinity && reachY > finalFrontReachY[j]) {
+              if (!isKohEtch && winBot === -Infinity && reachY > finalFrontReachY[j]) {
                 finalFrontReachY[j] = reachY;
               }
-              addLateralWindow(j, winBot, winTop, reachY);
+              addLateralWindow(j, winBot, winTop, reachY, winKind);
             }
           }
         }
@@ -1700,22 +1870,22 @@ function applyEtchSide(
           if (undercutDepth <= 0) continue;
 
           if (targetSide === 'front') {
-            const rawTargetY = yAirI - undercutDepth;
+            const rawTargetY = yCrystalAirI - undercutDepth;
             for (const [winBot, winTop] of activeIntervals) {
               const reachY = Math.max(winBot, rawTargetY);
-              if (winTop === Infinity && reachY < finalFrontReachY[j]) {
+              if (!isKohEtch && winTop === Infinity && reachY < finalFrontReachY[j]) {
                 finalFrontReachY[j] = reachY;
               }
-              addLateralWindow(j, winBot, winTop, reachY);
+              addLateralWindow(j, winBot, winTop, reachY, winKind);
             }
           } else {
-            const rawTargetY = yAirI + undercutDepth;
+            const rawTargetY = yCrystalAirI + undercutDepth;
             for (const [winBot, winTop] of activeIntervals) {
               const reachY = Math.min(winTop, rawTargetY);
-              if (winBot === -Infinity && reachY > finalFrontReachY[j]) {
+              if (!isKohEtch && winBot === -Infinity && reachY > finalFrontReachY[j]) {
                 finalFrontReachY[j] = reachY;
               }
-              addLateralWindow(j, winBot, winTop, reachY);
+              addLateralWindow(j, winBot, winTop, reachY, winKind);
             }
           }
         }
@@ -1737,7 +1907,7 @@ function applyEtchSide(
           const yAirJ =
             targetSide === 'front' ? getTopY(columns[j]) : getBottomY(columns[j]);
           const standsTaller =
-            targetSide === 'front' ? yAirJ > yAirI + 1 : yAirJ < yAirI - 1;
+            targetSide === 'front' ? yAirJ > yCrystalAirI + 1 : yAirJ < yCrystalAirI - 1;
           if (!standsTaller) break;
 
           activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
@@ -1753,20 +1923,187 @@ function applyEtchSide(
             const topOpen = activeIntervals.find((iv) => iv[1] === Infinity);
             if (topOpen) {
               const targetY = Math.max(topOpen[0], rawTargetY);
-              if (targetY < finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+              if (isKohEtch) {
+                addLateralWindow(j, topOpen[0], Infinity, targetY, 'crystal');
+              } else if (targetY < finalFrontReachY[j]) {
+                finalFrontReachY[j] = targetY;
+              }
             }
           } else {
             const rawTargetY = Math.min(vReachI, verticalEtchFloor[j] + extraDrop);
             const botOpen = activeIntervals.find((iv) => iv[0] === -Infinity);
             if (botOpen) {
               const targetY = Math.min(botOpen[1], rawTargetY);
-              if (targetY > finalFrontReachY[j]) finalFrontReachY[j] = targetY;
+              if (isKohEtch) {
+                addLateralWindow(j, -Infinity, botOpen[1], targetY, 'crystal');
+              } else if (targetY > finalFrontReachY[j]) {
+                finalFrontReachY[j] = targetY;
+              }
             }
           }
         }
       }
     }
-  } else if (isotropy > 0 && !isReentrant) {
+  }
+
+  // Non-crystalline materials in KOH/TMAH (e.g., poly-Si, Al, SiO2, quartz) still etch isotropically
+  if (isKohEtch) {
+    let maxIsoRadiusAll = 0;
+    if (!activeRecipe) {
+      maxIsoRadiusAll = refDepthForScale;
+    } else {
+      const seenNonCrystalMats = new Set<string>();
+      for (const col of columns) {
+        for (const seg of col.segments) {
+          if (isBarrierSegment(seg) || isCrystalMat(seg.materialId)) continue;
+          if (seenNonCrystalMats.has(seg.materialId)) continue;
+          seenNonCrystalMats.add(seg.materialId);
+          const r = getEtchRateNmMin(activeRecipe, seg.materialId) * etchTimeMin;
+          if (r > maxIsoRadiusAll) maxIsoRadiusAll = r;
+        }
+      }
+      if (cfg?.convexCornerEffect && maxBaseDepth > maxIsoRadiusAll) {
+        maxIsoRadiusAll = maxBaseDepth;
+      }
+    }
+
+    if (maxIsoRadiusAll > 0) {
+      const globalColRadius = Math.min(
+        columns.length,
+        Math.ceil(maxIsoRadiusAll / dx + 0.5)
+      );
+
+      for (let i = 0; i < columns.length; i++) {
+        const colI = columns[i];
+        if (colI.segments.length === 0) continue;
+
+        const topSurfaceMat = getMaterialById(
+          materials,
+          targetSide === 'front'
+            ? colI.segments[colI.segments.length - 1].materialId
+            : colI.segments[0].materialId
+        );
+        const hasProtectiveResist =
+          topSurfaceMat.category === 'photoresist' && cfg?.etchType !== 'ashing';
+        if (hasProtectiveResist) continue;
+
+        const yAirI = targetSide === 'front' ? getTopY(colI) : getBottomY(colI);
+        const vReachI = verticalEtchFloor[i];
+        const maxIsoI = !activeRecipe
+          ? baseDepthPerCol[i] > 0
+            ? baseDepthPerCol[i]
+            : refDepthForScale
+          : maxIsoRadiusAll;
+        if (maxIsoI <= 0) continue;
+
+        let baseIntervals: [number, number][] =
+          targetSide === 'front'
+            ? [[vReachI, Infinity]]
+            : [[-Infinity, vReachI]];
+        baseIntervals = subtractColBarriers(baseIntervals, colI);
+        if (baseIntervals.length === 0) continue;
+
+        const colRadiusI = Math.min(
+          globalColRadius,
+          Math.ceil(maxIsoI / dx + 0.5)
+        );
+
+        for (const dir of [-1, 1] as const) {
+          let activeIntervals = baseIntervals;
+
+          for (let stepCols = 1; stepCols <= colRadiusI; stepCols++) {
+            const j = i + dir * stepCols;
+            if (j < 0 || j >= columns.length) break;
+            const distX = (stepCols - 0.5) * dx;
+            if (distX > maxIsoI) break;
+
+            activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+            // Solid unetched crystal silicon blocks lateral isotropic attack behind it
+            for (const seg of columns[j].segments) {
+              if (!isCrystalMat(seg.materialId)) continue;
+              if (targetSide === 'front') {
+                const solidTop = Math.min(seg.yTop, verticalEtchFloor[j]);
+                if (solidTop > seg.yBottom) {
+                  activeIntervals = subtractBarrierInterval(
+                    activeIntervals,
+                    seg.yBottom,
+                    solidTop
+                  );
+                }
+              } else {
+                const solidBot = Math.max(seg.yBottom, verticalEtchFloor[j]);
+                if (seg.yTop > solidBot) {
+                  activeIntervals = subtractBarrierInterval(
+                    activeIntervals,
+                    solidBot,
+                    seg.yTop
+                  );
+                }
+              }
+              if (activeIntervals.length === 0) break;
+            }
+            if (activeIntervals.length === 0) break;
+
+            for (const seg of columns[j].segments) {
+              if (isBarrierSegment(seg) || isCrystalMat(seg.materialId)) continue;
+
+              const rawMatR = activeRecipe
+                ? getEtchRateNmMin(activeRecipe, seg.materialId) * etchTimeMin
+                : baseDepthPerCol[i] > 0
+                ? baseDepthPerCol[i]
+                : refDepthForScale;
+              let matR = rawMatR;
+              if (activeRecipe && cfg?.convexCornerEffect) {
+                const surfSeg =
+                  targetSide === 'front'
+                    ? colI.segments[colI.segments.length - 1]
+                    : colI.segments[0];
+                if (
+                  surfSeg &&
+                  surfSeg.materialId === seg.materialId &&
+                  baseDepthPerCol[i] > rawMatR
+                ) {
+                  matR = baseDepthPerCol[i];
+                }
+              }
+              if (matR <= 0 || distX > matR) continue;
+
+              const normX = distX / matR;
+              const curveDrop = matR * Math.sqrt(Math.max(0, 1 - normX * normX));
+
+              for (const [ivBot, ivTop] of activeIntervals) {
+                const ovBot = Math.max(seg.yBottom, ivBot);
+                const ovTop = Math.min(seg.yTop, ivTop);
+                if (ovTop <= ovBot) continue;
+
+                if (targetSide === 'front') {
+                  if (ovBot >= yAirI) {
+                    addLateralWindow(j, ovBot, ovTop, ovBot, 'isotropic');
+                  } else if (vReachI < yAirI) {
+                    const entryY = Math.min(yAirI, ovTop);
+                    const rawY = Math.max(ovBot, vReachI, entryY - curveDrop);
+                    if (rawY < ovTop) {
+                      addLateralWindow(j, ovBot, ovTop, rawY, 'isotropic');
+                    }
+                  }
+                } else {
+                  if (ovTop <= yAirI) {
+                    addLateralWindow(j, ovBot, ovTop, ovTop, 'isotropic');
+                  } else if (vReachI > yAirI) {
+                    const entryY = Math.max(yAirI, ovBot);
+                    const rawY = Math.min(ovTop, vReachI, entryY + curveDrop);
+                    if (rawY > ovBot) {
+                      addLateralWindow(j, ovBot, ovTop, rawY, 'isotropic');
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if (isotropy > 0 && !isReentrant && !isCrystallographic) {
     for (let i = 0; i < columns.length; i++) {
       const colI = columns[i];
       if (colI.segments.length === 0) continue;
@@ -1952,24 +2289,51 @@ function applyEtchSide(
         continue;
       }
 
-      if (blockedBelow) {
-        // Vertically blocked by an overlying mask, non-target layer, or etch stop:
-        // only lateral wavefront windows that survived all barriers up to this elevation can etch.
-        if (!hasLatWindows || !latWindows) {
-          processedSegments.push(seg);
-          continue;
+      if (blockedBelow || isKohEtch) {
+        // Check lateral wavefront windows (filtered by crystal vs isotropic kind in wet-koh)
+        // plus vertical reach when not vertically blocked.
+        const segKind: 'crystal' | 'isotropic' = isCrystalMat(seg.materialId)
+          ? 'crystal'
+          : 'isotropic';
+        let keptPieces: [number, number][] = [[seg.yBottom, seg.yTop]];
+
+        if (!blockedBelow) {
+          const verticalReach = targetReach;
+          if (targetSide === 'front') {
+            if (verticalReach < seg.yTop) {
+              const cutBot = Math.max(seg.yBottom, verticalReach);
+              keptPieces = subtractBarrierInterval(keptPieces, cutBot, seg.yTop);
+              if (verticalReach > seg.yBottom + 0.5) {
+                blockedBelow = true;
+              }
+            } else {
+              blockedBelow = true;
+            }
+          } else {
+            if (verticalReach > seg.yBottom) {
+              const cutTop = Math.min(seg.yTop, verticalReach);
+              keptPieces = subtractBarrierInterval(keptPieces, seg.yBottom, cutTop);
+              if (verticalReach < seg.yTop - 0.5) {
+                blockedBelow = true;
+              }
+            } else {
+              blockedBelow = true;
+            }
+          }
         }
 
-        let keptPieces: [number, number][] = [[seg.yBottom, seg.yTop]];
-        for (const w of latWindows) {
-          if (w.winBot >= seg.yTop || w.winTop <= seg.yBottom) continue;
-          const cutBot =
-            targetSide === 'front' ? Math.max(w.winBot, w.reachY) : w.winBot;
-          const cutTop =
-            targetSide === 'front' ? w.winTop : Math.min(w.winTop, w.reachY);
-          if (cutTop > cutBot) {
-            keptPieces = subtractBarrierInterval(keptPieces, cutBot, cutTop);
-            if (keptPieces.length === 0) break;
+        if (hasLatWindows && latWindows && keptPieces.length > 0) {
+          for (const w of latWindows) {
+            if (w.kind !== 'all' && w.kind !== segKind) continue;
+            if (w.winBot >= seg.yTop || w.winTop <= seg.yBottom) continue;
+            const cutBot =
+              targetSide === 'front' ? Math.max(w.winBot, w.reachY) : w.winBot;
+            const cutTop =
+              targetSide === 'front' ? w.winTop : Math.min(w.winTop, w.reachY);
+            if (cutTop > cutBot) {
+              keptPieces = subtractBarrierInterval(keptPieces, cutBot, cutTop);
+              if (keptPieces.length === 0) break;
+            }
           }
         }
 

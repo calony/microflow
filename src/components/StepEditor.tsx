@@ -21,7 +21,7 @@ import {
   EtchRecipe,
 } from '../types/microfab';
 import { ThicknessUnit, getUnitLabel, formatThickness } from '../lib/units';
-import { resolveResistMaterialId } from '../lib/materials';
+import { resolveResistMaterialId, isCrystallineKohMaterial } from '../lib/materials';
 import {
   getEtchRecipes,
   getEtchRateNmMin,
@@ -2140,7 +2140,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <option value="rie">Reactive Ion Etch (RIE)</option>
                       <option value="drie-bosch">Deep RIE (Bosch DRIE)</option>
                       <option value="wet-isotropic">Wet Chemical (HF/BOE - Isotropic)</option>
-                      <option value="wet-koh">Wet KOH Anisotropic (54.74°)</option>
+                      <option value="wet-koh">Wet KOH / TMAH Anisotropic (54.74°)</option>
                       <option value="ion-beam">Ion Beam Milling</option>
                       <option value="ashing">Oxygen Plasma Ashing</option>
                     </select>
@@ -2176,14 +2176,43 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     {materials.map((m) => (
                       <option key={m.id} value={m.id}>
                         Selective: {m.name} ({m.formula})
+                        {currentEtchType === 'wet-koh'
+                          ? isCrystallineKohMaterial(m)
+                            ? ' — Crystal {111}'
+                            : ' — Isotropic'
+                          : ''}
                       </option>
                     ))}
                   </select>
+                  {currentEtchType === 'wet-koh' && (() => {
+                    const selectedTargetMat =
+                      targetMatId !== 'all'
+                        ? materials.find((m) => m.id === targetMatId)
+                        : undefined;
+                    if (selectedTargetMat && !isCrystallineKohMaterial(selectedTargetMat)) {
+                      return (
+                        <p className="mt-1.5 px-2 py-1.5 rounded-lg bg-sky-950/40 border border-sky-500/30 text-[10px] text-sky-200 leading-snug">
+                          <strong>{selectedTargetMat.name}</strong> is not monocrystalline and does not etch along crystal planes — it will etch <strong>isotropically</strong> (circular undercut) in KOH / TMAH.
+                        </p>
+                      );
+                    }
+                    return (
+                      <p className="mt-1.5 text-[10px] text-slate-400 leading-snug">
+                        {selectedTargetMat
+                          ? `${selectedTargetMat.name} etches anisotropically along crystal planes (${step.etch?.sidewallAngle ?? 54.74}°).`
+                          : 'Crystal-plane etching (54.74°) applies only to single-crystal materials (Si <100>, Si:P); other etched layers (e.g. poly-Si, Al, SiO₂) etch isotropically.'}
+                      </p>
+                    );
+                  })()}
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] text-slate-400 mb-1">
-                    <span>Etch Isotropy (Mask Undercut)</span>
+                    <span>
+                      {step.etch?.etchType === 'wet-koh'
+                        ? 'Crystal {111} Mask Undercut'
+                        : 'Etch Isotropy (Mask Undercut)'}
+                    </span>
                     {(() => {
                       const isoVal =
                         step.etch?.isotropy ??
@@ -2504,8 +2533,9 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </div>
                 )}
 
-                {/* Convex Corner Acceleration for Isotropic Etching */}
+                {/* Convex Corner Acceleration for Isotropic Etching (and isotropic layers in KOH/TMAH) */}
                 {(step.etch?.etchType === 'wet-isotropic' ||
+                  step.etch?.etchType === 'wet-koh' ||
                   (step.etch?.isotropy ?? 0.05) >= 0.15) && (
                   <div className="pt-2.5 border-t border-slate-800 space-y-2.5">
                     <label className="flex items-start gap-2 cursor-pointer">

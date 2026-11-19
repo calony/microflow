@@ -5,6 +5,7 @@
 
 import React, { useState } from 'react';
 import { Material, PatternType, MaterialCategory } from '../types/microfab';
+import { isCrystallineKohMaterial } from '../lib/materials';
 import { Plus, Trash2, X, Sparkles, Check } from 'lucide-react';
 
 interface MaterialsModalProps {
@@ -30,6 +31,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
   const [density, setDensity] = useState<string>('2.5');
   const [refractiveIndex, setRefractiveIndex] = useState<string>('1.5');
   const [notes, setNotes] = useState<string>('');
+  const [crystallineAnisotropic, setCrystallineAnisotropic] = useState<boolean>(false);
 
   const handleStartAdd = () => {
     setEditingMat({
@@ -40,6 +42,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
       pattern: 'crosshatch',
       category: 'custom',
       isCustom: true,
+      crystallineAnisotropic: false,
     });
     setName('Custom Thin Film');
     setFormula('X');
@@ -49,6 +52,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
     setDensity('2.5');
     setRefractiveIndex('1.5');
     setNotes('');
+    setCrystallineAnisotropic(false);
   };
 
   const handleSave = () => {
@@ -64,6 +68,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
       refractiveIndex: parseFloat(refractiveIndex) || undefined,
       notes: notes.trim() || undefined,
       isCustom: true,
+      crystallineAnisotropic,
     };
 
     const exists = materials.some((m) => m.id === newOrUpdated.id);
@@ -160,6 +165,7 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
                       setDensity(mat.density?.toString() || '');
                       setRefractiveIndex(mat.refractiveIndex?.toString() || '');
                       setNotes(mat.notes || '');
+                      setCrystallineAnisotropic(isCrystallineKohMaterial(mat));
                     }}
                     className={`flex items-center justify-between p-2.5 rounded-xl text-xs cursor-pointer border transition-colors ${
                       isSelected
@@ -322,6 +328,32 @@ export const MaterialsModal: React.FC<MaterialsModalProps> = ({
                     rows={2}
                     className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-60"
                   />
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">KOH / TMAH Wet Etch</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+                        crystallineAnisotropic
+                          ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-300'
+                      }`}
+                    >
+                      {crystallineAnisotropic ? 'Crystal {111} Planes' : 'Isotropic (Non-Crystal)'}
+                    </span>
+                  </div>
+                  {editingMat.isCustom && (
+                    <label className="flex items-center gap-2 pt-1 cursor-pointer text-[11px] text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={crystallineAnisotropic}
+                        onChange={(e) => setCrystallineAnisotropic(e.target.checked)}
+                        className="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0"
+                      />
+                      <span>Single-crystal (etches along crystal planes in KOH / TMAH)</span>
+                    </label>
+                  )}
                 </div>
 
                 {editingMat.isCustom && (
