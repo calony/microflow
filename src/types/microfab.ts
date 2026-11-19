@@ -390,6 +390,7 @@ export interface ScallopWall {
   yBot: number; // nm
   scallopDepth: number; // nm
   scallopPitch: number; // nm
+  scallopBottomDepth?: number; // nm (Knudsen F* radical attenuation at trench bottom)
   isReentrant?: boolean;
 }
 

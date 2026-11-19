@@ -2404,17 +2404,20 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                         <div>
                           <div className="flex justify-between text-[11px] text-slate-400 mb-1">
                             <span>Scallop Pitch (Cycle Height)</span>
-                            <span className="font-mono text-amber-400">
-                              {formatThickness(step.etch?.scallopPitch ?? 200, thicknessUnit)} (~
-                              {Math.max(
-                                1,
-                                Math.round(
-                                  (step.etch?.depth ?? step.thickness ?? 300) /
-                                    Math.max(20, step.etch?.scallopPitch ?? 200)
-                                )
-                              )}{' '}
-                              cycles)
-                            </span>
+                            {(() => {
+                              const effCycleDepth =
+                                linkedRecipe && rateMode === 'time-rate' && refRate > 0
+                                  ? Math.round((refRate * etchTimeSec) / 60)
+                                  : step.etch?.depth ?? step.thickness ?? 300;
+                              const pitchNm = Math.max(20, step.etch?.scallopPitch ?? 200);
+                              return (
+                                <span className="font-mono text-amber-400">
+                                  {formatThickness(step.etch?.scallopPitch ?? 200, thicknessUnit)} (~
+                                  {Math.max(1, Math.round(effCycleDepth / pitchNm))}{' '}
+                                  cycles)
+                                </span>
+                              );
+                            })()}
                           </div>
                           <input
                             type="range"
@@ -2433,6 +2436,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             className="w-full accent-amber-500"
                           />
                         </div>
+                        {step.etch?.ardeEnabled && (
+                          <p className="text-[10px] text-slate-400 leading-snug">
+                            Knudsen ARDE transport preserves total cycle count across narrow &amp; wide trenches while compressing local pitch and attenuating bottom scallops.
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>

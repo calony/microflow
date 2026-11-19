@@ -1241,27 +1241,73 @@ function applyEtchSide(
     return;
   }
 
-  const isDryEtch = ['rie', 'drie-bosch', 'ion-beam', 'ashing'].includes(
-    cfg?.etchType || 'rie'
-  );
+  const rawEtchType = cfg?.etchType || 'rie';
+  const isBoschDrie = rawEtchType === 'drie-bosch';
+  const isKohEtch = rawEtchType === 'wet-koh';
+  const isDryEtch = ['rie', 'drie-bosch', 'ion-beam', 'ashing'].includes(rawEtchType);
+
+  const colSurfaceRate = new Float64Array(columns.length);
+  let maxExposedFastRate = 0;
+  let fastOpenRefDepth = 0;
+  for (let i = 0; i < columns.length; i++) {
+    if (!isColumnExposed[i] || columns[i].segments.length === 0) continue;
+    if (!activeRecipe) {
+      colSurfaceRate[i] = 1;
+      maxExposedFastRate = 1;
+      if (baseDepthPerCol[i] > fastOpenRefDepth) fastOpenRefDepth = baseDepthPerCol[i];
+      continue;
+    }
+    const surfSeg =
+      targetSide === 'front'
+        ? columns[i].segments[columns[i].segments.length - 1]
+        : columns[i].segments[0];
+    const r = getEtchRateNmMin(activeRecipe, surfSeg.materialId);
+    colSurfaceRate[i] = r;
+    if (r > maxExposedFastRate) maxExposedFastRate = r;
+    if (baseDepthPerCol[i] > fastOpenRefDepth) fastOpenRefDepth = baseDepthPerCol[i];
+  }
+  if (fastOpenRefDepth <= 0) fastOpenRefDepth = refDepthForScale;
+
+  // Classify columns acting as a selective hardmask / slow shoulder relative to fast trench layers
+  const isMaskShoulderCol = (colIdx: number): boolean => {
+    if (!isColumnExposed[colIdx]) return true;
+    if (
+      activeRecipe &&
+      maxExposedFastRate > 0 &&
+      colSurfaceRate[colIdx] < 0.2 * maxExposedFastRate &&
+      baseDepthPerCol[colIdx] <= 0.35 * fastOpenRefDepth
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  // True Knudsen neutral/radical conductance ARDE solver referenced to open-field dose:
+  // dz/dt = R0 / (1 + k * (z + z_pre) / W)  =>  z + (k / W) * (z_pre * z + z^2 / 2) = D0
+  const colArdeLagRatio = new Float64Array(columns.length).fill(1);
+  const colLocalAR = new Float64Array(columns.length).fill(0);
+
   if (cfg?.ardeEnabled && isDryEtch) {
     const kLag = Math.max(0.05, cfg.ardeStrength ?? 0.5);
-    const openings: {
-      runStart: number;
-      runEnd: number;
-      effectiveWidth: number;
-      preDepth: number;
-      requiredDose: number;
-    }[] = [];
+    const dOpenField =
+      isRateDriven && activeRecipe
+        ? Math.max(
+            fastOpenRefDepth,
+            getEtchRateNmMin(
+              activeRecipe,
+              cfg?.referenceMaterialId || activeRecipe.primaryMaterialId
+            ) * etchTimeMin
+          )
+        : refDepthForScale;
 
     let idx = 0;
     while (idx < columns.length) {
-      if (!isColumnExposed[idx]) {
+      if (isMaskShoulderCol(idx)) {
         idx++;
         continue;
       }
       const runStart = idx;
-      while (idx < columns.length && isColumnExposed[idx]) {
+      while (idx < columns.length && !isMaskShoulderCol(idx)) {
         idx++;
       }
       const runEnd = idx - 1;
@@ -1305,43 +1351,56 @@ function applyEtchSide(
           ? Math.max(0, avgShoulderY - avgFloorY)
           : Math.max(0, avgFloorY - avgShoulderY);
 
-      // Open-field dose needed for this feature to reach full reference etch depth
-      const requiredDose =
-        refDepthForScale +
-        (kLag / effectiveWidth) *
-          (preDepth * refDepthForScale + (refDepthForScale * refDepthForScale) / 2);
+      const a = kLag / (2 * effectiveWidth);
+      const b = 1 + (kLag * preDepth) / effectiveWidth;
+      const D0 = Math.max(1e-6, dOpenField);
+      const laggedRefDepth = (2 * D0) / (b + Math.sqrt(b * b + 4 * a * D0));
+      const lagFactor = Math.max(0.02, Math.min(1, laggedRefDepth / D0));
 
-      openings.push({
-        runStart,
-        runEnd,
-        effectiveWidth,
-        preDepth,
-        requiredDose,
-      });
-    }
+      for (let c = runStart; c <= runEnd; c++) {
+        if (activeRecipe) {
+          const col = columns[c];
+          const orderedSegs =
+            targetSide === 'front' ? [...col.segments].reverse() : [...col.segments];
+          let remTime = etchTimeMin * lagFactor;
+          let accumDepth = 0;
+          for (const seg of orderedSegs) {
+            const mat = getMaterialById(materials, seg.materialId);
+            if (
+              mat.category === 'photoresist' &&
+              cfg?.etchType !== 'ashing' &&
+              targetMatId !== seg.materialId
+            ) {
+              break;
+            }
+            if (stopLayerId && seg.materialId === stopLayerId) break;
+            if (targetMatId !== 'all' && seg.materialId !== targetMatId) break;
 
-    if (openings.length > 0) {
-      // Calibrate etch time/dose to the widest/deepest feature so it always reaches exact `refDepthForScale`
-      const calibratedDose = Math.min(...openings.map((o) => o.requiredDose));
+            const rate = getEtchRateNmMin(activeRecipe, seg.materialId);
+            if (rate <= 0) break;
 
-      for (const op of openings) {
-        const a = kLag / (2 * op.effectiveWidth);
-        const b = 1 + (kLag * op.preDepth) / op.effectiveWidth;
-        const laggedDepth =
-          (2 * calibratedDose) / (b + Math.sqrt(b * b + 4 * a * calibratedDose));
-        const lagRatio = Math.min(1, laggedDepth / Math.max(1e-6, refDepthForScale));
-
-        for (let c = op.runStart; c <= op.runEnd; c++) {
-          baseDepthPerCol[c] = isRateDriven
-            ? baseDepthPerCol[c] * lagRatio
-            : laggedDepth;
+            const segH = seg.yTop - seg.yBottom;
+            const timeNeeded = segH / rate;
+            if (remTime >= timeNeeded) {
+              remTime -= timeNeeded;
+              accumDepth += segH;
+            } else {
+              accumDepth += remTime * rate;
+              remTime = 0;
+              break;
+            }
+          }
+          baseDepthPerCol[c] = accumDepth;
+        } else {
+          const Dcol = Math.max(1e-6, baseDepthPerCol[c]);
+          baseDepthPerCol[c] = (2 * Dcol) / (b + Math.sqrt(b * b + 4 * a * Dcol));
         }
+        colArdeLagRatio[c] = lagFactor;
+        colLocalAR[c] = (preDepth + baseDepthPerCol[c]) / effectiveWidth;
       }
     }
   }
 
-  const rawEtchType = cfg?.etchType || 'rie';
-  const isKohEtch = rawEtchType === 'wet-koh';
   const isCrystalMat = (materialId: string): boolean => {
     if (!isKohEtch) return true;
     return isCrystallineKohMaterial(getMaterialById(materials, materialId));
@@ -1417,7 +1476,6 @@ function applyEtchSide(
   const supportsPositiveTaper =
     rawEtchType === 'wet-koh' ||
     rawEtchType === 'rie' ||
-    rawEtchType === 'drie-bosch' ||
     rawEtchType === 'ion-beam';
   const isReentrant =
     sidewallAngle > 90.5 &&
@@ -1426,7 +1484,7 @@ function applyEtchSide(
     rawEtchType === 'wet-koh' || (supportsPositiveTaper && sidewallAngle < 89.5);
   const etchDepthPerCol = new Float64Array(baseDepthPerCol);
 
-  // Tapered / crystallographic sidewalls (e.g. KOH 54.74° or positive-taper dry etch < 89.5°):
+  // Tapered sidewalls for non-Bosch dry etch (< 89.5°):
   // Non-zero isotropy shifts the sloped wall laterally outward by U = D * isotropy
   // while preserving the target sidewall angle.
   if (isCrystallographic && !isKohEtch) {
@@ -1435,19 +1493,18 @@ function applyEtchSide(
     const tanAngle = Math.tan(angleRad);
 
     for (let i = 0; i < columns.length; i++) {
-      if (!isColumnExposed[i]) continue;
+      if (isMaskShoulderCol(i)) continue;
       const col = columns[i];
       const surfaceY = targetSide === 'front' ? getTopY(col) : getBottomY(col);
       const localDepth = baseDepthPerCol[i];
       const lateralUndercut = localDepth * Math.max(0, isotropy);
 
-      // Only count an unexposed neighbor as a shadowing mask wall if it stands at or above
-      // this column's surface elevation (so lower exposed etch-stop terraces don't leave mesa spikes).
+      // Only count a masking/shoulder neighbor if it stands at or above this column's surface elevation
       let stepsLeft = 0;
       let leftMaskFound = false;
       while (i - stepsLeft >= 0) {
         const k = i - stepsLeft;
-        if (!isColumnExposed[k]) {
+        if (isMaskShoulderCol(k)) {
           if (columns[k].segments.length > 0) {
             const kSurfY =
               targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
@@ -1464,7 +1521,7 @@ function applyEtchSide(
       let rightMaskFound = false;
       while (i + stepsRight < columns.length) {
         const k = i + stepsRight;
-        if (!isColumnExposed[k]) {
+        if (isMaskShoulderCol(k)) {
           if (columns[k].segments.length > 0) {
             const kSurfY =
               targetSide === 'front' ? getTopY(columns[k]) : getBottomY(columns[k]);
@@ -2103,6 +2160,422 @@ function applyEtchSide(
         }
       }
     }
+  }
+  const boschPendingWalls: ScallopWall[] = [];
+
+  if (isBoschDrie) {
+    // Unified Physics-Based Bosch DRIE Solver:
+    // Combines cyclic C4F8 passivation protection, SF6 mask undercut, ion/passivation sidewall taper
+    // (80° positive taper w/ V-pinch-off, 90° vertical, >90° re-entrant), hardmask selectivity,
+    // and Knudsen ARDE pitch/scallop attenuation into one self-consistent column + wall solution.
+    const shouldEmitScallops = Boolean(cfg?.scallopEffect);
+    const rawScallopDepth = shouldEmitScallops
+      ? Math.max(5, Math.min(300, cfg?.scallopDepth ?? 45))
+      : 0;
+    const rawScallopPitch = Math.max(20, Math.min(1000, cfg?.scallopPitch ?? 200));
+    const isBoschPosTaper = sidewallAngle < 89.5;
+    const isBoschReentrant = sidewallAngle > 90.5;
+    const tanPosAngle = isBoschPosTaper
+      ? Math.tan((Math.max(15, sidewallAngle) * Math.PI) / 180)
+      : Infinity;
+    const tanReentrantOverhang = isBoschReentrant
+      ? Math.tan(((Math.min(135, sidewallAngle) - 90) * Math.PI) / 180)
+      : 0;
+    const kKn = cfg?.ardeEnabled ? Math.max(0.05, cfg?.ardeStrength ?? 0.5) : 0;
+
+    const hasFastEtchableInSpan = (
+      col: ColumnProfile,
+      spanBot: number,
+      spanTop: number
+    ): boolean => {
+      for (const seg of col.segments) {
+        if (Math.min(seg.yTop, spanTop) <= Math.max(seg.yBottom, spanBot) + 1) continue;
+        if (isBarrierSegment(seg)) continue;
+        if (activeRecipe && maxExposedFastRate > 0) {
+          if (getEtchRateNmMin(activeRecipe, seg.materialId) < 0.2 * maxExposedFastRate) {
+            continue;
+          }
+        }
+        return true;
+      }
+      return false;
+    };
+
+    const getFastEtchableIntervals = (
+      col: ColumnProfile,
+      spanBot: number,
+      spanTop: number
+    ): [number, number][] => {
+      let ivs: [number, number][] = [[spanBot, spanTop]];
+      for (const seg of col.segments) {
+        if (ivs.length === 0) break;
+        const isFastTarget =
+          !isBarrierSegment(seg) &&
+          (!activeRecipe ||
+            maxExposedFastRate <= 0 ||
+            getEtchRateNmMin(activeRecipe, seg.materialId) >= 0.2 * maxExposedFastRate);
+        if (!isFastTarget) {
+          ivs = subtractBarrierInterval(ivs, seg.yBottom, seg.yTop);
+        }
+      }
+      return ivs;
+    };
+
+    let idx = 0;
+    while (idx < columns.length) {
+      if (isMaskShoulderCol(idx)) {
+        idx++;
+        continue;
+      }
+      const runStart = idx;
+      while (idx < columns.length && !isMaskShoulderCol(idx)) {
+        idx++;
+      }
+      const runEnd = idx - 1;
+      if (runStart === 0 && runEnd === columns.length - 1) continue;
+
+      const xMaskLeft = runStart * dx;
+      const xMaskRight = (runEnd + 1) * dx;
+      const lagRatioOp = colArdeLagRatio[runStart];
+      const arOp = colLocalAR[runStart];
+      const localPitch = Math.max(5, rawScallopPitch * lagRatioOp);
+      const knScallopBotFactor = cfg?.ardeEnabled ? 1 / (1 + 0.55 * kKn * arOp) : 1;
+
+      // Left boundary metrics
+      const hasLeftShoulder =
+        runStart > 0 &&
+        columns[runStart - 1].segments.length > 0 &&
+        isMaskShoulderCol(runStart - 1);
+      const yEntryL =
+        targetSide === 'front'
+          ? getTopY(columns[runStart])
+          : getBottomY(columns[runStart]);
+      const yFloorL = verticalEtchFloor[runStart];
+      const shoulderFloorL = hasLeftShoulder
+        ? verticalEtchFloor[runStart - 1]
+        : yEntryL;
+      const yTopL =
+        targetSide === 'front'
+          ? Math.min(yEntryL, shoulderFloorL)
+          : Math.max(yEntryL, shoulderFloorL);
+      const wallHeightL =
+        targetSide === 'front' ? yTopL - yFloorL : yFloorL - yTopL;
+      const shoulderTallerL =
+        hasLeftShoulder &&
+        (targetSide === 'front'
+          ? shoulderFloorL > yFloorL + 10
+          : shoulderFloorL < yFloorL - 10);
+
+      // Right boundary metrics
+      const hasRightShoulder =
+        runEnd < columns.length - 1 &&
+        columns[runEnd + 1].segments.length > 0 &&
+        isMaskShoulderCol(runEnd + 1);
+      const yEntryR =
+        targetSide === 'front' ? getTopY(columns[runEnd]) : getBottomY(columns[runEnd]);
+      const yFloorR = verticalEtchFloor[runEnd];
+      const shoulderFloorR = hasRightShoulder
+        ? verticalEtchFloor[runEnd + 1]
+        : yEntryR;
+      const yTopR =
+        targetSide === 'front'
+          ? Math.min(yEntryR, shoulderFloorR)
+          : Math.max(yEntryR, shoulderFloorR);
+      const wallHeightR =
+        targetSide === 'front' ? yTopR - yFloorR : yFloorR - yTopR;
+      const shoulderTallerR =
+        hasRightShoulder &&
+        (targetSide === 'front'
+          ? shoulderFloorR > yFloorR + 10
+          : shoulderFloorR < yFloorR - 10);
+
+      const leftActive =
+        hasLeftShoulder &&
+        shoulderTallerL &&
+        Number.isFinite(wallHeightL) &&
+        wallHeightL > 10;
+      const rightActive =
+        hasRightShoulder &&
+        shoulderTallerR &&
+        Number.isFinite(wallHeightR) &&
+        wallHeightR > 10;
+
+      if (!leftActive && !rightActive) continue;
+
+      // Measure solid etchable silicon shoulder widths to prevent pillar self-intersection
+      let budgetWidthL = 0;
+      let leftEtchable = false;
+      if (leftActive) {
+        const spanMinL = Math.min(yTopL, yFloorL);
+        const spanMaxL = Math.max(yTopL, yFloorL);
+        leftEtchable = hasFastEtchableInSpan(columns[runStart - 1], spanMinL, spanMaxL);
+        let solidLeftCols = 0;
+        let k = runStart - 1;
+        for (; k >= 0; k--) {
+          if (
+            !isMaskShoulderCol(k) ||
+            columns[k].segments.length === 0 ||
+            !hasFastEtchableInSpan(columns[k], spanMinL, spanMaxL)
+          ) {
+            break;
+          }
+          solidLeftCols++;
+        }
+        const oppositeIsTrench =
+          k >= 0 && (!isMaskShoulderCol(k) || columns[k].segments.length === 0);
+        budgetWidthL = solidLeftCols * dx * (oppositeIsTrench ? 0.48 : 0.92);
+      }
+
+      let budgetWidthR = 0;
+      let rightEtchable = false;
+      if (rightActive) {
+        const spanMinR = Math.min(yTopR, yFloorR);
+        const spanMaxR = Math.max(yTopR, yFloorR);
+        rightEtchable = hasFastEtchableInSpan(columns[runEnd + 1], spanMinR, spanMaxR);
+        let solidRightCols = 0;
+        let k = runEnd + 1;
+        for (; k < columns.length; k++) {
+          if (
+            !isMaskShoulderCol(k) ||
+            columns[k].segments.length === 0 ||
+            !hasFastEtchableInSpan(columns[k], spanMinR, spanMaxR)
+          ) {
+            break;
+          }
+          solidRightCols++;
+        }
+        const oppositeIsTrench =
+          k < columns.length &&
+          (!isMaskShoulderCol(k) || columns[k].segments.length === 0);
+        budgetWidthR = solidRightCols * dx * (oppositeIsTrench ? 0.48 : 0.92);
+      }
+
+      // Compute mask undercut (U_mask) & endpoint coordinates (xTop, xBot, yBot)
+      let xTopL = xMaskLeft;
+      let xBotL = xMaskLeft;
+      let yBotL = yFloorL;
+      let uMaskL = 0;
+      let safeDepthL = 0;
+      let safeBotDepthL = 0;
+
+      if (leftActive) {
+        safeDepthL = shouldEmitScallops
+          ? Math.min(rawScallopDepth, budgetWidthL * 0.35, wallHeightL * 0.5)
+          : 0;
+        safeBotDepthL = safeDepthL * knScallopBotFactor;
+        const effIsoDepthL = Math.max(
+          wallHeightL,
+          Math.min(baseDepthPerCol[runStart] || refDepthForScale, wallHeightL * 2.5)
+        );
+        uMaskL = leftEtchable
+          ? Math.min(budgetWidthL * 0.45, effIsoDepthL * Math.max(0, isotropy))
+          : 0;
+        xTopL = xMaskLeft - uMaskL;
+
+        if (isBoschReentrant) {
+          const maxAvailL = leftEtchable
+            ? Math.max(0, budgetWidthL - uMaskL - safeDepthL - dx * 0.1)
+            : 0;
+          xBotL = xTopL - Math.min(maxAvailL, wallHeightL * tanReentrantOverhang);
+        } else if (isBoschPosTaper) {
+          xBotL = Math.min(totalWidth, xTopL + wallHeightL / tanPosAngle);
+        } else {
+          xBotL = xTopL;
+        }
+      }
+
+      let xTopR = xMaskRight;
+      let xBotR = xMaskRight;
+      let yBotR = yFloorR;
+      let uMaskR = 0;
+      let safeDepthR = 0;
+      let safeBotDepthR = 0;
+
+      if (rightActive) {
+        safeDepthR = shouldEmitScallops
+          ? Math.min(rawScallopDepth, budgetWidthR * 0.35, wallHeightR * 0.5)
+          : 0;
+        safeBotDepthR = safeDepthR * knScallopBotFactor;
+        const effIsoDepthR = Math.max(
+          wallHeightR,
+          Math.min(baseDepthPerCol[runEnd] || refDepthForScale, wallHeightR * 2.5)
+        );
+        uMaskR = rightEtchable
+          ? Math.min(budgetWidthR * 0.45, effIsoDepthR * Math.max(0, isotropy))
+          : 0;
+        xTopR = xMaskRight + uMaskR;
+
+        if (isBoschReentrant) {
+          const maxAvailR = rightEtchable
+            ? Math.max(0, budgetWidthR - uMaskR - safeDepthR - dx * 0.1)
+            : 0;
+          xBotR = xTopR + Math.min(maxAvailR, wallHeightR * tanReentrantOverhang);
+        } else if (isBoschPosTaper) {
+          xBotR = Math.max(0, xTopR - wallHeightR / tanPosAngle);
+        } else {
+          xBotR = xTopR;
+        }
+      }
+
+      // Check narrow-trench V-pinch-off when opposite positive-taper walls intersect
+      if (isBoschPosTaper && leftActive && rightActive && xBotL > xBotR) {
+        const signY = targetSide === 'front' ? -1 : 1;
+        const xPinchRaw =
+          (xTopL + xTopR) * 0.5 +
+          (signY === -1 ? yTopL - yTopR : yTopR - yTopL) / (2 * tanPosAngle);
+        const xPinch = Math.max(xTopL, Math.min(xTopR, xPinchRaw));
+        const yPinch = yTopL + signY * (xPinch - xTopL) * tanPosAngle;
+        xBotL = xPinch;
+        xBotR = xPinch;
+        yBotL = yPinch;
+        yBotR = yPinch;
+        if (shouldEmitScallops) {
+          const actualH = Math.abs(yPinch - yTopL);
+          safeDepthL = Math.min(safeDepthL, actualH * 0.5);
+          safeBotDepthL = safeDepthL * knScallopBotFactor;
+          safeDepthR = Math.min(safeDepthR, actualH * 0.5);
+          safeBotDepthR = safeDepthR * knScallopBotFactor;
+        }
+      }
+
+      // Carve coherent mask-undercut windows into columns[j] beneath overhanging masks
+      if (leftActive && uMaskL > 0) {
+        const spanMinL = Math.min(yTopL, yBotL);
+        const spanMaxL = Math.max(yTopL, yBotL);
+        for (let j = runStart - 1; j >= 0; j--) {
+          if (columns[j].x < xTopL - 1e-6) break;
+          if (!isMaskShoulderCol(j) || columns[j].segments.length === 0) break;
+          const cutReach =
+            isBoschPosTaper && columns[j].x < xBotL
+              ? targetSide === 'front'
+                ? yTopL - (columns[j].x - xTopL) * tanPosAngle
+                : yTopL + (columns[j].x - xTopL) * tanPosAngle
+              : yBotL;
+          const ivs = getFastEtchableIntervals(columns[j], spanMinL, spanMaxL);
+          for (const [winBot, winTop] of ivs) {
+            addLateralWindow(j, winBot, winTop, cutReach);
+          }
+        }
+      }
+
+      if (rightActive && uMaskR > 0) {
+        const spanMinR = Math.min(yTopR, yBotR);
+        const spanMaxR = Math.max(yTopR, yBotR);
+        for (let j = runEnd + 1; j < columns.length; j++) {
+          if (columns[j].x > xTopR + 1e-6) break;
+          if (!isMaskShoulderCol(j) || columns[j].segments.length === 0) break;
+          const cutReach =
+            isBoschPosTaper && columns[j].x > xBotR
+              ? targetSide === 'front'
+                ? yTopR - (xTopR - columns[j].x) * tanPosAngle
+                : yTopR + (xTopR - columns[j].x) * tanPosAngle
+              : yBotR;
+          const ivs = getFastEtchableIntervals(columns[j], spanMinR, spanMaxR);
+          for (const [winBot, winTop] of ivs) {
+            addLateralWindow(j, winBot, winTop, cutReach);
+          }
+        }
+      }
+
+      // Apply positive-taper wall slope cleanly onto exposed trench columns [runStart .. runEnd]
+      if (isBoschPosTaper) {
+        for (let j = runStart; j <= runEnd; j++) {
+          const xj = columns[j].x;
+          let reach = finalFrontReachY[j];
+          if (leftActive && xj < xBotL) {
+            const yL =
+              targetSide === 'front'
+                ? yTopL - (xj - xTopL) * tanPosAngle
+                : yTopL + (xj - xTopL) * tanPosAngle;
+            reach = targetSide === 'front' ? Math.max(reach, yL) : Math.min(reach, yL);
+          }
+          if (rightActive && xj > xBotR) {
+            const yR =
+              targetSide === 'front'
+                ? yTopR - (xTopR - xj) * tanPosAngle
+                : yTopR + (xTopR - xj) * tanPosAngle;
+            reach = targetSide === 'front' ? Math.max(reach, yR) : Math.min(reach, yR);
+          }
+          finalFrontReachY[j] = reach;
+        }
+      }
+
+      // Compute exact colTop / colBot indices consistent with columns[] for ScallopWall rendering
+      let colBotL = runStart;
+      if (leftActive) {
+        let colTopL = runStart - 1;
+        while (colTopL > 0 && columns[colTopL].x >= xTopL - 1e-6) {
+          colTopL--;
+        }
+        if (xBotL <= xTopL + 1e-6) {
+          colBotL = Math.min(runEnd, colTopL + 1);
+        } else {
+          colBotL = colTopL + 1;
+          while (colBotL < runEnd && columns[colBotL].x < xBotL - 1e-6) {
+            colBotL++;
+          }
+        }
+        if (
+          Math.abs(yBotL - yTopL) > 10 &&
+          (safeDepthL > 0.5 || Math.abs(xTopL - xBotL) > 0.5 || uMaskL > 0.5)
+        ) {
+          boschPendingWalls.push({
+            stepId: step.id,
+            targetSide,
+            wallSide: 'left',
+            colTop: colTopL,
+            colBot: colBotL,
+            xTop: xTopL,
+            xBot: xBotL,
+            yTop: yTopL,
+            yBot: yBotL,
+            scallopDepth: safeDepthL,
+            scallopBottomDepth: safeBotDepthL,
+            scallopPitch: localPitch,
+            isReentrant: isBoschReentrant && Math.abs(xTopL - xBotL) > 0.5,
+          });
+        }
+      }
+
+      if (rightActive) {
+        let colTopR = runEnd + 1;
+        while (colTopR < columns.length - 1 && columns[colTopR].x <= xTopR + 1e-6) {
+          colTopR++;
+        }
+        let colBotR = runEnd;
+        if (xBotR >= xTopR - 1e-6) {
+          colBotR = Math.max(runStart, colTopR - 1);
+        } else {
+          colBotR = colTopR - 1;
+          while (colBotR > runStart && columns[colBotR].x > xBotR + 1e-6) {
+            colBotR--;
+          }
+          if (leftActive && colBotR < colBotL) {
+            colBotR = colBotL;
+          }
+        }
+        if (
+          Math.abs(yBotR - yTopR) > 10 &&
+          (safeDepthR > 0.5 || Math.abs(xTopR - xBotR) > 0.5 || uMaskR > 0.5)
+        ) {
+          boschPendingWalls.push({
+            stepId: step.id,
+            targetSide,
+            wallSide: 'right',
+            colTop: colTopR,
+            colBot: colBotR,
+            xTop: xTopR,
+            xBot: xBotR,
+            yTop: yTopR,
+            yBot: yBotR,
+            scallopDepth: safeDepthR,
+            scallopBottomDepth: safeBotDepthR,
+            scallopPitch: localPitch,
+            isReentrant: isBoschReentrant && Math.abs(xTopR - xBotR) > 0.5,
+          });
+        }
+      }
+    }
   } else if (isotropy > 0 && !isReentrant && !isCrystallographic) {
     for (let i = 0; i < columns.length; i++) {
       const colI = columns[i];
@@ -2143,6 +2616,19 @@ function applyEtchSide(
           if (distX > effectiveRx) break;
 
           activeIntervals = subtractColBarriers(activeIntervals, columns[j]);
+          // Protect slow-rate hardmask segments in neighbor columns from fast-layer lateral blowout
+          if (activeRecipe && colSurfaceRate[i] > 0) {
+            for (const seg of columns[j].segments) {
+              if (isBarrierSegment(seg)) continue;
+              if (getEtchRateNmMin(activeRecipe, seg.materialId) < 0.25 * colSurfaceRate[i]) {
+                activeIntervals = subtractBarrierInterval(
+                  activeIntervals,
+                  seg.yBottom,
+                  seg.yTop
+                );
+              }
+            }
+          }
           if (activeIntervals.length === 0) break;
 
           const normX = distX / effectiveRx;
@@ -2160,6 +2646,13 @@ function applyEtchSide(
               const upperCurveY = yAirI + curveDrop;
               for (const seg of columns[j].segments) {
                 if (isBarrierSegment(seg)) continue;
+                if (
+                  activeRecipe &&
+                  colSurfaceRate[i] > 0 &&
+                  getEtchRateNmMin(activeRecipe, seg.materialId) < 0.25 * colSurfaceRate[i]
+                ) {
+                  continue;
+                }
                 const overlapsReached = activeIntervals.some(([a, b]) => {
                   const ovBot = Math.max(seg.yBottom, a);
                   const ovTop = Math.min(seg.yTop, b);
@@ -2188,6 +2681,13 @@ function applyEtchSide(
               const lowerCurveY = yAirI - curveDrop;
               for (const seg of columns[j].segments) {
                 if (isBarrierSegment(seg)) continue;
+                if (
+                  activeRecipe &&
+                  colSurfaceRate[i] > 0 &&
+                  getEtchRateNmMin(activeRecipe, seg.materialId) < 0.25 * colSurfaceRate[i]
+                ) {
+                  continue;
+                }
                 const overlapsReached = activeIntervals.some(([a, b]) => {
                   const ovBot = Math.max(seg.yBottom, a);
                   const ovTop = Math.min(seg.yTop, b);
@@ -2289,7 +2789,7 @@ function applyEtchSide(
         continue;
       }
 
-      if (blockedBelow || isKohEtch) {
+      if (blockedBelow || isKohEtch || hasLatWindows) {
         // Check lateral wavefront windows (filtered by crystal vs isotropic kind in wet-koh)
         // plus vertical reach when not vertically blocked.
         const segKind: 'crystal' | 'isotropic' = isCrystalMat(seg.materialId)
@@ -2529,22 +3029,40 @@ function applyEtchSide(
   }
 
   // 7. Record Bosch DRIE sidewall scallops, re-entrant (> 90.5°) walls, and sub-column positive dry-etch taper (< 89.5°)
-  const shouldEmitScallops =
-    rawEtchType === 'drie-bosch' && Boolean(cfg?.scallopEffect);
-  const isDryPosTaper =
-    (rawEtchType === 'rie' ||
-      rawEtchType === 'drie-bosch' ||
-      rawEtchType === 'ion-beam') &&
-    sidewallAngle < 89.5;
+  if (isBoschDrie && scallopWalls) {
+    for (const w of boschPendingWalls) {
+      const shoulderCol = columns[w.colTop];
+      if (!shoulderCol || shoulderCol.segments.length === 0) continue;
+      const shoulderSurf =
+        targetSide === 'front' ? getTopY(shoulderCol) : getBottomY(shoulderCol);
+      const validHeight =
+        targetSide === 'front'
+          ? shoulderSurf > w.yBot + 10
+          : shoulderSurf < w.yBot - 10;
+      if (!validHeight) continue;
+      if (targetSide === 'front' && shoulderSurf < w.yTop - 0.5) {
+        w.xTop = evalWallXAtY(w, shoulderSurf);
+        w.yTop = shoulderSurf;
+      } else if (targetSide === 'back' && shoulderSurf > w.yTop + 0.5) {
+        w.xTop = evalWallXAtY(w, shoulderSurf);
+        w.yTop = shoulderSurf;
+      }
+      scallopWalls.push(w);
+    }
+  }
 
-  if ((shouldEmitScallops || isReentrant || isDryPosTaper) && scallopWalls) {
-    const rawScallopDepth = shouldEmitScallops
-      ? Math.max(5, Math.min(300, cfg?.scallopDepth ?? 45))
-      : 0;
+  const isDryPosTaper =
+    !isBoschDrie &&
+    (rawEtchType === 'rie' || rawEtchType === 'ion-beam') &&
+    sidewallAngle < 89.5;
+  const isNonBoschReentrant = !isBoschDrie && isReentrant;
+
+  if ((isNonBoschReentrant || isDryPosTaper) && scallopWalls) {
+    const rawScallopDepth = 0;
     const rawScallopPitch = Math.max(20, Math.min(1000, cfg?.scallopPitch ?? 200));
     const clampedPosAngle = Math.max(15, Math.min(89.5, sidewallAngle));
     const tanPosAngle = Math.tan((clampedPosAngle * Math.PI) / 180);
-    const tanReentrantOverhang = isReentrant
+    const tanReentrantOverhang = isNonBoschReentrant
       ? Math.tan(((Math.min(135, sidewallAngle) - 90) * Math.PI) / 180)
       : 0;
 
@@ -2560,14 +3078,16 @@ function applyEtchSide(
       return false;
     };
 
+    const isTrenchCol = (c: number) => etchedDelta[c] > 5 && !isMaskShoulderCol(c);
+
     let idx = 0;
     while (idx < columns.length) {
-      if (etchedDelta[idx] <= 5) {
+      if (!isTrenchCol(idx)) {
         idx++;
         continue;
       }
       const runStart = idx;
-      while (idx < columns.length && etchedDelta[idx] > 5) {
+      while (idx < columns.length && isTrenchCol(idx)) {
         idx++;
       }
       const runEnd = idx - 1;
@@ -2641,14 +3161,12 @@ function applyEtchSide(
             solidLeftCols++;
           }
           const oppositeIsTrench =
-            k >= 0 && (etchedDelta[k] > 5 || columns[k].segments.length === 0);
+            k >= 0 && (isTrenchCol(k) || columns[k].segments.length === 0);
           const solidLeftWidth = solidLeftCols * dx;
           const budgetWidth = oppositeIsTrench
             ? solidLeftWidth * 0.48
             : solidLeftWidth * 0.92;
-          const safeDepth = shouldEmitScallops
-            ? Math.min(rawScallopDepth, budgetWidth * 0.35, wallHeight * 0.5)
-            : 0;
+          const safeDepth = 0;
 
           const baseMaskEdgeX = (colTop + 1) * dx;
           const effectiveIsoDepth = Math.max(
@@ -2791,14 +3309,12 @@ function applyEtchSide(
           }
           const oppositeIsTrench =
             k < columns.length &&
-            (etchedDelta[k] > 5 || columns[k].segments.length === 0);
+            (isTrenchCol(k) || columns[k].segments.length === 0);
           const solidRightWidth = solidRightCols * dx;
           const budgetWidth = oppositeIsTrench
             ? solidRightWidth * 0.48
             : solidRightWidth * 0.92;
-          const safeDepth = shouldEmitScallops
-            ? Math.min(rawScallopDepth, budgetWidth * 0.35, wallHeight * 0.5)
-            : 0;
+          const safeDepth = 0;
 
           const baseMaskEdgeX = colTop * dx;
           const effectiveIsoDepth = Math.max(
@@ -3755,11 +4271,13 @@ function sampleScallopWallPoints(
     return pts;
   }
 
-  const rawCycles = Math.max(1, Math.round(wallHeight / Math.max(20, wall.scallopPitch)));
+  const rawCycles = Math.max(1, Math.round(wallHeight / Math.max(5, wall.scallopPitch)));
   const numCycles = Math.min(80, rawCycles);
   const ptsPerCycle = numCycles > 35 ? 6 : 10;
   const totalSteps = numCycles * ptsPerCycle;
   const dir = wall.wallSide === 'left' ? -1 : 1;
+  const dTop = wall.scallopDepth;
+  const dBot = wall.scallopBottomDepth ?? wall.scallopDepth;
 
   const evalPointAtT = (t: number) => {
     const tc = Math.max(0, Math.min(1, t));
@@ -3767,7 +4285,8 @@ function sampleScallopWallPoints(
     const xBase = wall.xTop + tc * (wall.xBot - wall.xTop);
     const cyclePos = tc * numCycles;
     const u = cyclePos - Math.floor(cyclePos);
-    const indent = wall.scallopDepth * 2 * Math.sqrt(Math.max(0, u * (1 - u)));
+    const localDepth = dTop + tc * (dBot - dTop);
+    const indent = localDepth * 2 * Math.sqrt(Math.max(0, u * (1 - u)));
     return { x: xBase + dir * indent, y };
   };
 
