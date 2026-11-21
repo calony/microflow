@@ -14,7 +14,7 @@ import { simulateCrossSection, buildRenderPolygons } from '../lib/simulationEngi
 import { SvgPatterns } from './SvgPatterns';
 import { getMaterialById } from '../lib/materials';
 import { ThicknessUnit, formatThickness } from '../lib/units';
-import { Download, LayoutGrid, Check, FileDown, Eye, Sliders, Bookmark } from 'lucide-react';
+import { Download, LayoutGrid, Check, FileDown, Eye, Sliders, Bookmark, Square, Boxes } from 'lucide-react';
 
 interface MultiStepFlowViewProps {
   flow: ProcessFlow;
@@ -36,6 +36,9 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
   const [showLegend, setShowLegend] = useState<boolean>(true);
   const [includeSubstrateFrame, setIncludeSubstrateFrame] = useState<boolean>(true);
   const [milestonesOnly, setMilestonesOnly] = useState<boolean>(false);
+  const [blockLastStepOnly, setBlockLastStepOnly] = useState<boolean>(false);
+  const [renderMode, setRenderMode] = useState<'hatch' | 'solid'>('hatch');
+  const [showOutlines, setShowOutlines] = useState<boolean>(true);
   const [isExporting, setIsExporting] = useState<boolean>(false);
 
   const hasBookmarkedSteps = useMemo(
@@ -51,6 +54,21 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
         .filter(({ step }) => step.enabled),
     [flow.steps]
   );
+
+  const hasBlocks = useMemo(
+    () => enabledStepsWithIndex.some(({ step }) => Boolean(step.blockId)),
+    [enabledStepsWithIndex]
+  );
+
+  const lastStepIndexByBlockId = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const { step, stepIndex } of enabledStepsWithIndex) {
+      if (step.blockId) {
+        map.set(step.blockId, stepIndex);
+      }
+    }
+    return map;
+  }, [enabledStepsWithIndex]);
 
   const stepMeshes = useMemo(() => {
     const list: {
@@ -111,10 +129,16 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
       });
     }
 
-    const filtered =
-      milestonesOnly && hasBookmarkedSteps
-        ? enabledStepsWithIndex.filter(({ step }) => Boolean(step.bookmarked))
-        : enabledStepsWithIndex;
+    let filtered = enabledStepsWithIndex;
+    if (blockLastStepOnly && hasBlocks) {
+      filtered = filtered.filter(
+        ({ step, stepIndex }) =>
+          !step.blockId || lastStepIndexByBlockId.get(step.blockId) === stepIndex
+      );
+    }
+    if (milestonesOnly && hasBookmarkedSteps) {
+      filtered = filtered.filter(({ step }) => Boolean(step.bookmarked));
+    }
 
     filtered.forEach(({ step, stepIndex }, renderIdx) => {
       const mesh = simulateCrossSection(flow, stepIndex);
@@ -138,7 +162,17 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
     });
 
     return list;
-  }, [flow, enabledStepsWithIndex, includeSubstrateFrame, milestonesOnly, hasBookmarkedSteps, thicknessUnit]);
+  }, [
+    flow,
+    enabledStepsWithIndex,
+    includeSubstrateFrame,
+    milestonesOnly,
+    hasBookmarkedSteps,
+    blockLastStepOnly,
+    hasBlocks,
+    lastStepIndexByBlockId,
+    thicknessUnit,
+  ]);
 
   // Overall materials used
   const allUsedMaterials = useMemo(() => {
@@ -228,7 +262,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
           <LayoutGrid className="w-5 h-5 text-sky-400 shrink-0" />
           <div className="min-w-0">
             <h2 className="text-xs sm:text-sm font-bold text-white tracking-wide truncate">
-              Publication-Ready Process Flow Generator
+              Process Figure Generator
             </h2>
             <span className="hidden sm:block text-xs text-slate-400 font-mono">
               IEEE / Nature Style Cross-Section Figure Sequence
@@ -267,6 +301,31 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
             title="Toggle inclusion of initial starting substrate frame (a)"
           >
             Substrate (a): {includeSubstrateFrame ? 'ON' : 'OFF'}
+          </button>
+
+          {/* Process Block Last Step Only Filter */}
+          <button
+            type="button"
+            disabled={!hasBlocks}
+            onClick={() => setBlockLastStepOnly((prev) => !prev)}
+            aria-pressed={blockLastStepOnly && hasBlocks}
+            className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-medium transition-colors ${
+              !hasBlocks
+                ? 'bg-slate-800/60 border-slate-700/60 text-slate-500 cursor-not-allowed'
+                : blockLastStepOnly
+                ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-indigo-300'
+            }`}
+            title={
+              !hasBlocks
+                ? 'No process blocks in this flow — group steps into blocks to streamline by block'
+                : blockLastStepOnly
+                ? 'Showing only the last step of each process block (click to show all steps)'
+                : 'Streamline figure: show only the last step of each process block'
+            }
+          >
+            <Boxes className="w-3.5 h-3.5" />
+            <span>Block End Only</span>
           </button>
 
           {/* Bookmarked Milestones Filter */}
@@ -310,6 +369,37 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
               <span className="sm:hidden">Dark</span>
             </button>
           </div>
+
+          {/* Hatch vs Solid toggle */}
+          <button
+            type="button"
+            onClick={() => setRenderMode((prev) => (prev === 'hatch' ? 'solid' : 'hatch'))}
+            aria-pressed={renderMode === 'hatch'}
+            className={`px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-medium transition-colors ${
+              renderMode === 'hatch'
+                ? 'bg-sky-600/20 border-sky-500/50 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+            title="Toggle Cleanroom Hatching Patterns"
+          >
+            Hatch
+          </button>
+
+          {/* Shape Outline toggle */}
+          <button
+            type="button"
+            onClick={() => setShowOutlines((prev) => !prev)}
+            aria-pressed={showOutlines}
+            className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] sm:text-xs font-medium transition-colors ${
+              showOutlines
+                ? 'bg-sky-600/20 border-sky-500/50 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+            title={showOutlines ? 'Hide Shape Outlines' : 'Show Shape Outlines'}
+          >
+            <Square className="w-3.5 h-3.5" />
+            <span>Outline</span>
+          </button>
 
           {/* Export Buttons */}
           <button
@@ -524,9 +614,19 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                         <path
                           key={poly.id}
                           d={pathD}
-                          fill={`url(#mat-fill-${mat.id})`}
-                          stroke={theme === 'paper' ? '#0f172a' : mat.strokeColor || '#1e293b'}
-                          strokeWidth="1.2"
+                          fill={
+                            renderMode === 'hatch'
+                              ? `url(#mat-fill-${mat.id})`
+                              : mat.color
+                          }
+                          stroke={
+                            showOutlines
+                              ? theme === 'paper'
+                                ? '#0f172a'
+                                : mat.strokeColor || '#1e293b'
+                              : 'none'
+                          }
+                          strokeWidth={showOutlines ? '1.2' : '0'}
                         />
                       );
                     })}
@@ -565,7 +665,11 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
                         width="14"
                         height="14"
                         rx="2"
-                        fill={`url(#mat-fill-${mat.id})`}
+                        fill={
+                          renderMode === 'hatch'
+                            ? `url(#mat-fill-${mat.id})`
+                            : mat.color
+                        }
                         stroke={theme === 'paper' ? '#334155' : '#64748b'}
                         strokeWidth="1"
                       />

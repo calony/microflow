@@ -57,6 +57,18 @@ export interface MaskWindow {
   xStart: number; // in nm
   xEnd: number;   // in nm
   fixedWidth?: boolean;
+  paramBindings?: Record<string, string>;
+}
+
+export type VariableUnit = 'nm' | 'um' | 'deg' | 'sec' | 'none';
+
+export interface DesignVariable {
+  id: string;
+  name: string;
+  value: number;
+  unit: VariableUnit;
+  expression?: string;
+  description?: string;
 }
 
 export interface DepositionConfig {
@@ -199,6 +211,7 @@ export interface BondingConfig {
 export interface DicingStreet {
   id: string;
   xCenter: number; // nm
+  paramBindings?: Record<string, string>;
 }
 
 export interface DicingConfig {
@@ -269,6 +282,7 @@ export interface ProcessStep {
   dicing?: DicingConfig;
   tapeFrame?: TapeFrameConfig;
   toolRecipe?: ToolRecipe;
+  paramBindings?: Record<string, string>;
 }
 
 export interface SubstrateLayer {
@@ -276,6 +290,7 @@ export interface SubstrateLayer {
   name?: string; // e.g. "Silicon Bulk", "Buried Oxide", "Device Layer"
   materialId: string;
   thickness: number; // in nm
+  paramBindings?: Record<string, string>;
 }
 
 export interface GdsPoint {
@@ -303,6 +318,7 @@ export interface GdsShape {
   cx?: number;
   cy?: number;
   radius?: number;
+  paramBindings?: Record<string, string>;
 }
 
 export interface GdsLayerInfo {
@@ -325,6 +341,7 @@ export interface GdsSectionLine {
   points?: GdsPoint[]; // Optional multi-point polyline vertices (>= 2 points)
   color?: string;
   resizeWaferToCut?: boolean;
+  paramBindings?: Record<string, string>;
 }
 
 export interface GdsConcatConfig {
@@ -357,6 +374,8 @@ export interface ProcessFlow {
   blocks?: ProcessBlock[]; // Fabrication blocks / modules hierarchy
   gdsLayout?: GdsLayoutData; // Optional 2D GDS-style layout & section cut line
   etchLibrary?: EtchRecipe[]; // Custom & saved etch rate recipes
+  variables?: DesignVariable[]; // Parametric design variables
+  paramBindings?: Record<string, string>; // Flow-level parameter bindings (e.g. substrateWidth)
 }
 
 /**
@@ -392,6 +411,7 @@ export interface ScallopWall {
   scallopPitch: number; // nm
   scallopBottomDepth?: number; // nm (Knudsen F* radical attenuation at trench bottom)
   isReentrant?: boolean;
+  isDepositionWall?: boolean;
 }
 
 export interface CrossSectionMesh {

@@ -19,8 +19,11 @@ import {
   moveBlockInTimeline,
   moveStepInTimeline,
   reorderBlockInTimeline,
-  reorderStepInTimeline,
   StepDropTarget,
+  reorderStepInTimeline,
+  reorderStepsInTimeline,
+  assignStepsToBlock,
+  deleteStepsFromTimeline,
   insertStepIntoTimeline,
   insertStepAfterIndex,
   deleteStepFromTimeline,
@@ -67,6 +70,9 @@ import {
   Frame,
   Slice,
   Bookmark,
+  CheckSquare,
+  Square,
+  Minus,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -116,6 +122,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   // Drag-and-drop reordering state for steps and fabrication blocks
   type DragSource =
     | { kind: 'step'; stepId: string; blockId?: string }
+    | { kind: 'steps'; stepIds: string[] }
     | { kind: 'block'; blockId: string };
 
   type DropIndicator =
@@ -131,8 +138,36 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   const [editingBookmarkStepId, setEditingBookmarkStepId] = useState<string | null>(null);
   const [editingBookmarkLabel, setEditingBookmarkLabel] = useState<string>('');
 
+  // Bulk Edit mode state
+  const [bulkEditMode, setBulkEditMode] = useState<boolean>(false);
+  const [selectedStepIds, setSelectedStepIds] = useState<Set<string>>(() => new Set());
+  const [lastBulkClickedStepId, setLastBulkClickedStepId] = useState<string | null>(null);
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState<boolean>(false);
+  const bulkDragPreviewRef = useRef<HTMLDivElement | null>(null);
+
   const stepCardRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const pendingScrollStepIdRef = useRef<string | null>(null);
+
+  const validSelectedIdsOrdered = useMemo(
+    () =>
+      flow.steps
+        .filter((s) => selectedStepIds.has(s.id))
+        .map((s) => s.id),
+    [flow.steps, selectedStepIds]
+  );
+  const validSelectedSet = useMemo(
+    () => new Set(validSelectedIdsOrdered),
+    [validSelectedIdsOrdered]
+  );
+
+  useEffect(() => {
+    if (flow.steps.length === 0 && bulkEditMode) {
+      setBulkEditMode(false);
+      setSelectedStepIds(new Set());
+      setLastBulkClickedStepId(null);
+      setBulkDeleteConfirm(false);
+    }
+  }, [flow.steps.length, bulkEditMode]);
 
   const blocks = flow.blocks || [];
   const subLayers = flow.substrateLayers || [
@@ -722,6 +757,103 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
     setDropIndicator(null);
   };
 
+  const toggleBulkEditMode = () => {
+    setBulkEditMode((prev) => {
+      if (prev) {
+        setSelectedStepIds(new Set());
+        setLastBulkClickedStepId(null);
+        setBulkDeleteConfirm(false);
+        clearDragState();
+      } else {
+        setBulkDeleteConfirm(false);
+      }
+      return !prev;
+    });
+  };
+
+  const toggleBulkStepSelection = (stepId: string, shiftKey: boolean) => {
+    setBulkDeleteConfirm(false);
+    if (shiftKey && lastBulkClickedStepId) {
+      const anchorIdx = flow.steps.findIndex((s) => s.id === lastBulkClickedStepId);
+      const targetIdx = flow.steps.findIndex((s) => s.id === stepId);
+      if (anchorIdx >= 0 && targetIdx >= 0) {
+        const start = Math.min(anchorIdx, targetIdx);
+        const end = Math.max(anchorIdx, targetIdx);
+        setSelectedStepIds((prev) => {
+          const next = new Set(prev);
+          for (let i = start; i <= end; i++) {
+            next.add(flow.steps[i].id);
+          }
+          return next;
+        });
+        setLastBulkClickedStepId(stepId);
+        return;
+      }
+    }
+
+    setSelectedStepIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(stepId)) {
+        next.delete(stepId);
+      } else {
+        next.add(stepId);
+      }
+      return next;
+    });
+    setLastBulkClickedStepId(stepId);
+  };
+
+  const toggleBulkBlockSelection = (blockSteps: { step: ProcessStep; idx: number }[]) => {
+    setBulkDeleteConfirm(false);
+    if (blockSteps.length === 0) return;
+    const allSelected = blockSteps.every(({ step }) => validSelectedSet.has(step.id));
+    setSelectedStepIds((prev) => {
+      const next = new Set(prev);
+      for (const { step } of blockSteps) {
+        if (allSelected) {
+          next.delete(step.id);
+        } else {
+          next.add(step.id);
+        }
+      }
+      return next;
+    });
+  };
+
+  const handleBulkSetEnabled = (enabled: boolean) => {
+    if (validSelectedIdsOrdered.length === 0) return;
+    const updatedSteps = flow.steps.map((s) =>
+      validSelectedSet.has(s.id) ? { ...s, enabled } : s
+    );
+    onUpdateFlow({ ...flow, steps: updatedSteps });
+  };
+
+  const handleBulkAssignBlock = (targetBlockId: string | null) => {
+    if (validSelectedIdsOrdered.length === 0) return;
+    const nextFlow = assignStepsToBlock(flow, validSelectedIdsOrdered, targetBlockId);
+    applyFlowWithActivePreserved(nextFlow);
+  };
+
+  const handleBulkDeleteSteps = () => {
+    if (validSelectedIdsOrdered.length === 0) return;
+    const activeId = activeStepIndex >= 0 ? flow.steps[activeStepIndex]?.id : null;
+    const nextFlow = deleteStepsFromTimeline(flow, validSelectedIdsOrdered);
+    onUpdateFlow(nextFlow);
+    if (nextFlow.steps.length === 0) {
+      onSelectStepIndex(-1);
+    } else if (activeId) {
+      const nextActiveIdx = nextFlow.steps.findIndex((s) => s.id === activeId);
+      if (nextActiveIdx >= 0) {
+        onSelectStepIndex(nextActiveIdx);
+      } else {
+        onSelectStepIndex(Math.min(Math.max(0, activeStepIndex), nextFlow.steps.length - 1));
+      }
+    }
+    setSelectedStepIds(new Set());
+    setLastBulkClickedStepId(null);
+    setBulkDeleteConfirm(false);
+  };
+
   const commitDrop = (indicator: DropIndicator | null) => {
     if (!dragSource || !indicator) {
       clearDragState();
@@ -742,6 +874,13 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       return;
     }
 
+    if (dragSource.kind === 'steps') {
+      const nextFlow = reorderStepsInTimeline(flow, dragSource.stepIds, indicator);
+      applyFlowWithActivePreserved(nextFlow);
+      clearDragState();
+      return;
+    }
+
     // dragSource.kind === 'step'
     const target: StepDropTarget = indicator;
     const nextFlow = reorderStepInTimeline(flow, dragSource.stepId, target);
@@ -749,11 +888,19 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
     clearDragState();
   };
 
-  const DropLine = () => (
-    <div className="relative h-0.5 my-0.5 bg-sky-400 rounded-full shadow-[0_0_8px_rgba(56,189,248,0.85)] pointer-events-none">
-      <span className="absolute -left-0.5 -top-[3px] w-2 h-2 rounded-full bg-sky-400" />
-    </div>
-  );
+  const DropLine = () => {
+    const bulkDragCount = dragSource?.kind === 'steps' ? dragSource.stepIds.length : 0;
+    return (
+      <div className="relative h-0.5 my-0.5 bg-sky-400 rounded-full shadow-[0_0_8px_rgba(56,189,248,0.85)] pointer-events-none">
+        <span className="absolute -left-0.5 -top-[3px] w-2 h-2 rounded-full bg-sky-400" />
+        {bulkDragCount > 1 && (
+          <span className="absolute right-1 -top-2.5 px-1.5 py-0.2 rounded bg-sky-500 text-slate-950 font-mono text-[9px] font-bold shadow">
+            Move {bulkDragCount} steps
+          </span>
+        )}
+      </div>
+    );
+  };
 
   // Render a step item card
   const renderStepItem = (
@@ -764,8 +911,10 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       | { scope: 'block'; blockId: string }
   ) => {
     const isSelected = activeStepIndex === globalIdx;
+    const isBulkSelected = bulkEditMode && validSelectedSet.has(step.id);
     const isBeingDragged =
-      dragSource?.kind === 'step' && dragSource.stepId === step.id;
+      (dragSource?.kind === 'step' && dragSource.stepId === step.id) ||
+      (dragSource?.kind === 'steps' && dragSource.stepIds.includes(step.id));
 
     const showBeforeLine =
       (context.scope === 'timeline' &&
@@ -792,6 +941,19 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
     const handleStepDragStart = (e: React.DragEvent<HTMLDivElement>) => {
       e.stopPropagation();
       e.dataTransfer.effectAllowed = 'move';
+      if (bulkEditMode && validSelectedSet.has(step.id) && validSelectedIdsOrdered.length > 1) {
+        e.dataTransfer.setData('text/plain', `steps:${validSelectedIdsOrdered.join(',')}`);
+        if (bulkDragPreviewRef.current) {
+          bulkDragPreviewRef.current.textContent = `Moving ${validSelectedIdsOrdered.length} steps`;
+          try {
+            e.dataTransfer.setDragImage(bulkDragPreviewRef.current, 18, 16);
+          } catch {
+            // ignore if unsupported
+          }
+        }
+        setDragSource({ kind: 'steps', stepIds: validSelectedIdsOrdered });
+        return;
+      }
       e.dataTransfer.setData('text/plain', `step:${step.id}`);
       setDragSource({ kind: 'step', stepId: step.id, blockId: step.blockId });
     };
@@ -823,8 +985,11 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         return;
       }
 
-      // Dragging a step
-      if (dragSource.stepId === step.id) {
+      // Dragging one or more steps
+      if (
+        (dragSource.kind === 'step' && dragSource.stepId === step.id) ||
+        (dragSource.kind === 'steps' && dragSource.stepIds.includes(step.id))
+      ) {
         setDropIndicator(null);
         return;
       }
@@ -864,7 +1029,10 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           timelineIndex: context.timelineIndex,
           position,
         };
-      } else if (dragSource.kind === 'step' && dragSource.stepId !== step.id) {
+      } else if (
+        (dragSource.kind === 'step' && dragSource.stepId !== step.id) ||
+        (dragSource.kind === 'steps' && !dragSource.stepIds.includes(step.id))
+      ) {
         target =
           context.scope === 'block'
             ? {
@@ -898,15 +1066,27 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           onDragOver={handleStepDragOver}
           onDrop={handleStepDrop}
           onDragEnd={clearDragState}
-          onClick={() => onSelectStepIndex(globalIdx)}
+          onClick={(e) => {
+            if (bulkEditMode) {
+              toggleBulkStepSelection(step.id, e.shiftKey);
+              return;
+            }
+            onSelectStepIndex(globalIdx);
+          }}
           onDoubleClick={() => {
+            if (bulkEditMode) {
+              onSelectStepIndex(globalIdx);
+              return;
+            }
             onSelectStepIndex(globalIdx);
             onOpenParameters?.();
           }}
           className={`group relative rounded-xl p-2 text-xs transition-all cursor-pointer border ${
             isBeingDragged ? 'opacity-40 scale-[0.98]' : ''
           } ${
-            isSelected
+            isBulkSelected
+              ? 'bg-indigo-950/60 border-indigo-400/80 ring-1 ring-indigo-400/50 text-white shadow-md'
+              : isSelected
               ? 'bg-sky-950/70 border-sky-500 text-white shadow-md'
               : step.bookmarked
               ? step.enabled
@@ -918,18 +1098,47 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           }`}
         >
           <div className="flex items-start gap-1.5 min-w-0">
+            {/* Bulk Edit Checkbox */}
+            {bulkEditMode && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleBulkStepSelection(step.id, e.shiftKey);
+                }}
+                aria-label={isBulkSelected ? `Deselect step ${globalIdx + 1}` : `Select step ${globalIdx + 1}`}
+                className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
+                  isBulkSelected
+                    ? 'bg-indigo-500 border-indigo-400 text-white shadow-sm'
+                    : 'bg-slate-900 border-slate-600 text-transparent hover:border-indigo-400'
+                }`}
+              >
+                <Check className="w-2.5 h-2.5 stroke-[3]" />
+              </button>
+            )}
+
             {/* Drag handle */}
             {!isFilterActive && (
               <GripVertical
-                className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5 mt-0.5"
-                aria-label="Drag to reorder step"
+                className={`w-3.5 h-3.5 cursor-grab active:cursor-grabbing flex-shrink-0 -ml-0.5 mt-0.5 ${
+                  isBulkSelected
+                    ? 'text-indigo-300'
+                    : 'text-slate-600 group-hover:text-slate-400'
+                }`}
+                aria-label={
+                  isBulkSelected && validSelectedIdsOrdered.length > 1
+                    ? `Drag to move ${validSelectedIdsOrdered.length} selected steps`
+                    : 'Drag to reorder step'
+                }
               />
             )}
 
             {/* Step global index badge */}
             <span
               className={`w-5 h-5 rounded-md flex items-center justify-center font-mono text-[10px] font-bold flex-shrink-0 mt-0.5 ${
-                isSelected
+                isBulkSelected
+                  ? 'bg-indigo-500 text-white'
+                  : isSelected
                   ? 'bg-sky-500 text-white'
                   : step.bookmarked
                   ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
@@ -1054,16 +1263,17 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             </div>
           </div>
 
-          {/* Step Quick Actions: docked footer bar on selected card, floating hover bar on unselected */}
-          <div
-            className={
-              isSelected
-                ? 'flex items-center justify-end gap-1 mt-1.5 pt-1 border-t border-sky-500/25'
-                : 'hidden group-hover:flex items-center gap-0.5 absolute right-1.5 top-1.5 z-10 rounded-lg bg-slate-900/95 border border-slate-700/90 px-1 py-0.5 shadow-lg'
-            }
-            onClick={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-          >
+          {/* Step Quick Actions: hidden in Bulk Edit mode so selection/drag stays clean */}
+          {!bulkEditMode && (
+            <div
+              className={
+                isSelected
+                  ? 'flex items-center justify-end gap-1 mt-1.5 pt-1 border-t border-sky-500/25'
+                  : 'hidden group-hover:flex items-center gap-0.5 absolute right-1.5 top-1.5 z-10 rounded-lg bg-slate-900/95 border border-slate-700/90 px-1 py-0.5 shadow-lg'
+              }
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+            >
             <button
               onClick={() => handleToggleBookmark(globalIdx)}
               className={`p-1 rounded hover:bg-slate-700/80 transition-colors ${
@@ -1125,6 +1335,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           </div>
+          )}
         </div>
         {showAfterLine && <DropLine />}
       </div>
@@ -1133,8 +1344,16 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
 
   return (
     <div className="flex flex-col h-full bg-slate-900 border-r border-slate-800 text-slate-200 select-none">
+      {/* Offscreen Multi-Step Drag Ghost Badge */}
+      <div
+        ref={bulkDragPreviewRef}
+        className="fixed -top-96 -left-96 pointer-events-none px-2.5 py-1.5 rounded-lg bg-indigo-600 border border-indigo-300 text-white text-xs font-semibold shadow-xl"
+      >
+        Moving steps
+      </div>
+
       {/* Sidebar Top Header */}
-      <div className="px-2.5 py-1.5 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+      <div className="px-2.5 py-1.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-1.5 shrink-0">
         <div className="min-w-0">
           <span className="text-[11px] font-bold text-slate-200 tracking-wider uppercase leading-tight block truncate">
             Process Traveller
@@ -1145,6 +1364,22 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            disabled={flow.steps.length === 0}
+            onClick={toggleBulkEditMode}
+            aria-pressed={bulkEditMode}
+            className={`flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md border transition-colors disabled:opacity-40 disabled:pointer-events-none ${
+              bulkEditMode
+                ? 'bg-indigo-600 border-indigo-400 text-white shadow-sm'
+                : 'bg-slate-800 hover:bg-slate-700 text-indigo-300 border-slate-700'
+            }`}
+            title="Toggle Bulk Edit Mode to select and drag-reorder multiple steps simultaneously"
+          >
+            <CheckSquare className="w-3 h-3" />
+            <span>{bulkEditMode ? 'Done' : 'Bulk Edit'}</span>
+          </button>
+
           <button
             onClick={() => handleOpenCreateBlock(false)}
             className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 transition-colors"
@@ -1580,6 +1815,142 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
         </div>
       )}
 
+      {/* Bulk Edit Toolbar */}
+      {bulkEditMode && (
+        <div className="px-2.5 py-2 border-b border-indigo-500/40 bg-indigo-950/35 shrink-0 space-y-1.5">
+          <div className="flex items-center justify-between gap-1.5">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <CheckSquare className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+              <span className="text-[11px] font-semibold text-indigo-200 truncate">
+                {validSelectedIdsOrdered.length > 0
+                  ? `${validSelectedIdsOrdered.length} selected`
+                  : 'Bulk Edit'}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 shrink-0 text-[10px]">
+              <button
+                type="button"
+                onClick={() => {
+                  setBulkDeleteConfirm(false);
+                  setSelectedStepIds(new Set(flow.steps.map((s) => s.id)));
+                }}
+                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium transition-colors"
+              >
+                All
+              </button>
+              <button
+                type="button"
+                disabled={validSelectedIdsOrdered.length === 0}
+                onClick={() => {
+                  setBulkDeleteConfirm(false);
+                  setSelectedStepIds(new Set());
+                  setLastBulkClickedStepId(null);
+                }}
+                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 disabled:opacity-35 font-medium transition-colors"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={toggleBulkEditMode}
+                className="px-1.5 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition-colors"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+
+          {validSelectedIdsOrdered.length > 0 ? (
+            <div className="space-y-1.5">
+              <div className="flex flex-wrap items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => handleBulkSetEnabled(true)}
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] text-emerald-300 font-medium transition-colors"
+                  title="Enable selected steps"
+                >
+                  <Eye className="w-3 h-3" />
+                  <span>Enable</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkSetEnabled(false)}
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] text-amber-300 font-medium transition-colors"
+                  title="Mute selected steps"
+                >
+                  <EyeOff className="w-3 h-3" />
+                  <span>Mute</span>
+                </button>
+
+                {blocks.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (!val) return;
+                      handleBulkAssignBlock(val === '__ungroup__' ? null : val);
+                    }}
+                    aria-label="Move selected steps to block"
+                    className="flex-1 min-w-[95px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-200 focus:outline-none focus:border-indigo-400 cursor-pointer"
+                  >
+                    <option value="" disabled>
+                      Move to block...
+                    </option>
+                    {blocks.map((b) => (
+                      <option key={b.id} value={b.id} className="bg-slate-900">
+                        {b.name}
+                      </option>
+                    ))}
+                    <option value="__ungroup__" className="bg-slate-900">
+                      Ungroup from block
+                    </option>
+                  </select>
+                )}
+
+                {bulkDeleteConfirm ? (
+                  <div className="flex items-center gap-1 ml-auto">
+                    <button
+                      type="button"
+                      onClick={handleBulkDeleteSteps}
+                      className="px-1.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-semibold"
+                    >
+                      Delete ({validSelectedIdsOrdered.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBulkDeleteConfirm(false)}
+                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setBulkDeleteConfirm(true)}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-rose-500/20 border border-slate-700 hover:border-rose-500/40 text-[10px] text-rose-300 font-medium ml-auto transition-colors"
+                    title="Delete selected steps"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Delete</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="text-[10px] text-indigo-300/90 leading-tight">
+                {isFilterActive
+                  ? 'Clear search/milestone filter to drag-reorder selected steps.'
+                  : 'Drag any selected step to move all selected steps together.'}
+              </div>
+            </div>
+          ) : (
+            <div className="text-[10px] text-slate-400 leading-tight">
+              Click or Shift+click steps to select multiple steps, then drag to reposition together.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* FABRICATION STEPS LIST - GROUPED BY BLOCK HIERARCHY */}
       <div
         className="flex-1 overflow-y-auto p-2 space-y-3"
@@ -1802,7 +2173,14 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                 };
               }
 
-              // dragSource.kind === 'step'
+              // dragSource.kind === 'step' | 'steps'
+              const draggedAllInThisBlock =
+                dragSource.kind === 'step'
+                  ? dragSource.blockId === block.id
+                  : dragSource.stepIds.every(
+                      (id) => flow.steps.find((s) => s.id === id)?.blockId === block.id
+                    );
+
               if (zone === 'header') {
                 const rect = e.currentTarget.getBoundingClientRect();
                 const relY = e.clientY - rect.top;
@@ -1820,14 +2198,14 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                     position: 'after',
                   };
                 }
-                if (dragSource.blockId !== block.id) {
+                if (!draggedAllInThisBlock) {
                   return { kind: 'into-block', blockId: block.id };
                 }
                 return null;
               }
 
               if (zone === 'body') {
-                if (dragSource.blockId !== block.id) {
+                if (!draggedAllInThisBlock) {
                   return { kind: 'into-block', blockId: block.id };
                 }
                 return null;
@@ -1917,6 +2295,42 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   >
                     <div className="flex items-start justify-between gap-1.5">
                       <div className="flex items-start gap-1.5 min-w-0 flex-1">
+                        {bulkEditMode && blockStepsWithIndex.length > 0 && (() => {
+                          const selectedCountInBlock = blockStepsWithIndex.filter(({ step }) =>
+                            validSelectedSet.has(step.id)
+                          ).length;
+                          const allInBlockSelected =
+                            selectedCountInBlock === blockStepsWithIndex.length;
+                          const someInBlockSelected =
+                            selectedCountInBlock > 0 && !allInBlockSelected;
+                          return (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleBulkBlockSelection(blockStepsWithIndex);
+                              }}
+                              title={
+                                allInBlockSelected
+                                  ? 'Deselect all steps in this block'
+                                  : 'Select all steps in this block'
+                              }
+                              className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 mt-0.5 transition-colors ${
+                                allInBlockSelected || someInBlockSelected
+                                  ? 'bg-indigo-500 border-indigo-400 text-white'
+                                  : 'bg-slate-900 border-slate-600 text-transparent hover:border-indigo-400'
+                              }`}
+                            >
+                              {allInBlockSelected ? (
+                                <Check className="w-2.5 h-2.5 stroke-[3]" />
+                              ) : someInBlockSelected ? (
+                                <Minus className="w-2.5 h-2.5 stroke-[3]" />
+                              ) : (
+                                <Square className="w-2.5 h-2.5" />
+                              )}
+                            </button>
+                          );
+                        })()}
                         {!isEditing && (
                           <GripVertical
                             className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-300 cursor-grab active:cursor-grabbing shrink-0 -ml-0.5 mt-0.5"
@@ -1972,9 +2386,22 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                         )}
                       </div>
 
-                      <span className="text-[10px] font-mono text-slate-300 bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 rounded shrink-0 mt-0.5">
-                        {blockStepsWithIndex.length} {blockStepsWithIndex.length === 1 ? 'step' : 'steps'}
-                      </span>
+                      <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                        {bulkEditMode && (() => {
+                          const selInBlock = blockStepsWithIndex.filter(({ step }) =>
+                            validSelectedSet.has(step.id)
+                          ).length;
+                          if (selInBlock === 0) return null;
+                          return (
+                            <span className="text-[9.5px] font-mono text-indigo-200 bg-indigo-500/30 border border-indigo-400/50 px-1 py-0.5 rounded">
+                              {selInBlock} sel
+                            </span>
+                          );
+                        })()}
+                        <span className="text-[10px] font-mono text-slate-300 bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 rounded">
+                          {blockStepsWithIndex.length} {blockStepsWithIndex.length === 1 ? 'step' : 'steps'}
+                        </span>
+                      </div>
                     </div>
 
                     <div
@@ -2038,7 +2465,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                     <div
                       className="p-1.5 space-y-1 bg-slate-950/20"
                       onDragOver={(e) => {
-                        if (!dragSource || dragSource.kind !== 'step') return;
+                        if (!dragSource || dragSource.kind === 'block') return;
                         if (blockStepsWithIndex.length === 0) {
                           const target = computeBlockDropTarget(e, 'body');
                           if (!target) return;
@@ -2049,7 +2476,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                         }
                       }}
                       onDrop={(e) => {
-                        if (!dragSource || dragSource.kind !== 'step') return;
+                        if (!dragSource || dragSource.kind === 'block') return;
                         if (blockStepsWithIndex.length === 0) {
                           const target = computeBlockDropTarget(e, 'body');
                           if (!target) return;

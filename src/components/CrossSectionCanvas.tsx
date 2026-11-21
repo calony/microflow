@@ -28,8 +28,19 @@ import {
   EyeOff,
   PictureInPicture2,
   ArrowUpRight,
+  ChevronLeft,
+  ChevronRight,
   X,
+  Square,
+  Axis3d,
+  Magnet,
 } from 'lucide-react';
+
+interface InsetStepOption {
+  stepIndex: number;
+  stepNumber: number;
+  title: string;
+}
 
 interface CrossSectionCanvasProps {
   mesh: CrossSectionMesh;
@@ -47,6 +58,11 @@ interface CrossSectionCanvasProps {
   finalPolygons?: RenderedPolygon[];
   finalStepNumber?: number;
   finalStepTitle?: string;
+  canShowInsetButton?: boolean;
+  insetStepOptions?: InsetStepOption[];
+  selectedInsetStepIndex?: number;
+  isInsetFinalStep?: boolean;
+  onChangeInsetStep?: (stepIndex: number) => void;
   showFinalInset?: boolean;
   onToggleFinalInset?: () => void;
   onSelectFinalStep?: () => void;
@@ -68,6 +84,11 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   finalPolygons,
   finalStepNumber,
   finalStepTitle,
+  canShowInsetButton,
+  insetStepOptions,
+  selectedInsetStepIndex,
+  isInsetFinalStep = true,
+  onChangeInsetStep,
   showFinalInset = false,
   onToggleFinalInset,
   onSelectFinalStep,
@@ -135,15 +156,21 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Measurement caliper tool
   const [measureMode, setMeasureMode] = useState<boolean>(false);
+  const [caliperSnap, setCaliperSnap] = useState<boolean>(true);
+  const [caliperAngleSnap, setCaliperAngleSnap] = useState<boolean>(true);
+  const [shiftKeyDown, setShiftKeyDown] = useState<boolean>(false);
+  const [ctrlKeyDown, setCtrlKeyDown] = useState<boolean>(false);
   const [measurePoints, setMeasurePoints] = useState<{ x: number; y: number }[]>([]);
 
-  // Hovered layer inspector
+  // Hovered layer inspector & cursor SVG coordinate
   const [hoveredPolygon, setHoveredPolygon] = useState<RenderedPolygon | null>(null);
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [hoverWorldPos, setHoverWorldPos] = useState<{ x: number; y: number } | null>(null);
+  const [hoverSvgPos, setHoverSvgPos] = useState<{ x: number; y: number } | null>(null);
 
   // Display toggles
-  const [showGrid, setShowGrid] = useState<boolean>(true);
+  const [showOutlines, setShowOutlines] = useState<boolean>(true);
+  const [showAxesAndLabels, setShowAxesAndLabels] = useState<boolean>(true);
   const [renderMode, setRenderMode] = useState<'hatch' | 'solid'>('hatch');
   const [showLegend, setShowLegend] = useState<boolean>(true);
   const [insetExpanded, setInsetExpanded] = useState<boolean>(false);
@@ -267,6 +294,153 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     },
     [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX, waferWidth]
   );
+
+  // Screen-space snap lookup for Caliper (vertices > edge midpoints > edge projections)
+  const findGeometrySnap = useCallback(
+    (
+      unscaledSx: number,
+      unscaledSy: number
+    ): { point: { x: number; y: number }; kind: 'vertex' | 'midpoint' | 'edge' } | null => {
+      if (polygons.length === 0) return null;
+
+      const safeZoom = Math.max(0.12, zoom);
+      const vertexThreshold = 12 / safeZoom;
+      const midpointThreshold = 9 / safeZoom;
+      const edgeThreshold = 10 / safeZoom;
+      const minEdgeLenForMidpoint = 16 / safeZoom;
+
+      let bestVertex: { x: number; y: number } | null = null;
+      let bestVertexDist = vertexThreshold;
+
+      let bestMidpoint: { x: number; y: number } | null = null;
+      let bestMidpointDist = midpointThreshold;
+
+      let bestEdge: { x: number; y: number } | null = null;
+      let bestEdgeDist = edgeThreshold;
+
+      for (const poly of polygons) {
+        const pts = poly.points;
+        const n = pts.length;
+        if (n < 2) continue;
+
+        for (let i = 0; i < n; i++) {
+          const a = pts[i];
+          const sA = toScreen(a.x, a.y);
+
+          const vDist = Math.hypot(unscaledSx - sA.x, unscaledSy - sA.y);
+          if (vDist < bestVertexDist) {
+            bestVertexDist = vDist;
+            bestVertex = { x: a.x, y: a.y };
+          }
+
+          const b = pts[(i + 1) % n];
+          const sB = toScreen(b.x, b.y);
+          const dx = sB.x - sA.x;
+          const dy = sB.y - sA.y;
+          const lenSq = dx * dx + dy * dy;
+          if (lenSq < 1e-6) continue;
+
+          if (Math.sqrt(lenSq) >= minEdgeLenForMidpoint) {
+            const midSx = (sA.x + sB.x) * 0.5;
+            const midSy = (sA.y + sB.y) * 0.5;
+            const mDist = Math.hypot(unscaledSx - midSx, unscaledSy - midSy);
+            if (mDist < bestMidpointDist) {
+              bestMidpointDist = mDist;
+              bestMidpoint = { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 };
+            }
+          }
+
+          const t = Math.max(
+            0,
+            Math.min(1, ((unscaledSx - sA.x) * dx + (unscaledSy - sA.y) * dy) / lenSq)
+          );
+          const projSx = sA.x + t * dx;
+          const projSy = sA.y + t * dy;
+          const eDist = Math.hypot(unscaledSx - projSx, unscaledSy - projSy);
+          if (eDist < bestEdgeDist) {
+            bestEdgeDist = eDist;
+            bestEdge = {
+              x: a.x + t * (b.x - a.x),
+              y: a.y + t * (b.y - a.y),
+            };
+          }
+        }
+      }
+
+      if (bestVertex) return { point: bestVertex, kind: 'vertex' };
+      if (bestMidpoint) return { point: bestMidpoint, kind: 'midpoint' };
+      if (bestEdge) return { point: bestEdge, kind: 'edge' };
+      return null;
+    },
+    [polygons, zoom, toScreen]
+  );
+
+  const activeSnapTarget = useMemo(() => {
+    if (!measureMode || !caliperSnap || !hoverSvgPos) return null;
+    return findGeometrySnap(hoverSvgPos.x, hoverSvgPos.y);
+  }, [measureMode, caliperSnap, hoverSvgPos, findGeometrySnap]);
+
+  const constrainCaliperPoint = useCallback(
+    (
+      startWorld: { x: number; y: number },
+      rawTargetWorld: { x: number; y: number }
+    ): { point: { x: number; y: number }; modeLabel: 'H' | 'V' | '45°' } => {
+      const s1 = toScreen(startWorld.x, startWorld.y);
+      const s2 = toScreen(rawTargetWorld.x, rawTargetWorld.y);
+      const sdx = s2.x - s1.x;
+      const sdy = s2.y - s1.y;
+      if (Math.hypot(sdx, sdy) < 1e-3) {
+        return { point: { ...rawTargetWorld }, modeLabel: 'H' };
+      }
+      const angle = Math.atan2(sdy, sdx);
+      const sector = ((Math.round(angle / (Math.PI / 4)) % 8) + 8) % 8;
+
+      if (sector === 0 || sector === 4) {
+        return {
+          point: { x: rawTargetWorld.x, y: startWorld.y },
+          modeLabel: 'H',
+        };
+      }
+      if (sector === 2 || sector === 6) {
+        return {
+          point: { x: startWorld.x, y: rawTargetWorld.y },
+          modeLabel: 'V',
+        };
+      }
+      const theta = sector * (Math.PI / 4);
+      const ux = Math.cos(theta);
+      const uy = Math.sin(theta);
+      const proj = sdx * ux + sdy * uy;
+      return {
+        point: toWorld(s1.x + proj * ux, s1.y + proj * uy),
+        modeLabel: '45°',
+      };
+    },
+    [toScreen, toWorld]
+  );
+
+  // Track Shift key state dynamically while Caliper mode is active
+  useEffect(() => {
+    if (!measureMode) {
+      setShiftKeyDown(false);
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setShiftKeyDown(true);
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setShiftKeyDown(false);
+    };
+    const handleBlur = () => setShiftKeyDown(false);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [measureMode]);
 
   // Compute local vertical thickness of a hovered polygon at cursor world (x, y)
   const computeLocalThicknessAtPoint = useCallback(
@@ -489,7 +663,10 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Commit selected region zoom uniformly so selection aspect ratio never stretches geometry
   const commitRegionZoom = useCallback(
-    (sel: { startX: number; startY: number; endX: number; endY: number }) => {
+    (
+      sel: { startX: number; startY: number; endX: number; endY: number },
+      isZoomOut = false
+    ) => {
       const selLeft = Math.min(sel.startX, sel.endX);
       const selRight = Math.max(sel.startX, sel.endX);
       const selTop = Math.min(sel.startY, sel.endY);
@@ -498,8 +675,8 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       const selH = selBottom - selTop;
 
       if (selW < 8 && selH < 8) {
-        // Single click in magnifying glass mode zooms 2x centered on clicked point
-        zoomAroundPoint(zoom * 2.0, sel.startX, sel.startY);
+        // Single click in magnifying glass mode zooms 2x in (or 2x out when holding Ctrl)
+        zoomAroundPoint(isZoomOut ? zoom * 0.5 : zoom * 2.0, sel.startX, sel.startY);
         return;
       }
 
@@ -514,11 +691,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       const uCenterY = (selCenterSvgY - pan.y) / zoom;
 
       // Apply uniform scalar zoom based on tightest axis so entire region fits without distortion
-      const scaleFactor = Math.min(
+      const regionScale = Math.min(
         (svgWidth * 0.92) / safeSelW,
         (svgHeight * 0.92) / safeSelH
       );
-      const newZoom = Math.max(0.12, Math.min(25.0, zoom * scaleFactor));
+      const newZoom = isZoomOut
+        ? Math.max(0.12, Math.min(25.0, zoom / Math.max(1.25, Math.min(8.0, regionScale))))
+        : Math.max(0.12, Math.min(25.0, zoom * regionScale));
 
       setZoom(newZoom);
       setPan({
@@ -553,6 +732,25 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [fitToScreen, zoomSelection, regionZoomMode, measureMode]);
 
+  useEffect(() => {
+    const syncModifiers = (e: KeyboardEvent) => {
+      setCtrlKeyDown(e.ctrlKey);
+      setShiftKeyDown(e.shiftKey);
+    };
+    const resetModifiers = () => {
+      setCtrlKeyDown(false);
+      setShiftKeyDown(false);
+    };
+    window.addEventListener('keydown', syncModifiers);
+    window.addEventListener('keyup', syncModifiers);
+    window.addEventListener('blur', resetModifiers);
+    return () => {
+      window.removeEventListener('keydown', syncModifiers);
+      window.removeEventListener('keyup', syncModifiers);
+      window.removeEventListener('blur', resetModifiers);
+    };
+  }, []);
+
   // Listen to fullscreen change
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -571,6 +769,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   useEffect(() => {
     if (!zoomSelection) return;
     const handleWindowPointerMove = (e: PointerEvent) => {
+      setCtrlKeyDown(e.ctrlKey);
       const svgP = clientToSvg(e.clientX, e.clientY);
       if (!svgP) return;
       setZoomSelection((prev) =>
@@ -583,10 +782,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           : null
       );
     };
-    const handleWindowPointerUp = () => {
+    const handleWindowPointerUp = (e: PointerEvent) => {
+      const isCancel = e.type === 'pointercancel';
+      const isZoomOut = e.ctrlKey || ctrlKeyDown;
       setZoomSelection((prev) => {
-        if (prev) {
-          commitRegionZoom(prev);
+        if (prev && !isCancel) {
+          commitRegionZoom(prev, isZoomOut);
         }
         return null;
       });
@@ -599,7 +800,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       window.removeEventListener('pointerup', handleWindowPointerUp);
       window.removeEventListener('pointercancel', handleWindowPointerUp);
     };
-  }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight]);
+  }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight, ctrlKeyDown]);
 
   // Prevent mobile browser page pinch-zoom inside the SVG viewport so custom canvas pinch-zoom works
   useEffect(() => {
@@ -671,6 +872,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     const svgP = clientToSvg(e.clientX, e.clientY);
 
     if (regionZoomMode && svgP) {
+      setCtrlKeyDown(e.ctrlKey);
       setZoomSelection({
         startX: svgP.x,
         startY: svgP.y,
@@ -681,14 +883,20 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     }
 
     if (measureMode && svgP) {
+      setShiftKeyDown(e.shiftKey);
       const clickX = (svgP.x - pan.x) / zoom;
       const clickY = (svgP.y - pan.y) / zoom;
-      const worldPt = toWorld(clickX, clickY);
+      const snapped = caliperSnap ? findGeometrySnap(clickX, clickY) : null;
+      const basePt = snapped ? snapped.point : toWorld(clickX, clickY);
 
-      if (measurePoints.length >= 2) {
-        setMeasurePoints([worldPt]);
+      if (measurePoints.length === 1) {
+        const useAngleLock = caliperAngleSnap && (e.shiftKey || shiftKeyDown);
+        const finalPt = useAngleLock
+          ? constrainCaliperPoint(measurePoints[0], basePt).point
+          : basePt;
+        setMeasurePoints([measurePoints[0], finalPt]);
       } else {
-        setMeasurePoints([...measurePoints, worldPt]);
+        setMeasurePoints([basePt]);
       }
       return;
     }
@@ -735,10 +943,17 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
     const rect = e.currentTarget.getBoundingClientRect();
     setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    if (e.shiftKey !== shiftKeyDown) {
+      setShiftKeyDown(e.shiftKey);
+    }
+    if (e.ctrlKey !== ctrlKeyDown) {
+      setCtrlKeyDown(e.ctrlKey);
+    }
     const svgP = clientToSvg(e.clientX, e.clientY);
     if (svgP) {
       const unscaledX = (svgP.x - pan.x) / zoom;
       const unscaledY = (svgP.y - pan.y) / zoom;
+      setHoverSvgPos({ x: unscaledX, y: unscaledY });
       setHoverWorldPos(toWorld(unscaledX, unscaledY));
     }
 
@@ -830,7 +1045,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         </div>
 
         {/* Right: Viewport Controls */}
-        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0 ml-auto">
+        <div className="flex flex-wrap items-center gap-1 sm:gap-1.5 shrink-0 ml-auto">
           {/* Zoom Controls (hidden on <sm because Floating Bottom-Right HUD covers it cleanly) */}
           <div className="hidden sm:flex items-center gap-0.5 bg-slate-800/90 border border-slate-700/80 rounded-lg p-0.5 shrink-0 shadow-sm">
             <button
@@ -865,7 +1080,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   ? 'bg-sky-500 text-white shadow-sm ring-1 ring-sky-300/60'
                   : 'text-slate-300 hover:text-white hover:bg-slate-700'
               }`}
-              title="Magnifying Glass: Drag a region to zoom without altering geometry aspect ratio"
+              title="Magnifying Glass: Drag a region or click to zoom in (hold Ctrl to zoom out)"
             >
               <Search className="w-3.5 h-3.5" />
               <span className="hidden md:inline">Zoom Area</span>
@@ -926,6 +1141,42 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             Hatch
           </button>
 
+          {/* Shape Outline Toggle */}
+          <button
+            type="button"
+            onClick={() => setShowOutlines((v) => !v)}
+            aria-pressed={showOutlines}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              showOutlines
+                ? 'bg-sky-600/20 border-sky-500/50 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+            title={showOutlines ? 'Hide Shape Outlines' : 'Show Shape Outlines'}
+          >
+            <Square className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Outline</span>
+          </button>
+
+          {/* Graph Axes, Grid & Labels Toggle */}
+          <button
+            type="button"
+            onClick={() => setShowAxesAndLabels((v) => !v)}
+            aria-pressed={showAxesAndLabels}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              showAxesAndLabels
+                ? 'bg-sky-600/20 border-sky-500/50 text-sky-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+            title={
+              showAxesAndLabels
+                ? 'Hide Graph Axes, Grid & Labels'
+                : 'Show Graph Axes, Grid & Labels'
+            }
+          >
+            <Axis3d className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Axes</span>
+          </button>
+
           {/* Material Legend Toggle */}
           <button
             type="button"
@@ -941,8 +1192,8 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             <span className="hidden md:inline">Legend</span>
           </button>
 
-          {/* Final Step Inset Preview Toggle */}
-          {onToggleFinalInset && finalStepNumber !== undefined && (
+          {/* Step Inset Preview Toggle */}
+          {onToggleFinalInset && (canShowInsetButton ?? finalStepNumber !== undefined) && (
             <button
               type="button"
               onClick={onToggleFinalInset}
@@ -952,39 +1203,62 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
               }`}
               title={
-                stepNumber !== undefined && stepNumber >= finalStepNumber
-                  ? 'Final step inset preview (active when viewing an earlier step)'
+                insetStepOptions && insetStepOptions.length === 0
+                  ? 'Inset preview (active when viewing an earlier step)'
                   : showFinalInset
-                  ? 'Hide final process step inset'
-                  : 'Show inset preview of final process step'
+                  ? 'Hide step inset preview'
+                  : 'Show inset preview of a later process step'
               }
             >
               <PictureInPicture2 className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Final Inset</span>
+              <span className="hidden md:inline">Inset</span>
             </button>
           )}
 
-          {/* Caliper Measurement tool */}
-          <button
-            onClick={() => {
-              const next = !measureMode;
-              setMeasureMode(next);
-              setMeasurePoints([]);
-              if (next) {
-                setRegionZoomMode(false);
-                setZoomSelection(null);
+          {/* Caliper Measurement tool & Geometry Snap */}
+          <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => {
+                const next = !measureMode;
+                setMeasureMode(next);
+                setMeasurePoints([]);
+                if (next) {
+                  setRegionZoomMode(false);
+                  setZoomSelection(null);
+                }
+              }}
+              className={`flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors ${
+                measureMode
+                  ? 'bg-amber-500/20 text-amber-300'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/60'
+              }`}
+              title="Measure distances (Caliper)"
+            >
+              <Ruler className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Caliper</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setCaliperSnap((v) => !v)}
+              aria-pressed={caliperSnap}
+              className={`flex items-center gap-1 px-1.5 py-1 border-l border-slate-700 text-[11px] font-medium transition-colors ${
+                caliperSnap
+                  ? measureMode
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-sky-600/20 text-sky-300'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/60'
+              }`}
+              title={
+                caliperSnap
+                  ? 'Snap to Geometry: On (vertices, midpoints, edges)'
+                  : 'Snap to Geometry: Off'
               }
-            }}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
-              measureMode
-                ? 'bg-amber-500/20 border-amber-500 text-amber-300'
-                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
-            }`}
-            title="Measure distances (Caliper)"
-          >
-            <Ruler className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Caliper</span>
-          </button>
+            >
+              <Magnet className="w-3.5 h-3.5" />
+              <span className="hidden lg:inline">Snap</span>
+            </button>
+          </div>
 
           {/* Export SVG */}
           <button
@@ -1017,7 +1291,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         onWheel={handleWheel}
         className={`relative flex-1 min-h-0 w-full overflow-hidden bg-[#060a12] touch-none ${
           regionZoomMode
-            ? 'cursor-zoom-in'
+            ? ctrlKeyDown
+              ? 'cursor-zoom-out'
+              : 'cursor-zoom-in'
             : measureMode
             ? 'cursor-crosshair'
             : isPanning
@@ -1034,13 +1310,17 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
+          onPointerLeave={() => {
+            setHoverSvgPos(null);
+            setHoverWorldPos(null);
+          }}
         >
           <SvgPatterns materials={materials} />
 
           {/* Master Transform Group (Pan & Zoom) */}
           <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
             {/* Grid background */}
-            {showGrid && (
+            {showAxesAndLabels && (
               <g opacity="0.15">
                 {/* Vertical grid lines (every 1 µm) */}
                 {Array.from({ length: 11 }).map((_, i) => {
@@ -1079,8 +1359,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                     key={poly.id}
                     d={pathStr}
                     fill={fillRef}
-                    stroke={isHovered ? '#38bdf8' : mat.strokeColor || '#1e293b'}
-                    strokeWidth={isHovered ? 2.5 : 1.2}
+                    stroke={
+                      isHovered
+                        ? '#38bdf8'
+                        : showOutlines
+                        ? mat.strokeColor || '#1e293b'
+                        : 'none'
+                    }
+                    strokeWidth={isHovered ? 2.5 : showOutlines ? 1.2 : 0}
                     className="transition-colors cursor-pointer"
                     onMouseEnter={() => setHoveredPolygon(poly)}
                     onMouseLeave={() => setHoveredPolygon(null)}
@@ -1168,16 +1454,18 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                         strokeWidth="1"
                       />
 
-                      <text
-                        x={rightX + extW + jawW + 5}
-                        y={(yMinPx + yMaxPx) / 2 + 3}
-                        fill="#38bdf8"
-                        fontSize="8.5"
-                        fontWeight="600"
-                        fontFamily="JetBrains Mono, monospace"
-                      >
-                        FRAME
-                      </text>
+                      {showAxesAndLabels && (
+                        <text
+                          x={rightX + extW + jawW + 5}
+                          y={(yMinPx + yMaxPx) / 2 + 3}
+                          fill="#38bdf8"
+                          fontSize="8.5"
+                          fontWeight="600"
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          FRAME
+                        </text>
+                      )}
                     </g>
                   );
                 })}
@@ -1185,144 +1473,263 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             )}
 
             {/* Wafer X Axis & Coordinates */}
-            <g id="wafer-axes">
-              {/* Bottom datum line */}
-              {(() => {
-                const datumY = toScreen(0, rawMinY).y;
-                return (
-                  <>
-                    <line
-                      x1={effectivePaddingX}
-                      y1={datumY}
-                      x2={effectivePaddingX + effectiveContentWidth}
-                      y2={datumY}
-                      stroke="#64748b"
-                      strokeWidth="1.5"
-                    />
-
-                    {/* Ticks along X */}
-                    {Array.from({ length: 11 }).map((_, i) => {
-                      const xNm = (waferWidth / 10) * i;
-                      const xUm = (xNm / 1000).toFixed(1);
-                      const pt = toScreen(xNm, 0);
-                      return (
-                        <g key={`xtick_${i}`} transform={`translate(${pt.x}, ${datumY})`}>
-                          <line y1="0" y2="6" stroke="#64748b" strokeWidth="1" />
-                          <text
-                            y="18"
-                            textAnchor="middle"
-                            fill="#94a3b8"
-                            fontSize="9.5"
-                            fontFamily="JetBrains Mono, monospace"
-                          >
-                            {xUm} µm
-                          </text>
-                        </g>
-                      );
-                    })}
-
-                    {/* Wafer Orientation Markers (Frontside +Z / Backside -Z) */}
-                    <text
-                      x={effectivePaddingX}
-                      y={toScreen(0, rawMaxY).y - 10}
-                      fill={
-                        activeStepSide === 'front' || !activeStepSide
-                          ? '#38bdf8'
-                          : activeStepSide === 'both'
-                          ? '#34d399'
-                          : '#64748b'
-                      }
-                      fontSize="9.5"
-                      fontWeight="600"
-                      fontFamily="JetBrains Mono, monospace"
-                    >
-                      ▲ FRONTSIDE (+Z)
-                    </text>
-                    <text
-                      x={effectivePaddingX}
-                      y={datumY + 34}
-                      fill={
-                        activeStepSide === 'back'
-                          ? '#fbbf24'
-                          : activeStepSide === 'both'
-                          ? '#34d399'
-                          : '#64748b'
-                      }
-                      fontSize="9.5"
-                      fontWeight="600"
-                      fontFamily="JetBrains Mono, monospace"
-                    >
-                      ▼ BACKSIDE (-Z)
-                    </text>
-                  </>
-                );
-              })()}
-            </g>
-
-            {/* Caliper measurement lines */}
-            {measurePoints.length > 0 && (
-              <g id="caliper-measurement">
-                {measurePoints.map((pt, i) => {
-                  const s = toScreen(pt.x, pt.y);
+            {showAxesAndLabels && (
+              <g id="wafer-axes">
+                {/* Bottom datum line */}
+                {(() => {
+                  const datumY = toScreen(0, rawMinY).y;
                   return (
-                    <circle
-                      key={`meas_pt_${i}`}
-                      cx={s.x}
-                      cy={s.y}
-                      r="4"
-                      fill="#f59e0b"
-                      stroke="#fff"
-                      strokeWidth="1.5"
-                    />
-                  );
-                })}
-
-                {measurePoints.length === 2 && (() => {
-                  const p1 = toScreen(measurePoints[0].x, measurePoints[0].y);
-                  const p2 = toScreen(measurePoints[1].x, measurePoints[1].y);
-                  const dxNm = Math.abs(measurePoints[1].x - measurePoints[0].x);
-                  const dyNm = Math.abs(measurePoints[1].y - measurePoints[0].y);
-                  const distNm = Math.sqrt(dxNm * dxNm + dyNm * dyNm);
-                  const midX = (p1.x + p2.x) / 2;
-                  const midY = (p1.y + p2.y) / 2;
-
-                  return (
-                    <g>
+                    <>
                       <line
-                        x1={p1.x}
-                        y1={p1.y}
-                        x2={p2.x}
-                        y2={p2.y}
-                        stroke="#f59e0b"
-                        strokeWidth="1.8"
-                        strokeDasharray="4 3"
+                        x1={effectivePaddingX}
+                        y1={datumY}
+                        x2={effectivePaddingX + effectiveContentWidth}
+                        y2={datumY}
+                        stroke="#64748b"
+                        strokeWidth="1.5"
                       />
-                      <rect
-                        x={midX - 72}
-                        y={midY - 26}
-                        width="144"
-                        height="24"
-                        rx="5"
-                        fill="#0f172a"
-                        stroke="#f59e0b"
-                        strokeWidth="1.2"
-                      />
+
+                      {/* Ticks along X */}
+                      {Array.from({ length: 11 }).map((_, i) => {
+                        const xNm = (waferWidth / 10) * i;
+                        const xUm = (xNm / 1000).toFixed(1);
+                        const pt = toScreen(xNm, 0);
+                        return (
+                          <g key={`xtick_${i}`} transform={`translate(${pt.x}, ${datumY})`}>
+                            <line y1="0" y2="6" stroke="#64748b" strokeWidth="1" />
+                            <text
+                              y="18"
+                              textAnchor="middle"
+                              fill="#94a3b8"
+                              fontSize="9.5"
+                              fontFamily="JetBrains Mono, monospace"
+                            >
+                              {xUm} µm
+                            </text>
+                          </g>
+                        );
+                      })}
+
+                      {/* Wafer Orientation Markers (Frontside +Z / Backside -Z) */}
                       <text
-                        x={midX}
-                        y={midY - 11}
-                        fill="#fbbf24"
-                        fontSize="10"
+                        x={effectivePaddingX}
+                        y={toScreen(0, rawMaxY).y - 10}
+                        fill={
+                          activeStepSide === 'front' || !activeStepSide
+                            ? '#38bdf8'
+                            : activeStepSide === 'both'
+                            ? '#34d399'
+                            : '#64748b'
+                        }
+                        fontSize="9.5"
                         fontWeight="600"
                         fontFamily="JetBrains Mono, monospace"
-                        textAnchor="middle"
                       >
-                        ΔX: {formatThickness(dxNm, thicknessUnit)} | ΔY: {formatThickness(dyNm, thicknessUnit)}
+                        ▲ FRONTSIDE (+Z)
                       </text>
-                    </g>
+                      <text
+                        x={effectivePaddingX}
+                        y={datumY + 34}
+                        fill={
+                          activeStepSide === 'back'
+                            ? '#fbbf24'
+                            : activeStepSide === 'both'
+                            ? '#34d399'
+                            : '#64748b'
+                        }
+                        fontSize="9.5"
+                        fontWeight="600"
+                        fontFamily="JetBrains Mono, monospace"
+                      >
+                        ▼ BACKSIDE (-Z)
+                      </text>
+                    </>
                   );
                 })()}
               </g>
             )}
+
+            {/* Caliper measurement lines & geometry snap reticle */}
+            {(measurePoints.length > 0 || (measureMode && activeSnapTarget)) && (() => {
+              const invZ = 1 / Math.max(0.12, zoom);
+              const rawPreviewEnd =
+                measureMode && measurePoints.length === 1
+                  ? activeSnapTarget?.point ?? hoverWorldPos
+                  : null;
+              const isShiftConstrained =
+                measureMode &&
+                measurePoints.length === 1 &&
+                caliperAngleSnap &&
+                shiftKeyDown &&
+                rawPreviewEnd !== null;
+              const constrainedPreview =
+                isShiftConstrained && rawPreviewEnd
+                  ? constrainCaliperPoint(measurePoints[0], rawPreviewEnd)
+                  : null;
+              const previewEnd = constrainedPreview
+                ? constrainedPreview.point
+                : rawPreviewEnd;
+
+              const renderMeasurementSpan = (
+                ptA: { x: number; y: number },
+                ptB: { x: number; y: number },
+                isPreview: boolean,
+                angleBadge?: 'H' | 'V' | '45°'
+              ) => {
+                const p1 = toScreen(ptA.x, ptA.y);
+                const p2 = toScreen(ptB.x, ptB.y);
+                const dxNm = Math.abs(ptB.x - ptA.x);
+                const dyNm = Math.abs(ptB.y - ptA.y);
+                const midX = (p1.x + p2.x) / 2;
+                const midY = (p1.y + p2.y) / 2;
+                const labelText = angleBadge
+                  ? `ΔX: ${formatThickness(dxNm, thicknessUnit)} | ΔY: ${formatThickness(dyNm, thicknessUnit)} · ${angleBadge}`
+                  : `ΔX: ${formatThickness(dxNm, thicknessUnit)} | ΔY: ${formatThickness(dyNm, thicknessUnit)}`;
+                const boxW = Math.max(152, labelText.length * 6.2 + 16) * invZ;
+                const boxH = 22 * invZ;
+
+                return (
+                  <g opacity={isPreview ? 0.88 : 1} pointerEvents="none">
+                    <line
+                      x1={p1.x}
+                      y1={p1.y}
+                      x2={p2.x}
+                      y2={p2.y}
+                      stroke={angleBadge ? '#a78bfa' : isPreview ? '#38bdf8' : '#f59e0b'}
+                      strokeWidth={1.8 * invZ}
+                      strokeDasharray={`${4 * invZ} ${3 * invZ}`}
+                    />
+                    <rect
+                      x={midX - boxW / 2}
+                      y={midY - 26 * invZ}
+                      width={boxW}
+                      height={boxH}
+                      rx={5 * invZ}
+                      fill="#0f172a"
+                      fillOpacity="0.94"
+                      stroke={angleBadge ? '#a78bfa' : isPreview ? '#38bdf8' : '#f59e0b'}
+                      strokeWidth={1.2 * invZ}
+                    />
+                    <text
+                      x={midX}
+                      y={midY - 12 * invZ}
+                      fill={angleBadge ? '#ddd6fe' : isPreview ? '#7dd3fc' : '#fbbf24'}
+                      fontSize={10 * invZ}
+                      fontWeight="600"
+                      fontFamily="JetBrains Mono, monospace"
+                      textAnchor="middle"
+                    >
+                      {labelText}
+                    </text>
+                  </g>
+                );
+              };
+
+              return (
+                <g id="caliper-measurement" pointerEvents="none">
+                  {measurePoints.map((pt, i) => {
+                    const s = toScreen(pt.x, pt.y);
+                    return (
+                      <circle
+                        key={`meas_pt_${i}`}
+                        cx={s.x}
+                        cy={s.y}
+                        r={4 * invZ}
+                        fill="#f59e0b"
+                        stroke="#fff"
+                        strokeWidth={1.5 * invZ}
+                      />
+                    );
+                  })}
+
+                  {measurePoints.length === 1 &&
+                    previewEnd &&
+                    renderMeasurementSpan(
+                      measurePoints[0],
+                      previewEnd,
+                      true,
+                      constrainedPreview?.modeLabel
+                    )}
+
+                  {measurePoints.length === 2 &&
+                    renderMeasurementSpan(measurePoints[0], measurePoints[1], false)}
+
+                  {measureMode && activeSnapTarget && (() => {
+                    const s = toScreen(activeSnapTarget.point.x, activeSnapTarget.point.y);
+                    const sz = 5.5 * invZ;
+                    const color =
+                      activeSnapTarget.kind === 'vertex'
+                        ? '#34d399'
+                        : activeSnapTarget.kind === 'midpoint'
+                        ? '#38bdf8'
+                        : '#fbbf24';
+                    const tag =
+                      activeSnapTarget.kind === 'vertex'
+                        ? 'VERTEX'
+                        : activeSnapTarget.kind === 'midpoint'
+                        ? 'MID'
+                        : 'EDGE';
+
+                    return (
+                      <g>
+                        {activeSnapTarget.kind === 'vertex' && (
+                          <rect
+                            x={s.x - sz}
+                            y={s.y - sz}
+                            width={sz * 2}
+                            height={sz * 2}
+                            fill="rgba(52, 211, 153, 0.18)"
+                            stroke={color}
+                            strokeWidth={1.8 * invZ}
+                          />
+                        )}
+                        {activeSnapTarget.kind === 'midpoint' && (
+                          <polygon
+                            points={`${s.x},${s.y - sz * 1.25} ${s.x + sz * 1.25},${s.y} ${s.x},${s.y + sz * 1.25} ${s.x - sz * 1.25},${s.y}`}
+                            fill="rgba(56, 189, 248, 0.18)"
+                            stroke={color}
+                            strokeWidth={1.8 * invZ}
+                          />
+                        )}
+                        {activeSnapTarget.kind === 'edge' && (
+                          <circle
+                            cx={s.x}
+                            cy={s.y}
+                            r={sz}
+                            fill="rgba(251, 191, 36, 0.16)"
+                            stroke={color}
+                            strokeWidth={1.8 * invZ}
+                          />
+                        )}
+                        <circle cx={s.x} cy={s.y} r={2 * invZ} fill={color} />
+                        <rect
+                          x={s.x + 8 * invZ}
+                          y={s.y - 17 * invZ}
+                          width={42 * invZ}
+                          height={14 * invZ}
+                          rx={3 * invZ}
+                          fill="#0f172a"
+                          fillOpacity="0.92"
+                          stroke={color}
+                          strokeWidth={0.9 * invZ}
+                        />
+                        <text
+                          x={s.x + 29 * invZ}
+                          y={s.y - 7 * invZ}
+                          fill={color}
+                          fontSize={8.5 * invZ}
+                          fontWeight="700"
+                          fontFamily="JetBrains Mono, monospace"
+                          textAnchor="middle"
+                        >
+                          {tag}
+                        </text>
+                      </g>
+                    );
+                  })()}
+                </g>
+              );
+            })()}
           </g>
 
           {/* Magnifying Glass Region Selection Marquee (Screen / Viewport coordinates) */}
@@ -1335,6 +1742,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             const w2 = toWorld((x + w - pan.x) / zoom, (y + h - pan.y) / zoom);
             const dxNm = Math.abs(w2.x - w1.x);
             const dyNm = Math.abs(w2.y - w1.y);
+            const strokeCol = ctrlKeyDown ? '#f59e0b' : '#38bdf8';
+            const fillCol = ctrlKeyDown ? 'rgba(245, 158, 11, 0.14)' : 'rgba(56, 189, 248, 0.14)';
+            const textCol = ctrlKeyDown ? '#fde68a' : '#7dd3fc';
             return (
               <g pointerEvents="none">
                 <rect
@@ -1342,34 +1752,34 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   y={y}
                   width={w}
                   height={h}
-                  fill="rgba(56, 189, 248, 0.14)"
-                  stroke="#38bdf8"
+                  fill={fillCol}
+                  stroke={strokeCol}
                   strokeWidth="1.5"
                   strokeDasharray="5 3"
                   rx="2"
                 />
                 {(w > 24 || h > 24) && (
-                  <g transform={`translate(${Math.min(svgWidth - 140, x)}, ${Math.max(20, y - 6)})`}>
+                  <g transform={`translate(${Math.min(svgWidth - 165, x)}, ${Math.max(20, y - 6)})`}>
                     <rect
                       x="0"
                       y="-14"
-                      width="136"
+                      width="160"
                       height="16"
                       rx="3"
                       fill="#0f172a"
                       fillOpacity="0.92"
-                      stroke="#38bdf8"
+                      stroke={strokeCol}
                       strokeWidth="0.8"
                     />
                     <text
                       x="6"
                       y="-3"
-                      fill="#7dd3fc"
+                      fill={textCol}
                       fontSize="9.5"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="600"
                     >
-                      {formatThickness(dxNm, thicknessUnit)} × {formatThickness(dyNm, thicknessUnit)}
+                      {ctrlKeyDown ? 'Out' : 'In'} {formatThickness(dxNm, thicknessUnit)} × {formatThickness(dyNm, thicknessUnit)}
                     </text>
                   </g>
                 )}
@@ -1378,111 +1788,127 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           })()}
 
           {/* Cleanroom Scale Bar HUD in bottom-left */}
-          <g transform={`translate(${Math.min(paddingX, 40)}, ${svgHeight - 20})`}>
-            {(() => {
-              const pxPerNm = scaleX * zoom;
-              if (!Number.isFinite(pxPerNm) || pxPerNm <= 0) return null;
+          {showAxesAndLabels && (
+            <g transform={`translate(${Math.min(paddingX, 40)}, ${svgHeight - 20})`}>
+              {(() => {
+                const pxPerNm = scaleX * zoom;
+                if (!Number.isFinite(pxPerNm) || pxPerNm <= 0) return null;
 
-              const leftOriginX = Math.min(paddingX, 40);
-              const maxBarPx = Math.max(64, Math.min(180, svgWidth - leftOriginX - 210));
-              const minBarPx = Math.min(44, maxBarPx * 0.45);
-              const targetBarPx = Math.max(minBarPx, Math.min(115, maxBarPx * 0.72));
+                const leftOriginX = Math.min(paddingX, 40);
+                const maxBarPx = Math.max(64, Math.min(180, svgWidth - leftOriginX - 210));
+                const minBarPx = Math.min(44, maxBarPx * 0.45);
+                const targetBarPx = Math.max(minBarPx, Math.min(115, maxBarPx * 0.72));
 
-              // Pick the cleanest 1-2-5 * 10^k nm length within [minBarPx, maxBarPx]
-              let bestNm = 1000;
-              let bestScore = Infinity;
-              for (let exp = -1; exp <= 7; exp++) {
-                const pow = Math.pow(10, exp);
-                for (const mult of [1, 2, 5]) {
-                  const candidateNm = mult * pow;
-                  const px = candidateNm * pxPerNm;
-                  if (px > maxBarPx) continue;
-                  const penalty = px < minBarPx ? (minBarPx - px) * 5 : 0;
-                  const score = Math.abs(px - targetBarPx) + penalty;
-                  if (score < bestScore) {
-                    bestScore = score;
-                    bestNm = candidateNm;
+                // Pick the cleanest 1-2-5 * 10^k nm length within [minBarPx, maxBarPx]
+                let bestNm = 1000;
+                let bestScore = Infinity;
+                for (let exp = -1; exp <= 7; exp++) {
+                  const pow = Math.pow(10, exp);
+                  for (const mult of [1, 2, 5]) {
+                    const candidateNm = mult * pow;
+                    const px = candidateNm * pxPerNm;
+                    if (px > maxBarPx) continue;
+                    const penalty = px < minBarPx ? (minBarPx - px) * 5 : 0;
+                    const score = Math.abs(px - targetBarPx) + penalty;
+                    if (score < bestScore) {
+                      bestScore = score;
+                      bestNm = candidateNm;
+                    }
                   }
                 }
-              }
 
-              // Fallback if even smallest candidate exceeded maxBarPx
-              let barPixels = bestNm * pxPerNm;
-              if (barPixels > maxBarPx) {
-                barPixels = maxBarPx;
-                bestNm = maxBarPx / pxPerNm;
-              }
-
-              const formatScaleLabel = (nm: number): string => {
-                if (nm >= 1_000_000) {
-                  const mm = Math.round((nm / 1_000_000) * 1000) / 1000;
-                  return `${mm} mm`;
+                // Fallback if even smallest candidate exceeded maxBarPx
+                let barPixels = bestNm * pxPerNm;
+                if (barPixels > maxBarPx) {
+                  barPixels = maxBarPx;
+                  bestNm = maxBarPx / pxPerNm;
                 }
-                if (nm >= 1000) {
-                  const um = Math.round((nm / 1000) * 1000) / 1000;
-                  return `${um} µm`;
-                }
-                const cleanNm = Math.round(nm * 100) / 100;
-                return `${cleanNm} nm`;
-              };
 
-              const label = formatScaleLabel(bestNm);
-              const labelX = Math.max(22, barPixels / 2);
+                const formatScaleLabel = (nm: number): string => {
+                  if (nm >= 1_000_000) {
+                    const mm = Math.round((nm / 1_000_000) * 1000) / 1000;
+                    return `${mm} mm`;
+                  }
+                  if (nm >= 1000) {
+                    const um = Math.round((nm / 1000) * 1000) / 1000;
+                    return `${um} µm`;
+                  }
+                  const cleanNm = Math.round(nm * 100) / 100;
+                  return `${cleanNm} nm`;
+                };
 
-              return (
-                <g>
-                  <line
-                    x1="0"
-                    y1="0"
-                    x2={barPixels}
-                    y2="0"
-                    stroke="#020617"
-                    strokeWidth="5"
-                    strokeLinecap="round"
-                    opacity="0.7"
-                  />
-                  <line
-                    x1="0"
-                    y1="0"
-                    x2={barPixels}
-                    y2="0"
-                    stroke="#e2e8f0"
-                    strokeWidth="2.5"
-                  />
-                  <line x1="0" y1="-4.5" x2="0" y2="4.5" stroke="#e2e8f0" strokeWidth="2" />
-                  <line
-                    x1={barPixels}
-                    y1="-4.5"
-                    x2={barPixels}
-                    y2="4.5"
-                    stroke="#e2e8f0"
-                    strokeWidth="2"
-                  />
-                  <text
-                    x={labelX}
-                    y="-7"
-                    fill="#f1f5f9"
-                    stroke="#020617"
-                    strokeWidth="3"
-                    paintOrder="stroke"
-                    fontSize="10.5"
-                    fontWeight="600"
-                    fontFamily="JetBrains Mono, monospace"
-                    textAnchor="middle"
-                  >
-                    {label}
-                  </text>
-                </g>
-              );
-            })()}
-          </g>
+                const label = formatScaleLabel(bestNm);
+                const labelX = Math.max(22, barPixels / 2);
+
+                return (
+                  <g>
+                    <line
+                      x1="0"
+                      y1="0"
+                      x2={barPixels}
+                      y2="0"
+                      stroke="#020617"
+                      strokeWidth="5"
+                      strokeLinecap="round"
+                      opacity="0.7"
+                    />
+                    <line
+                      x1="0"
+                      y1="0"
+                      x2={barPixels}
+                      y2="0"
+                      stroke="#e2e8f0"
+                      strokeWidth="2.5"
+                    />
+                    <line x1="0" y1="-4.5" x2="0" y2="4.5" stroke="#e2e8f0" strokeWidth="2" />
+                    <line
+                      x1={barPixels}
+                      y1="-4.5"
+                      x2={barPixels}
+                      y2="4.5"
+                      stroke="#e2e8f0"
+                      strokeWidth="2"
+                    />
+                    <text
+                      x={labelX}
+                      y="-7"
+                      fill="#f1f5f9"
+                      stroke="#020617"
+                      strokeWidth="3"
+                      paintOrder="stroke"
+                      fontSize="10.5"
+                      fontWeight="600"
+                      fontFamily="JetBrains Mono, monospace"
+                      textAnchor="middle"
+                    >
+                      {label}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
+          )}
         </svg>
 
         {/* Active Magnifying Glass Mode Banner */}
         {regionZoomMode && (
-          <div className="absolute top-3 left-3 z-10 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/90 border border-sky-500/60 text-sky-300 text-[11px] font-medium shadow-lg backdrop-blur-md">
-            <Search className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-            <span>Drag rectangle to zoom region · Click to zoom 2× · Preserves geometry aspect ratio</span>
+          <div
+            className={`absolute top-3 left-3 z-10 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/90 border text-[11px] font-medium shadow-lg backdrop-blur-md transition-colors ${
+              ctrlKeyDown
+                ? 'border-amber-500/60 text-amber-300'
+                : 'border-sky-500/60 text-sky-300'
+            }`}
+          >
+            <Search
+              className={`w-3.5 h-3.5 shrink-0 ${
+                ctrlKeyDown ? 'text-amber-400' : 'text-sky-400'
+              }`}
+            />
+            <span>
+              {ctrlKeyDown
+                ? 'Ctrl held: Drag or click to zoom out · Preserves aspect ratio'
+                : 'Drag region to zoom · Click to zoom 2× · Hold Ctrl to zoom out'}
+            </span>
             <button
               type="button"
               onClick={() => {
@@ -1496,7 +1922,91 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           </div>
         )}
 
-        {/* Floating Final Process Step Inset (Top-Right when intermediate step is selected) */}
+        {/* Active Caliper Mode Banner */}
+        {measureMode && !regionZoomMode && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            className="absolute top-3 left-3 z-10 flex flex-wrap items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/92 border border-amber-500/60 text-amber-200 text-[11px] font-medium shadow-lg backdrop-blur-md"
+          >
+            <Ruler className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            {measurePoints.length === 2 ? (() => {
+              const dxNm = Math.abs(measurePoints[1].x - measurePoints[0].x);
+              const dyNm = Math.abs(measurePoints[1].y - measurePoints[0].y);
+              const distNm = Math.hypot(dxNm, dyNm);
+              return (
+                <span className="font-mono text-[11px] text-amber-200">
+                  ΔX {formatThickness(dxNm, thicknessUnit)} · ΔY {formatThickness(dyNm, thicknessUnit)} · L {formatThickness(distNm, thicknessUnit)}
+                </span>
+              );
+            })() : (
+              <span>
+                {measurePoints.length === 0
+                  ? 'Click start point to measure'
+                  : 'Click end point to measure'}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => setCaliperSnap((v) => !v)}
+              aria-pressed={caliperSnap}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium transition-colors ${
+                caliperSnap
+                  ? 'bg-emerald-500/20 border-emerald-500/60 text-emerald-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+              }`}
+              title="Toggle snapping to polygon vertices, midpoints, and edges"
+            >
+              <Magnet className="w-3 h-3" />
+              <span>Snap: {caliperSnap ? 'On' : 'Off'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setCaliperAngleSnap((v) => !v)}
+              aria-pressed={caliperAngleSnap}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium transition-colors ${
+                caliperAngleSnap
+                  ? shiftKeyDown && measurePoints.length === 1
+                    ? 'bg-violet-500/30 border-violet-400 text-violet-200'
+                    : 'bg-sky-500/20 border-sky-500/60 text-sky-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+              }`}
+              title="When On, holding Shift forces horizontal, vertical, or 45° measurement"
+            >
+              <span>Shift H/V/45°: {caliperAngleSnap ? 'On' : 'Off'}</span>
+            </button>
+            {caliperAngleSnap && shiftKeyDown && measurePoints.length === 1 && (
+              <span className="px-1.5 py-0.5 rounded bg-violet-500/25 border border-violet-400/60 text-violet-200 text-[10px] font-mono font-semibold">
+                {(() => {
+                  const target = activeSnapTarget?.point ?? hoverWorldPos;
+                  if (!target) return '0/45/90°';
+                  const { modeLabel } = constrainCaliperPoint(measurePoints[0], target);
+                  return modeLabel === 'H' ? '0° (H)' : modeLabel === 'V' ? '90° (V)' : '45°';
+                })()}
+              </span>
+            )}
+            {measurePoints.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setMeasurePoints([])}
+                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[10px]"
+              >
+                Clear
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setMeasureMode(false);
+                setMeasurePoints([]);
+              }}
+              className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[10px]"
+            >
+              Done
+            </button>
+          </div>
+        )}
+
+        {/* Floating Later Process Step Inset (Top-Right when earlier step is selected) */}
         {showFinalInset &&
           finalMesh &&
           finalPolygons &&
@@ -1574,6 +2084,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             const datumLeft = toInset(fMinX, fMinY);
             const datumRight = toInset(fMaxX, fMinY);
 
+            const options = insetStepOptions ?? [];
+            const currentOptionIdx =
+              selectedInsetStepIndex !== undefined
+                ? options.findIndex((o) => o.stepIndex === selectedInsetStepIndex)
+                : options.length - 1;
+
             return (
               <div
                 onPointerDown={(e) => e.stopPropagation()}
@@ -1588,13 +2104,19 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 bg-slate-950/85 border-b border-slate-800 text-[11px]">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-                    <span className="px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[9px] font-semibold shrink-0">
-                      FINAL
+                    <span
+                      className={`px-1 py-0.5 rounded font-mono text-[9px] font-semibold shrink-0 border ${
+                        isInsetFinalStep
+                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                          : 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                      }`}
+                    >
+                      {isInsetFinalStep ? 'FINAL' : 'STEP'}
                     </span>
                     <span className="text-slate-300 font-mono text-[10px] shrink-0">
                       {finalStepNumber}/{totalSteps}
                     </span>
-                    {finalStepTitle && (
+                    {options.length <= 1 && finalStepTitle && (
                       <span className="text-slate-400 truncate text-[10px]" title={finalStepTitle}>
                         {finalStepTitle}
                       </span>
@@ -1606,7 +2128,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                         type="button"
                         onClick={onSelectFinalStep}
                         className="p-1 rounded text-slate-400 hover:text-emerald-300 hover:bg-slate-800 transition-colors"
-                        title={`Jump to final step (${finalStepNumber}/${totalSteps})`}
+                        title={`Jump to step (${finalStepNumber}/${totalSteps})`}
                       >
                         <ArrowUpRight className="w-3 h-3" />
                       </button>
@@ -1628,13 +2150,66 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                         type="button"
                         onClick={onToggleFinalInset}
                         className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors"
-                        title="Hide final step inset"
+                        title="Hide inset"
                       >
                         <X className="w-3 h-3" />
                       </button>
                     )}
                   </div>
                 </div>
+
+                {/* Inset Step Selector (when multiple later steps are available) */}
+                {options.length > 1 && onChangeInsetStep && (
+                  <div className="flex items-center gap-1 px-2 py-1 bg-slate-900/95 border-b border-slate-800/90 text-[10px]">
+                    <button
+                      type="button"
+                      disabled={currentOptionIdx <= 0}
+                      onClick={() => {
+                        if (currentOptionIdx > 0) {
+                          onChangeInsetStep(options[currentOptionIdx - 1].stepIndex);
+                        }
+                      }}
+                      className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
+                      title="Previous later step"
+                    >
+                      <ChevronLeft className="w-3 h-3" />
+                    </button>
+                    <select
+                      value={selectedInsetStepIndex ?? options[options.length - 1].stepIndex}
+                      onChange={(e) => onChangeInsetStep(Number(e.target.value))}
+                      aria-label="Select step to preview in inset"
+                      className="flex-1 min-w-0 bg-slate-950/90 hover:bg-slate-800/90 text-slate-200 border border-slate-700/70 focus:border-emerald-500/60 rounded px-1.5 py-0.5 text-[10px] font-mono truncate focus:outline-none cursor-pointer"
+                      title={finalStepTitle ? `Step ${finalStepNumber}/${totalSteps}: ${finalStepTitle}` : undefined}
+                    >
+                      {options.map((opt, idx) => {
+                        const isLast = idx === options.length - 1;
+                        return (
+                          <option
+                            key={opt.stepIndex}
+                            value={opt.stepIndex}
+                            className="bg-slate-900 text-slate-100"
+                          >
+                            {opt.stepNumber}/{totalSteps} · {opt.title}
+                            {isLast ? ' (Final)' : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={currentOptionIdx < 0 || currentOptionIdx >= options.length - 1}
+                      onClick={() => {
+                        if (currentOptionIdx >= 0 && currentOptionIdx < options.length - 1) {
+                          onChangeInsetStep(options[currentOptionIdx + 1].stepIndex);
+                        }
+                      }}
+                      className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors shrink-0"
+                      title="Next later step"
+                    >
+                      <ChevronRight className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
 
                 {/* Inset Mini Cross-Section SVG */}
                 <div
@@ -1664,8 +2239,8 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                                 ? `url(#final-inset-mat-fill-${mat.id})`
                                 : mat.color
                             }
-                            stroke={mat.strokeColor || '#1e293b'}
-                            strokeWidth="0.9"
+                            stroke={showOutlines ? mat.strokeColor || '#1e293b' : 'none'}
+                            strokeWidth={showOutlines ? '0.9' : '0'}
                           />
                         );
                       })}
@@ -1703,14 +2278,16 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                       })}
 
                     {/* Datum reference line */}
-                    <line
-                      x1={datumLeft.x}
-                      y1={datumLeft.y}
-                      x2={datumRight.x}
-                      y2={datumRight.y}
-                      stroke="#475569"
-                      strokeWidth="0.9"
-                    />
+                    {showAxesAndLabels && (
+                      <line
+                        x1={datumLeft.x}
+                        y1={datumLeft.y}
+                        x2={datumRight.x}
+                        y2={datumRight.y}
+                        stroke="#475569"
+                        strokeWidth="0.9"
+                      />
+                    )}
 
                     {/* Zoomed-in region indicator matching current main viewport */}
                     {showRoiBox && roiX2 > roiX1 && roiY2 > roiY1 && (
@@ -1755,7 +2332,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 ? 'bg-sky-500 text-white shadow-sm'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800'
             }`}
-            title="Magnifying Glass: Drag to zoom selected region"
+            title="Magnifying Glass: Drag or click to zoom in (hold Ctrl to zoom out)"
           >
             <Search className="w-3.5 h-3.5" />
           </button>
@@ -1777,7 +2354,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         </div>
 
         {/* Hover Layer Inspector Tooltip */}
-        {hoveredPolygon && !zoomSelection && (
+        {hoveredPolygon && !zoomSelection && !measureMode && (
           <div
             className="absolute pointer-events-none z-20 px-3 py-2 rounded-xl bg-slate-900/95 border border-sky-500/50 text-white shadow-2xl backdrop-blur-md"
             style={{

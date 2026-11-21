@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useMemo, useEffect } from 'react';
-import { ProcessFlow, ProcessStep, PhotomaskLevel, MaskWindow } from '../types/microfab';
+import React, { useState, useRef, useMemo, useEffect, useCallback } from 'react';
+import { ProcessFlow, ProcessStep, PhotomaskLevel, MaskWindow, VariableUnit } from '../types/microfab';
 import {
   calculateMaskMetrics,
   updateMaskAndSyncSteps,
@@ -12,8 +12,14 @@ import {
   swapMaskAssignments,
   createNewMaskInFlow,
   deleteMaskFromFlow,
+  duplicateMaskWindow,
+  createMaskWindowArray,
+  MaskWindowArrayOptions,
   RETICLE_PALETTE,
 } from '../lib/maskUtils';
+import { resolveFlowParameters } from '../lib/variableUtils';
+import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
+import { MaskWindowArrayPanel } from './MaskWindowArrayPanel';
 import {
   X,
   Plus,
@@ -38,6 +44,9 @@ import {
   ChevronDown,
   PanelLeft,
   Eraser,
+  Variable as VariableIcon,
+  Undo2,
+  Redo2,
 } from 'lucide-react';
 import { GdsLayoutEditor } from './GdsLayoutEditor';
 
@@ -48,6 +57,7 @@ interface MaskLevelsModalProps {
   onUpdateFlow: (updatedFlow: ProcessFlow) => void;
   onSelectStepIndex?: (index: number) => void;
   initialMaskId?: string;
+  onOpenVariablesModal?: () => void;
 }
 
 interface DragState {
@@ -56,6 +66,14 @@ interface DragState {
   startClientX: number;
   initialXStart: number;
   initialXEnd: number;
+  initialWindows?: Array<{ id: string; xStart: number; xEnd: number }>;
+}
+
+interface TrackMarquee {
+  startClientX: number;
+  startNm: number;
+  currentNm: number;
+  additive: boolean;
 }
 
 export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
@@ -65,8 +83,10 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   onUpdateFlow,
   onSelectStepIndex,
   initialMaskId,
+  onOpenVariablesModal,
 }) => {
   const masks = useMemo(() => flow.masks || [], [flow.masks]);
+  const variables = useMemo(() => flow.variables || [], [flow.variables]);
   const waferWidth = flow.substrateWidth || 10000;
 
   // Selected mask in the panel
@@ -123,8 +143,238 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
   // Drag state for interactive aperture track
   const trackRef = useRef<HTMLDivElement>(null);
-  const [activeWindowId, setActiveWindowId] = useState<string | null>(null);
+  const [selectedWindowIds, setSelectedWindowIds] = useState<string[]>([]);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [trackMarquee, setTrackMarquee] = useState<TrackMarquee | null>(null);
+  const [openWinBind, setOpenWinBind] = useState<{
+    winId: string;
+    field: 'xStart' | 'xEnd' | 'width';
+  } | null>(null);
+  const [arraySourceWinId, setArraySourceWinId] = useState<string | null>(null);
+
+  interface TrackHistorySnapshot {
+    masks: ProcessFlow['masks'];
+    steps: ProcessFlow['steps'];
+    variables: ProcessFlow['variables'];
+    selectedMaskId: string;
+  }
+
+  const MAX_HISTORY = 60;
+  const undoStackRef = useRef<TrackHistorySnapshot[]>([]);
+  const redoStackRef = useRef<TrackHistorySnapshot[]>([]);
+  const dragStartSnapRef = useRef<TrackHistorySnapshot | null>(null);
+  const latestFlowRef = useRef(flow);
+  latestFlowRef.current = flow;
+  const latestSelectedMaskIdRef = useRef(selectedMaskId);
+  latestSelectedMaskIdRef.current = selectedMaskId;
+  const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+
+  const syncHistoryState = useCallback(() => {
+    setHistoryState({
+      canUndo: undoStackRef.current.length > 0,
+      canRedo: redoStackRef.current.length > 0,
+    });
+  }, []);
+
+  const makeTrackSnapshot = useCallback(
+    (targetFlow: ProcessFlow, selId: string): TrackHistorySnapshot => ({
+      masks: targetFlow.masks,
+      steps: targetFlow.steps,
+      variables: targetFlow.variables,
+      selectedMaskId: selId,
+    }),
+    []
+  );
+
+  const trackSnapshotsEqual = (a: TrackHistorySnapshot, b: TrackHistorySnapshot): boolean =>
+    JSON.stringify({ m: a.masks, s: a.steps, v: a.variables }) ===
+    JSON.stringify({ m: b.masks, s: b.steps, v: b.variables });
+
+  const commitTrackFlow = useCallback(
+    (nextFlow: ProcessFlow, options?: { skipHistory?: boolean; nextSelectedMaskId?: string }) => {
+      if (!options?.skipHistory) {
+        const prevSnap = makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current);
+        const nextSnap = makeTrackSnapshot(
+          nextFlow,
+          options?.nextSelectedMaskId ?? latestSelectedMaskIdRef.current
+        );
+        if (!trackSnapshotsEqual(prevSnap, nextSnap)) {
+          undoStackRef.current = [
+            ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+            prevSnap,
+          ];
+          redoStackRef.current = [];
+          syncHistoryState();
+        }
+      }
+      onUpdateFlow(nextFlow);
+    },
+    [makeTrackSnapshot, onUpdateFlow, syncHistoryState]
+  );
+
+  const handleUndoTrack = useCallback(() => {
+    if (undoStackRef.current.length === 0) return;
+    const prevSnap = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [
+      ...redoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current),
+    ];
+    dragStartSnapRef.current = null;
+    setDragState(null);
+    setTrackMarquee(null);
+    syncHistoryState();
+    onUpdateFlow({
+      ...latestFlowRef.current,
+      masks: prevSnap.masks,
+      steps: prevSnap.steps,
+      variables: prevSnap.variables,
+    });
+    if (
+      prevSnap.selectedMaskId &&
+      (prevSnap.masks || []).some((m) => m.id === prevSnap.selectedMaskId)
+    ) {
+      setSelectedMaskId(prevSnap.selectedMaskId);
+    }
+  }, [makeTrackSnapshot, onUpdateFlow, syncHistoryState]);
+
+  const handleRedoTrack = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    const nextSnap = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = [
+      ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current),
+    ];
+    dragStartSnapRef.current = null;
+    setDragState(null);
+    setTrackMarquee(null);
+    syncHistoryState();
+    onUpdateFlow({
+      ...latestFlowRef.current,
+      masks: nextSnap.masks,
+      steps: nextSnap.steps,
+      variables: nextSnap.variables,
+    });
+    if (
+      nextSnap.selectedMaskId &&
+      (nextSnap.masks || []).some((m) => m.id === nextSnap.selectedMaskId)
+    ) {
+      setSelectedMaskId(nextSnap.selectedMaskId);
+    }
+  }, [makeTrackSnapshot, onUpdateFlow, syncHistoryState]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+      dragStartSnapRef.current = null;
+      setHistoryState({ canUndo: false, canRedo: false });
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    setSelectedWindowIds([]);
+    setArraySourceWinId(null);
+    setOpenWinBind(null);
+  }, [selectedMaskId]);
+
+  useEffect(() => {
+    const wins = selectedMask?.windows || [];
+    const validIds = new Set(wins.map((w) => w.id));
+    setSelectedWindowIds((prev) => {
+      const next = prev.filter((id) => validIds.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [selectedMask?.windows]);
+
+  // Keyboard shortcuts: Undo/Redo (Ctrl+Z / Ctrl+Y / Cmd+Shift+Z), Escape, Left/Right arrow nudging
+  useEffect(() => {
+    if (!isOpen || editorTab !== 'apertures' || conflictPrompt) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const keyLower = e.key.toLowerCase();
+        if (keyLower === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            handleRedoTrack();
+          } else {
+            handleUndoTrack();
+          }
+          return;
+        }
+        if (keyLower === 'y' && !e.shiftKey) {
+          e.preventDefault();
+          handleRedoTrack();
+          return;
+        }
+      }
+
+      if (!selectedMask) return;
+
+      if (e.key === 'Escape' && selectedWindowIds.length > 0) {
+        setSelectedWindowIds([]);
+        return;
+      }
+
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const wins = selectedMask.windows || [];
+      const targetIds =
+        selectedWindowIds.length > 0
+          ? selectedWindowIds
+          : wins.length === 1
+          ? [wins[0].id]
+          : [];
+      if (targetIds.length === 0) return;
+
+      const selectedTargets = wins.filter((w) => targetIds.includes(w.id));
+      if (selectedTargets.length === 0) return;
+
+      e.preventDefault();
+      const nudge = e.shiftKey ? 250 : 50;
+      const deltaNm = e.key === 'ArrowLeft' ? -nudge : nudge;
+      const minDelta = -Math.min(...selectedTargets.map((w) => w.xStart));
+      const maxDelta = Math.min(...selectedTargets.map((w) => waferWidth - w.xEnd));
+      const clampedDelta = Math.round(Math.max(minDelta, Math.min(maxDelta, deltaNm)));
+      if (clampedDelta === 0) return;
+
+      const selSet = new Set(selectedTargets.map((w) => w.id));
+      const updatedMask: PhotomaskLevel = {
+        ...selectedMask,
+        windows: wins.map((w) =>
+          selSet.has(w.id)
+            ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
+            : w
+        ),
+      };
+      commitTrackFlow(updateMaskAndSyncSteps(flow, updatedMask));
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    isOpen,
+    editorTab,
+    selectedMask,
+    conflictPrompt,
+    selectedWindowIds,
+    waferWidth,
+    flow,
+    commitTrackFlow,
+    handleUndoTrack,
+    handleRedoTrack,
+  ]);
 
   // List of all lithography steps in the process flow
   const lithoSteps = useMemo(() => {
@@ -156,15 +406,15 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     : null;
 
   // Handler: Update current mask
-  const handleUpdateMask = (updated: PhotomaskLevel) => {
-    const newFlow = updateMaskAndSyncSteps(flow, updated);
-    onUpdateFlow(newFlow);
+  const handleUpdateMask = (updated: PhotomaskLevel, skipHistory?: boolean) => {
+    const newFlow = updateMaskAndSyncSteps(latestFlowRef.current, updated);
+    commitTrackFlow(newFlow, { skipHistory });
   };
 
   // Handler: Add new mask level beforehand
   const handleCreateNewMask = () => {
-    const { flow: newFlow, newMask } = createNewMaskInFlow(flow);
-    onUpdateFlow(newFlow);
+    const { flow: newFlow, newMask } = createNewMaskInFlow(latestFlowRef.current);
+    commitTrackFlow(newFlow, { nextSelectedMaskId: newMask.id });
     setSelectedMaskId(newMask.id);
   };
 
@@ -180,8 +430,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       assignedStepId: undefined, // Fresh copy is unassigned
       windows: maskToDup.windows.map((w) => ({ ...w, id: `w_${Date.now()}_${Math.random().toString(36).substring(2, 6)}` })),
     };
-    const { flow: newFlow } = createNewMaskInFlow(flow, newMask);
-    onUpdateFlow(newFlow);
+    const { flow: newFlow } = createNewMaskInFlow(latestFlowRef.current, newMask);
+    commitTrackFlow(newFlow, { nextSelectedMaskId: newMask.id });
     setSelectedMaskId(newMask.id);
   };
 
@@ -205,11 +455,12 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       return;
     }
 
-    const newFlow = deleteMaskFromFlow(flow, maskId);
-    onUpdateFlow(newFlow);
+    const newFlow = deleteMaskFromFlow(latestFlowRef.current, maskId);
     const remaining = newFlow.masks || [];
+    const nextSelId = selectedMaskId === maskId ? (remaining[0]?.id || '') : selectedMaskId;
+    commitTrackFlow(newFlow, { nextSelectedMaskId: nextSelId });
     if (selectedMaskId === maskId) {
-      setSelectedMaskId(remaining[0]?.id || '');
+      setSelectedMaskId(nextSelId);
     }
     handleEditorNotify(`Deleted unassigned mask "${targetMask.name}".`, 'success');
   };
@@ -223,7 +474,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       windows: [],
     });
     if (targetMask.id === selectedMask?.id) {
-      setActiveWindowId(null);
+      setSelectedWindowIds([]);
     }
     handleEditorNotify(`Cleared aperture track on "${targetMask.name}".`, 'success');
   };
@@ -232,8 +483,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   const handleAssignStep = (targetStepId: string) => {
     if (!selectedMask) return;
     if (targetStepId === 'none') {
-      const newFlow = assignMaskToStep(flow, selectedMask.id, null);
-      onUpdateFlow(newFlow);
+      const newFlow = assignMaskToStep(latestFlowRef.current, selectedMask.id, null);
+      commitTrackFlow(newFlow);
       setFeedbackNotice({
         message: `Unassigned ${selectedMask.name} from process steps.`,
         type: 'success',
@@ -275,8 +526,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     }
 
     // No conflict: perform direct assignment
-    const newFlow = assignMaskToStep(flow, selectedMask.id, targetStepId);
-    onUpdateFlow(newFlow);
+    const newFlow = assignMaskToStep(latestFlowRef.current, selectedMask.id, targetStepId);
+    commitTrackFlow(newFlow);
     const stepItem = lithoSteps.find(({ step }) => step.id === targetStepId);
     setFeedbackNotice({
       message: `Assigned ${selectedMask.name} to Step ${stepItem ? stepItem.index + 1 : ''}: ${stepItem?.step.title || ''}.`,
@@ -290,8 +541,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     const { targetStepId, targetStepTitle, targetStepIndex, conflictingMask, currentMaskPriorStep } = conflictPrompt;
     
     // Execute photomask swap
-    const newFlow = swapMaskAssignments(flow, selectedMask.id, targetStepId);
-    onUpdateFlow(newFlow);
+    const newFlow = swapMaskAssignments(latestFlowRef.current, selectedMask.id, targetStepId);
+    commitTrackFlow(newFlow);
 
     if (currentMaskPriorStep) {
       setFeedbackNotice({
@@ -320,6 +571,16 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     }
   };
 
+  const toggleWindowSelection = (winId: string, additive: boolean) => {
+    if (additive) {
+      setSelectedWindowIds((prev) =>
+        prev.includes(winId) ? prev.filter((id) => id !== winId) : [...prev, winId]
+      );
+    } else {
+      setSelectedWindowIds([winId]);
+    }
+  };
+
   // Aperture CRUD on selected mask
   const handleAddWindow = () => {
     if (!selectedMask) return;
@@ -336,7 +597,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       windows: [...windows, newWin],
     };
     handleUpdateMask(updated);
-    setActiveWindowId(newWin.id);
+    setSelectedWindowIds([newWin.id]);
   };
 
   const handleRemoveWindow = (winId: string) => {
@@ -346,7 +607,98 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       windows: selectedMask.windows.filter((w) => w.id !== winId),
     };
     handleUpdateMask(updated);
-    if (activeWindowId === winId) setActiveWindowId(null);
+    setSelectedWindowIds((prev) => prev.filter((id) => id !== winId));
+    if (arraySourceWinId === winId) setArraySourceWinId(null);
+  };
+
+  const handleRemoveSelectedWindows = (ids: string[]) => {
+    if (!selectedMask || ids.length === 0) return;
+    const delSet = new Set(ids);
+    handleUpdateMask({
+      ...selectedMask,
+      windows: selectedMask.windows.filter((w) => !delSet.has(w.id)),
+    });
+    setSelectedWindowIds([]);
+    if (arraySourceWinId && delSet.has(arraySourceWinId)) {
+      setArraySourceWinId(null);
+    }
+  };
+
+  const handleDuplicateWindow = (winId: string) => {
+    if (!selectedMask) return;
+    const idx = selectedMask.windows.findIndex((w) => w.id === winId);
+    if (idx < 0) return;
+    const dup = duplicateMaskWindow(selectedMask.windows[idx], waferWidth);
+    const updatedWins = [
+      ...selectedMask.windows.slice(0, idx + 1),
+      dup,
+      ...selectedMask.windows.slice(idx + 1),
+    ];
+    handleUpdateMask({
+      ...selectedMask,
+      windows: updatedWins,
+    });
+    setSelectedWindowIds([dup.id]);
+    setArraySourceWinId(null);
+  };
+
+  const handleDuplicateSelectedWindows = (ids: string[]) => {
+    if (!selectedMask || ids.length === 0) return;
+    if (ids.length === 1) {
+      handleDuplicateWindow(ids[0]);
+      return;
+    }
+    const selSet = new Set(ids);
+    const newIds: string[] = [];
+    const clones: MaskWindow[] = [];
+    const baseTs = Date.now();
+    selectedMask.windows.forEach((w, idx) => {
+      if (!selSet.has(w.id)) return;
+      const dup = {
+        ...duplicateMaskWindow(w, waferWidth),
+        id: `w_dup_${baseTs}_${idx}`,
+      };
+      clones.push(dup);
+      newIds.push(dup.id);
+    });
+    handleUpdateMask({
+      ...selectedMask,
+      windows: [...selectedMask.windows, ...clones],
+    });
+    setSelectedWindowIds(newIds);
+    setArraySourceWinId(null);
+  };
+
+  const handleShiftWindows = (ids: string[], deltaNm: number) => {
+    if (!selectedMask || ids.length === 0 || deltaNm === 0) return;
+    const targets = selectedMask.windows.filter((w) => ids.includes(w.id));
+    if (targets.length === 0) return;
+    const minDelta = -Math.min(...targets.map((w) => w.xStart));
+    const maxDelta = Math.min(...targets.map((w) => waferWidth - w.xEnd));
+    const clampedDelta = Math.round(Math.max(minDelta, Math.min(maxDelta, deltaNm)));
+    if (clampedDelta === 0) return;
+    const selSet = new Set(targets.map((w) => w.id));
+    handleUpdateMask({
+      ...selectedMask,
+      windows: selectedMask.windows.map((w) =>
+        selSet.has(w.id)
+          ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
+          : w
+      ),
+    });
+  };
+
+  const handleCreateWindowArray = (sourceId: string, options: MaskWindowArrayOptions) => {
+    if (!selectedMask) return;
+    const res = createMaskWindowArray(selectedMask.windows, sourceId, options, waferWidth);
+    handleUpdateMask({
+      ...selectedMask,
+      windows: res.windows,
+    });
+    setSelectedWindowIds(
+      res.addedIds.length > 0 ? [res.addedIds[res.addedIds.length - 1]] : [sourceId]
+    );
+    setArraySourceWinId(null);
   };
 
   const handleUpdateWindowCoord = (winId: string, field: 'xStart' | 'xEnd', val: number) => {
@@ -354,6 +706,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     const clamped = Math.max(0, Math.min(waferWidth, val));
     const updatedWins = selectedMask.windows.map((w) => {
       if (w.id === winId) {
+        if (w.paramBindings?.[field]) return w;
         const u = { ...w, [field]: clamped };
         if (u.xStart > u.xEnd) {
           if (field === 'xStart') u.xEnd = u.xStart;
@@ -367,6 +720,92 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       ...selectedMask,
       windows: updatedWins,
     });
+  };
+
+  const handleUpdateWindowWidth = (winId: string, targetWidthNm: number) => {
+    if (!selectedMask || !Number.isFinite(targetWidthNm)) return;
+    const clampedWidth = Math.max(10, Math.min(waferWidth, Math.round(targetWidthNm)));
+    const updatedWins = selectedMask.windows.map((w) => {
+      if (w.id !== winId || w.paramBindings?.width) return w;
+      const center = (w.xStart + w.xEnd) / 2;
+      let nextStart = center - clampedWidth / 2;
+      let nextEnd = center + clampedWidth / 2;
+      if (nextStart < 0) {
+        nextStart = 0;
+        nextEnd = Math.min(waferWidth, clampedWidth);
+      } else if (nextEnd > waferWidth) {
+        nextEnd = waferWidth;
+        nextStart = Math.max(0, waferWidth - clampedWidth);
+      }
+      return {
+        ...w,
+        xStart: Math.round(nextStart),
+        xEnd: Math.round(nextEnd),
+      };
+    });
+    handleUpdateMask({
+      ...selectedMask,
+      windows: updatedWins,
+    });
+  };
+
+  const handleUpdateWindowBinding = (
+    winId: string,
+    field: 'width' | 'xStart' | 'xEnd',
+    expr: string | undefined
+  ) => {
+    if (!selectedMask) return;
+    const updatedWins = selectedMask.windows.map((w) => {
+      if (w.id !== winId) return w;
+      const nextB = { ...(w.paramBindings || {}) };
+      if (expr && expr.trim()) {
+        nextB[field] = expr.trim();
+      } else {
+        delete nextB[field];
+      }
+      return {
+        ...w,
+        paramBindings: Object.keys(nextB).length > 0 ? nextB : undefined,
+      };
+    });
+    handleUpdateMask({
+      ...selectedMask,
+      windows: updatedWins,
+    });
+  };
+
+  const handleCreateAndBindWindowVar = (
+    winId: string,
+    field: 'width' | 'xStart' | 'xEnd',
+    name: string,
+    value: number,
+    unit: VariableUnit,
+    description?: string
+  ) => {
+    if (!selectedMask) return;
+    const newVar = {
+      id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      value,
+      unit,
+      description,
+    };
+    const updatedWins = selectedMask.windows.map((w) => {
+      if (w.id !== winId) return w;
+      return {
+        ...w,
+        paramBindings: { ...(w.paramBindings || {}), [field]: name },
+      };
+    });
+    const updatedMask: PhotomaskLevel = {
+      ...selectedMask,
+      windows: updatedWins,
+    };
+    const flowWithVar: ProcessFlow = {
+      ...latestFlowRef.current,
+      variables: [...(latestFlowRef.current.variables || []), newVar],
+    };
+    commitTrackFlow(resolveFlowParameters(updateMaskAndSyncSteps(flowWithVar, updatedMask)));
   };
 
   // Preset aperture patterns
@@ -421,6 +860,29 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     });
   };
 
+  // Track background marquee drag start
+  const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !trackRef.current) return;
+    trackRef.current.focus({ preventScroll: true });
+    const rect = trackRef.current.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const nm = Math.max(
+      0,
+      Math.min(waferWidth, ((e.clientX - rect.left) / rect.width) * waferWidth)
+    );
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+    setTrackMarquee({
+      startClientX: e.clientX,
+      startNm: nm,
+      currentNm: nm,
+      additive: e.shiftKey || e.ctrlKey || e.metaKey,
+    });
+  };
+
   // Pointer drag logic for interactive aperture track
   const handlePointerDown = (
     e: React.PointerEvent<HTMLDivElement>,
@@ -429,19 +891,79 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   ) => {
     e.preventDefault();
     e.stopPropagation();
+    trackRef.current?.focus({ preventScroll: true });
 
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    setActiveWindowId(win.id);
+    const isAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const wins = selectedMask?.windows || [];
+    if (type === 'move' && isAdditive) {
+      if (selectedWindowIds.includes(win.id)) {
+        setSelectedWindowIds((prev) => prev.filter((id) => id !== win.id));
+        return;
+      }
+      const nextIds = [...selectedWindowIds, win.id];
+      setSelectedWindowIds(nextIds);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      const nextSet = new Set(nextIds);
+      const targets = wins
+        .filter((w) => nextSet.has(w.id))
+        .map((w) => ({ id: w.id, xStart: w.xStart, xEnd: w.xEnd }));
+      dragStartSnapRef.current = makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current);
+      setDragState({
+        winId: win.id,
+        type,
+        startClientX: e.clientX,
+        initialXStart: win.xStart,
+        initialXEnd: win.xEnd,
+        initialWindows: targets,
+      });
+      return;
+    }
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+
+    let moveTargets: Array<{ id: string; xStart: number; xEnd: number }>;
+    if (type === 'move' && selectedWindowIds.includes(win.id)) {
+      const selSet = new Set(selectedWindowIds);
+      moveTargets = wins
+        .filter((w) => selSet.has(w.id))
+        .map((w) => ({ id: w.id, xStart: w.xStart, xEnd: w.xEnd }));
+    } else {
+      setSelectedWindowIds([win.id]);
+      moveTargets = [{ id: win.id, xStart: win.xStart, xEnd: win.xEnd }];
+    }
+
+    dragStartSnapRef.current = makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current);
     setDragState({
       winId: win.id,
       type,
       startClientX: e.clientX,
       initialXStart: win.xStart,
       initialXEnd: win.xEnd,
+      initialWindows: moveTargets,
     });
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (trackMarquee && trackRef.current) {
+      const rect = trackRef.current.getBoundingClientRect();
+      if (rect.width > 0) {
+        const nm = Math.max(
+          0,
+          Math.min(waferWidth, ((e.clientX - rect.left) / rect.width) * waferWidth)
+        );
+        setTrackMarquee((prev) => (prev ? { ...prev, currentNm: nm } : null));
+      }
+      return;
+    }
+
     if (!dragState || !trackRef.current || !selectedMask) return;
 
     const rect = trackRef.current.getBoundingClientRect();
@@ -455,52 +977,95 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     // Snap to 50 nm increments
     const snapTo = (val: number) => Math.round(val / 50) * 50;
 
-    const updatedWins = selectedMask.windows.map((w) => {
-      if (w.id !== dragState.winId) return w;
+    let updatedWins = selectedMask.windows;
+    if (dragState.type === 'move') {
+      const targets =
+        dragState.initialWindows && dragState.initialWindows.length > 0
+          ? dragState.initialWindows
+          : [{ id: dragState.winId, xStart: dragState.initialXStart, xEnd: dragState.initialXEnd }];
+      const snappedDelta = snapTo(deltaNm);
+      const minDelta = -Math.min(...targets.map((t) => t.xStart));
+      const maxDelta = Math.min(...targets.map((t) => waferWidth - t.xEnd));
+      const clampedDelta = Math.max(minDelta, Math.min(maxDelta, snappedDelta));
+      const byId = new Map(
+        targets.map((t) => [t.id, { xStart: t.xStart + clampedDelta, xEnd: t.xEnd + clampedDelta }])
+      );
+      updatedWins = selectedMask.windows.map((w) => {
+        const next = byId.get(w.id);
+        return next ? { ...w, xStart: next.xStart, xEnd: next.xEnd } : w;
+      });
+    } else {
+      updatedWins = selectedMask.windows.map((w) => {
+        if (w.id !== dragState.winId) return w;
 
-      if (dragState.type === 'move') {
-        const width = dragState.initialXEnd - dragState.initialXStart;
-        let newStart = snapTo(dragState.initialXStart + deltaNm);
-        let newEnd = newStart + width;
-
-        if (newStart < 0) {
-          newStart = 0;
-          newEnd = width;
+        if (dragState.type === 'resize-start') {
+          let newStart = snapTo(dragState.initialXStart + deltaNm);
+          newStart = Math.max(0, Math.min(dragState.initialXEnd - 50, newStart));
+          return { ...w, xStart: newStart };
         }
-        if (newEnd > waferWidth) {
-          newEnd = waferWidth;
-          newStart = waferWidth - width;
+
+        if (dragState.type === 'resize-end') {
+          let newEnd = snapTo(dragState.initialXEnd + deltaNm);
+          newEnd = Math.min(waferWidth, Math.max(dragState.initialXStart + 50, newEnd));
+          return { ...w, xEnd: newEnd };
         }
 
-        return { ...w, xStart: newStart, xEnd: newEnd };
-      }
+        return w;
+      });
+    }
 
-      if (dragState.type === 'resize-start') {
-        let newStart = snapTo(dragState.initialXStart + deltaNm);
-        newStart = Math.max(0, Math.min(dragState.initialXEnd - 50, newStart));
-        return { ...w, xStart: newStart };
-      }
-
-      if (dragState.type === 'resize-end') {
-        let newEnd = snapTo(dragState.initialXEnd + deltaNm);
-        newEnd = Math.min(waferWidth, Math.max(dragState.initialXStart + 50, newEnd));
-        return { ...w, xEnd: newEnd };
-      }
-
-      return w;
-    });
-
-    handleUpdateMask({
-      ...selectedMask,
-      windows: updatedWins,
-    });
+    handleUpdateMask(
+      {
+        ...selectedMask,
+        windows: updatedWins,
+      },
+      true
+    );
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (dragState) {
+    if (trackMarquee && selectedMask) {
+      const distPx = Math.abs(e.clientX - trackMarquee.startClientX);
+      if (distPx >= 4) {
+        const minNm = Math.min(trackMarquee.startNm, trackMarquee.currentNm);
+        const maxNm = Math.max(trackMarquee.startNm, trackMarquee.currentNm);
+        const hitIds = selectedMask.windows
+          .filter((w) => w.xEnd >= minNm && w.xStart <= maxNm)
+          .map((w) => w.id);
+        if (trackMarquee.additive) {
+          setSelectedWindowIds((prev) => Array.from(new Set([...prev, ...hitIds])));
+        } else {
+          setSelectedWindowIds(hitIds);
+        }
+      } else if (!trackMarquee.additive) {
+        setSelectedWindowIds([]);
+      }
       try {
-        (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-      } catch (err) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      setTrackMarquee(null);
+      return;
+    }
+
+    if (dragState) {
+      if (dragStartSnapRef.current) {
+        const startSnap = dragStartSnapRef.current;
+        dragStartSnapRef.current = null;
+        const currSnap = makeTrackSnapshot(latestFlowRef.current, latestSelectedMaskIdRef.current);
+        if (!trackSnapshotsEqual(startSnap, currSnap)) {
+          undoStackRef.current = [
+            ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+            startSnap,
+          ];
+          redoStackRef.current = [];
+          syncHistoryState();
+        }
+      }
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
         // ignore
       }
       setDragState(null);
@@ -849,8 +1414,25 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               </button>
             </div>
 
-            {/* Desktop Masks List Toggle + New + Close */}
+            {/* Desktop Masks List Toggle + Variables + New + Close */}
             <div className="hidden lg:flex items-center gap-2 shrink-0">
+              {onOpenVariablesModal && (
+                <button
+                  type="button"
+                  onClick={onOpenVariablesModal}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-950 hover:bg-slate-800 hover:border-violet-500/40 text-xs font-medium text-violet-300 transition-colors"
+                  title="Define & edit parametric design variables"
+                >
+                  <VariableIcon className="w-3.5 h-3.5" />
+                  <span>Variables</span>
+                  {variables.length > 0 && (
+                    <span className="px-1 py-0.2 rounded bg-violet-500/20 text-violet-200 font-mono text-[10px]">
+                      {variables.length}
+                    </span>
+                  )}
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => setDesktopMasksSidebarOpen((v) => !v)}
@@ -926,6 +1508,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 selectedMask={selectedMask}
                 onUpdateFlow={onUpdateFlow}
                 onNotify={handleEditorNotify}
+                onOpenVariablesModal={onOpenVariablesModal}
               />
             </div>
           ) : selectedMask ? (
@@ -1196,12 +1779,40 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                           {isLF ? 'Light-Field Blocker Track' : 'Dark-Field Aperture Track'}
                         </span>
                         <span className="hidden sm:inline text-[11px] text-slate-400">
-                          · {isLF ? 'Quartz bg (UV passes) · Blocks = Chrome blockers' : 'Chrome bg (UV blocked) · Blocks = Clear apertures'} · 50nm snap
+                          {dragState?.type === 'move' && (dragState.initialWindows?.length || 1) > 1 ? (
+                            <span className="text-amber-300 font-semibold">
+                              · Sliding {dragState.initialWindows?.length} {featNoun}s together...
+                            </span>
+                          ) : (
+                            <>
+                              · Shift/Ctrl+Click or drag track for multi · ←/→ arrows nudge 50nm (Shift 250nm)
+                            </>
+                          )}
                         </span>
                       </div>
 
-                      {/* Preset Pattern Buttons */}
+                      {/* Undo / Redo + Preset Pattern Buttons */}
                       <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                        <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 mr-0.5">
+                          <button
+                            type="button"
+                            onClick={handleUndoTrack}
+                            disabled={!historyState.canUndo}
+                            className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+                            title="Undo track edit (Ctrl+Z)"
+                          >
+                            <Undo2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleRedoTrack}
+                            disabled={!historyState.canRedo}
+                            className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+                            title="Redo track edit (Ctrl+Y)"
+                          >
+                            <Redo2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                         <span className="text-[10px] text-slate-400 mr-0.5">Presets:</span>
                         <button
                           onClick={() => handleApplyPreset('center-slit')}
@@ -1258,10 +1869,12 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     {/* Visual Draggable Mask Track */}
                     <div
                       ref={trackRef}
+                      tabIndex={0}
+                      onPointerDown={handleTrackPointerDown}
                       onPointerMove={handlePointerMove}
                       onPointerUp={handlePointerUp}
                       onPointerCancel={handlePointerUp}
-                      className={`relative h-14 rounded-xl overflow-hidden cursor-default select-none shadow-inner touch-none border ${
+                      className={`relative h-14 rounded-xl overflow-hidden cursor-default select-none shadow-inner touch-none border focus:outline-none focus-visible:ring-1 focus-visible:ring-sky-500/60 ${
                         isLF
                           ? 'bg-gradient-to-b from-sky-200/35 via-cyan-100/25 to-amber-100/30 border-sky-400/50'
                           : 'bg-slate-950 border-slate-800'
@@ -1293,11 +1906,25 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                         />
                       )}
 
+                      {/* Track Marquee Selection Box */}
+                      {trackMarquee && (() => {
+                        const minPct = (Math.min(trackMarquee.startNm, trackMarquee.currentNm) / waferWidth) * 100;
+                        const maxPct = (Math.max(trackMarquee.startNm, trackMarquee.currentNm) / waferWidth) * 100;
+                        return (
+                          <div
+                            className="absolute top-0 bottom-0 bg-sky-400/20 border-x-2 border-sky-400 pointer-events-none z-30"
+                            style={{ left: `${minPct}%`, width: `${Math.max(0.5, maxPct - minPct)}%` }}
+                          />
+                        );
+                      })()}
+
                       {/* Movable Blocks: Chrome Blockers (Light-Field) OR Clear Apertures (Dark-Field) */}
                       {selectedMask.windows.map((win, idx) => {
                         const leftPct = (win.xStart / waferWidth) * 100;
                         const widthPct = ((win.xEnd - win.xStart) / waferWidth) * 100;
-                        const isActive = activeWindowId === win.id;
+                        const isActive =
+                          selectedWindowIds.includes(win.id) ||
+                          Boolean(dragState?.initialWindows?.some((t) => t.id === win.id));
                         const widthNm = Math.round(win.xEnd - win.xStart);
                         const accentColor = selectedMask.color || '#38bdf8';
 
@@ -1325,6 +1952,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                                 : `0 3px 10px -2px ${accentColor}60`,
                               cursor: 'grab',
                             }}
+                            onClick={(e) => e.stopPropagation()}
                             onPointerDown={(e) => handlePointerDown(e, win, 'move')}
                           >
                             {/* Left edge resize handle */}
@@ -1345,8 +1973,13 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                             </div>
 
                             {/* Feature label (width) */}
-                            <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/50 text-white backdrop-blur-xs select-none pointer-events-none truncate shadow-sm">
-                              {widthNm >= 1000 ? `${(widthNm / 1000).toFixed(2)} µm` : `${widthNm} nm`}
+                            <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/50 text-white backdrop-blur-xs select-none pointer-events-none truncate shadow-sm flex items-center gap-1">
+                              {(win.paramBindings?.width || win.paramBindings?.xStart || win.paramBindings?.xEnd) && (
+                                <span className="italic text-violet-300 font-bold">fx</span>
+                              )}
+                              <span>
+                                {widthNm >= 1000 ? `${(widthNm / 1000).toFixed(2)} µm` : `${widthNm} nm`}
+                              </span>
                             </span>
 
                             {/* Right edge resize handle */}
@@ -1384,92 +2017,387 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
               {/* PRECISION NUMERIC FEATURE TABLE / MOBILE CARDS */}
               <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="font-semibold text-xs text-slate-200">
-                    {selectedMask.maskField === 'light-field'
-                      ? `Chrome Blockers (${selectedMask.windows.length})`
-                      : `Aperture Windows (${selectedMask.windows.length})`}
-                  </span>
+                {(() => {
+                  const effectiveSelectedIds =
+                    selectedWindowIds.length > 0
+                      ? selectedWindowIds
+                      : selectedMask.windows.length === 1
+                      ? [selectedMask.windows[0].id]
+                      : [];
+                  const singleSelWin =
+                    effectiveSelectedIds.length === 1
+                      ? selectedMask.windows.find((w) => w.id === effectiveSelectedIds[0]) || null
+                      : null;
+                  const singleSelIdx = singleSelWin
+                    ? selectedMask.windows.findIndex((w) => w.id === singleSelWin.id)
+                    : -1;
+                  const featWord = selectedMask.maskField === 'light-field' ? 'Blocker' : 'Window';
+                  const allSelected =
+                    selectedMask.windows.length > 0 &&
+                    selectedWindowIds.length === selectedMask.windows.length;
 
-                  <button
-                    onClick={handleAddWindow}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 text-xs font-semibold transition-colors"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>
-                      {selectedMask.maskField === 'light-field' ? 'Add Blocker' : 'Add Window'}
-                    </span>
-                  </button>
-                </div>
+                  return (
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-xs text-slate-200">
+                          {selectedMask.maskField === 'light-field'
+                            ? `Chrome Blockers (${selectedMask.windows.length})`
+                            : `Aperture Windows (${selectedMask.windows.length})`}
+                        </span>
+                        {effectiveSelectedIds.length === 1 && singleSelIdx >= 0 && (
+                          <span className="text-[11px] font-mono text-sky-300">
+                            · Selected: W-{singleSelIdx + 1}
+                          </span>
+                        )}
+                        {effectiveSelectedIds.length > 1 && (
+                          <span className="text-[11px] font-mono font-semibold text-amber-300">
+                            · {effectiveSelectedIds.length} selected
+                          </span>
+                        )}
+                        {selectedMask.windows.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedWindowIds(
+                                allSelected ? [] : selectedMask.windows.map((w) => w.id)
+                              )
+                            }
+                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[10px]"
+                          >
+                            {allSelected ? 'Clear' : 'All'}
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {selectedMask.windows.length > 0 && (
+                          <>
+                            {effectiveSelectedIds.length > 0 && (
+                              <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg px-1.5 py-0.5">
+                                <span className="text-[10px] text-slate-400">Move:</span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleShiftWindows(effectiveSelectedIds, -100)}
+                                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10.5px]"
+                                  title="Shift selected -100 nm"
+                                >
+                                  -100nm
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleShiftWindows(effectiveSelectedIds, 100)}
+                                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10.5px]"
+                                  title="Shift selected +100 nm"
+                                >
+                                  +100nm
+                                </button>
+                              </div>
+                            )}
+                            <button
+                              type="button"
+                              disabled={effectiveSelectedIds.length === 0}
+                              onClick={() => handleDuplicateSelectedWindows(effectiveSelectedIds)}
+                              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none text-slate-200 border border-slate-700 text-xs font-medium transition-colors"
+                              title={
+                                effectiveSelectedIds.length > 1
+                                  ? `Duplicate ${effectiveSelectedIds.length} selected ${featWord.toLowerCase()}s`
+                                  : singleSelWin
+                                  ? `Duplicate selected ${featWord} W-${singleSelIdx + 1}`
+                                  : `Select a ${featWord.toLowerCase()} row or track block first`
+                              }
+                            >
+                              <Copy className="w-3.5 h-3.5 text-sky-400" />
+                              <span>
+                                {effectiveSelectedIds.length > 1
+                                  ? `Duplicate (${effectiveSelectedIds.length})`
+                                  : 'Duplicate'}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={!singleSelWin}
+                              onClick={() => {
+                                if (!singleSelWin) return;
+                                setSelectedWindowIds([singleSelWin.id]);
+                                setOpenWinBind(null);
+                                setArraySourceWinId((prev) =>
+                                  prev === singleSelWin.id ? null : singleSelWin.id
+                                );
+                              }}
+                              className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-xs font-medium transition-colors disabled:opacity-40 disabled:pointer-events-none ${
+                                singleSelWin && arraySourceWinId === singleSelWin.id
+                                  ? 'bg-sky-600/25 border-sky-500/60 text-sky-200'
+                                  : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                              }`}
+                              title={
+                                singleSelWin
+                                  ? `Make 1D array from selected ${featWord} W-${singleSelIdx + 1}`
+                                  : `Select a single ${featWord.toLowerCase()} to make an array`
+                              }
+                            >
+                              <LayoutGrid className="w-3.5 h-3.5 text-sky-400" />
+                              <span>Make Array</span>
+                            </button>
+                            {selectedWindowIds.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveSelectedWindows(selectedWindowIds)}
+                                className="flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-xs font-medium transition-colors"
+                                title={`Delete ${selectedWindowIds.length} selected ${featWord.toLowerCase()}s`}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Delete ({selectedWindowIds.length})</span>
+                              </button>
+                            )}
+                          </>
+                        )}
+
+                        <button
+                          onClick={handleAddWindow}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 text-xs font-semibold transition-colors"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>
+                            {selectedMask.maskField === 'light-field' ? 'Add Blocker' : 'Add Window'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Mobile Stacked Aperture Cards (< sm) */}
                 <div className="sm:hidden space-y-2">
                   {selectedMask.windows.map((win, idx) => {
                     const widthNm = Math.round(win.xEnd - win.xStart);
                     const widthUm = (widthNm / 1000).toFixed(2);
+                    const wExpr = win.paramBindings?.width;
+                    const xStartExpr = win.paramBindings?.xStart;
+                    const xEndExpr = win.paramBindings?.xEnd;
+                    const activeBindField =
+                      openWinBind?.winId === win.id ? openWinBind.field : null;
+                    const isArrayOpen = arraySourceWinId === win.id;
+                    const isSelected = selectedWindowIds.includes(win.id);
+                    const featLabel = selectedMask.maskField === 'light-field' ? 'Blocker' : 'Window';
+
                     return (
                       <div
                         key={`m_${win.id || idx}`}
-                        className={`p-2.5 rounded-xl border space-y-2 ${
-                          activeWindowId === win.id
+                        onClick={(e) =>
+                          toggleWindowSelection(win.id, e.shiftKey || e.ctrlKey || e.metaKey)
+                        }
+                        className={`p-2.5 rounded-xl border space-y-2 cursor-pointer ${
+                          isSelected
                             ? 'bg-sky-950/25 border-sky-500/50'
                             : 'bg-slate-950/60 border-slate-800'
                         }`}
                       >
-                        <div className="flex items-center justify-between text-xs">
-                          <div className="flex items-center gap-2 font-mono text-slate-200 font-semibold">
+                        <div className="flex items-center justify-between text-xs gap-2">
+                          <div className="flex items-center gap-1.5 font-mono text-slate-200 font-semibold min-w-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleWindowSelection(win.id, true);
+                              }}
+                              className={`w-4 h-4 rounded border flex items-center justify-center transition-colors shrink-0 ${
+                                isSelected
+                                  ? 'bg-sky-600 border-sky-400 text-white'
+                                  : 'bg-slate-900 border-slate-600'
+                              }`}
+                            >
+                              {isSelected && <Check className="w-2.5 h-2.5" />}
+                            </button>
                             <span
-                              className="w-2.5 h-2.5 rounded-full"
+                              className="w-2.5 h-2.5 rounded-full shrink-0"
                               style={{ backgroundColor: selectedMask.color || '#38bdf8' }}
                             />
                             <span>W-{idx + 1}</span>
                             <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px]">
                               {widthNm >= 1000 ? `${widthUm} µm` : `${widthNm} nm`}
                             </span>
+                            <ParamBindingBadge
+                              expression={wExpr}
+                              isOpen={activeBindField === 'width'}
+                              onToggle={() => {
+                                setArraySourceWinId(null);
+                                setOpenWinBind(
+                                  activeBindField === 'width'
+                                    ? null
+                                    : { winId: win.id, field: 'width' }
+                                );
+                              }}
+                              compact
+                            />
                           </div>
-                          <button
-                            onClick={() => handleRemoveWindow(win.id)}
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/30 transition-colors"
-                            title="Delete this aperture"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          <div className="flex items-center gap-0.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDuplicateWindow(win.id);
+                              }}
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 transition-colors"
+                              title={`Duplicate ${featLabel}`}
+                            >
+                              <Copy className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedWindowIds([win.id]);
+                                setOpenWinBind(null);
+                                setArraySourceWinId((prev) =>
+                                  prev === win.id ? null : win.id
+                                );
+                              }}
+                              className={`p-1.5 rounded-lg transition-colors ${
+                                isArrayOpen
+                                  ? 'text-sky-300 bg-sky-500/20'
+                                  : 'text-slate-400 hover:text-sky-300 hover:bg-sky-500/10'
+                              }`}
+                              title={`Make 1D array from ${featLabel}`}
+                            >
+                              <LayoutGrid className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRemoveWindow(win.id);
+                              }}
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/30 transition-colors"
+                              title="Delete this aperture"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
 
                         <div className="grid grid-cols-2 gap-2">
-                          <label className="space-y-1 block">
-                            <span className="block text-[10px] font-mono text-slate-400">
-                              Start X₁ ({(win.xStart / 1000).toFixed(2)} µm)
-                            </span>
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[10px] font-mono text-slate-400">
+                                Start X₁ ({(win.xStart / 1000).toFixed(2)} µm)
+                              </span>
+                              <ParamBindingBadge
+                                expression={xStartExpr}
+                                isOpen={activeBindField === 'xStart'}
+                                onToggle={() =>
+                                  setOpenWinBind(
+                                    activeBindField === 'xStart'
+                                      ? null
+                                      : { winId: win.id, field: 'xStart' }
+                                  )
+                                }
+                                compact
+                              />
+                            </div>
                             <input
                               type="number"
                               min="0"
                               max={waferWidth}
                               step="50"
+                              disabled={Boolean(xStartExpr)}
                               value={win.xStart}
+                              title={xStartExpr ? `Bound to: ${xStartExpr}` : 'Start X₁ (nm)'}
                               onChange={(e) =>
                                 handleUpdateWindowCoord(win.id, 'xStart', parseFloat(e.target.value || '0'))
                               }
-                              className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                              className={`w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border font-mono text-xs focus:outline-none ${
+                                xStartExpr
+                                  ? 'border-violet-500/50 text-violet-300 opacity-75 cursor-not-allowed'
+                                  : 'border-slate-700 text-slate-100 focus:border-sky-500'
+                              }`}
                             />
-                          </label>
-                          <label className="space-y-1 block">
-                            <span className="block text-[10px] font-mono text-slate-400">
-                              End X₂ ({(win.xEnd / 1000).toFixed(2)} µm)
-                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[10px] font-mono text-slate-400">
+                                End X₂ ({(win.xEnd / 1000).toFixed(2)} µm)
+                              </span>
+                              <ParamBindingBadge
+                                expression={xEndExpr}
+                                isOpen={activeBindField === 'xEnd'}
+                                onToggle={() =>
+                                  setOpenWinBind(
+                                    activeBindField === 'xEnd'
+                                      ? null
+                                      : { winId: win.id, field: 'xEnd' }
+                                  )
+                                }
+                                compact
+                              />
+                            </div>
                             <input
                               type="number"
                               min="0"
                               max={waferWidth}
                               step="50"
+                              disabled={Boolean(xEndExpr)}
                               value={win.xEnd}
+                              title={xEndExpr ? `Bound to: ${xEndExpr}` : 'End X₂ (nm)'}
                               onChange={(e) =>
                                 handleUpdateWindowCoord(win.id, 'xEnd', parseFloat(e.target.value || '0'))
                               }
-                              className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                              className={`w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border font-mono text-xs focus:outline-none ${
+                                xEndExpr
+                                  ? 'border-violet-500/50 text-violet-300 opacity-75 cursor-not-allowed'
+                                  : 'border-slate-700 text-slate-100 focus:border-sky-500'
+                              }`}
                             />
-                          </label>
+                          </div>
                         </div>
+
+                        {isArrayOpen && (
+                          <MaskWindowArrayPanel
+                            sourceWindow={win}
+                            sourceIndex={idx}
+                            waferWidth={waferWidth}
+                            featureNounCap={featLabel}
+                            unit="nm"
+                            onApply={(opts) => handleCreateWindowArray(win.id, opts)}
+                            onClose={() => setArraySourceWinId(null)}
+                          />
+                        )}
+
+                        {activeBindField && (
+                          <ParamBindingPanel
+                            expression={win.paramBindings?.[activeBindField]}
+                            variables={variables}
+                            waferWidth={waferWidth}
+                            currentValue={
+                              activeBindField === 'width'
+                                ? Math.max(10, widthNm)
+                                : activeBindField === 'xStart'
+                                ? win.xStart
+                                : win.xEnd
+                            }
+                            unit="nm"
+                            suggestedVarName={
+                              activeBindField === 'width'
+                                ? `win_${idx + 1}_w`
+                                : activeBindField === 'xStart'
+                                ? `win_${idx + 1}_x1`
+                                : `win_${idx + 1}_x2`
+                            }
+                            targetLabel={`${selectedMask.layerCode || selectedMask.name} · ${featLabel} #${idx + 1} · ${
+                              activeBindField === 'width'
+                                ? 'Width ΔX'
+                                : activeBindField === 'xStart'
+                                ? 'Start X₁'
+                                : 'End X₂'
+                            }`}
+                            onChangeExpression={(expr) =>
+                              handleUpdateWindowBinding(win.id, activeBindField, expr)
+                            }
+                            onCreateAndBind={(name, val, unit, desc) =>
+                              handleCreateAndBindWindowVar(win.id, activeBindField, name, val, unit, desc)
+                            }
+                            onOpenVariablesModal={onOpenVariablesModal}
+                            onClose={() => setOpenWinBind(null)}
+                          />
+                        )}
                       </div>
                     );
                   })}
@@ -1488,12 +2416,37 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-900/90 text-[11px] text-slate-400 font-mono uppercase tracking-wider border-b border-slate-800">
                       <tr>
+                        <th className="pl-3 pr-1 py-2 w-7">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const allSel =
+                                selectedMask.windows.length > 0 &&
+                                selectedWindowIds.length === selectedMask.windows.length;
+                              setSelectedWindowIds(
+                                allSel ? [] : selectedMask.windows.map((w) => w.id)
+                              );
+                            }}
+                            className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${
+                              selectedMask.windows.length > 0 &&
+                              selectedWindowIds.length === selectedMask.windows.length
+                                ? 'bg-sky-600 border-sky-400 text-white'
+                                : 'bg-slate-950 border-slate-600 hover:border-slate-400'
+                            }`}
+                            title="Select / deselect all rows"
+                          >
+                            {selectedMask.windows.length > 0 &&
+                              selectedWindowIds.length === selectedMask.windows.length && (
+                                <Check className="w-2.5 h-2.5" />
+                              )}
+                          </button>
+                        </th>
                         <th className="px-3.5 py-2">
                           {selectedMask.maskField === 'light-field' ? 'Blocker #' : 'Window #'}
                         </th>
                         <th className="px-3.5 py-2">Start X₁ (nm)</th>
                         <th className="px-3.5 py-2">End X₂ (nm)</th>
-                        <th className="px-3.5 py-2">Width ΔX</th>
+                        <th className="px-3.5 py-2">Width ΔX (nm)</th>
                         <th className="px-3.5 py-2 text-right">Actions</th>
                       </tr>
                     </thead>
@@ -1501,80 +2454,273 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                       {selectedMask.windows.map((win, idx) => {
                         const widthNm = Math.round(win.xEnd - win.xStart);
                         const widthUm = (widthNm / 1000).toFixed(2);
+                        const wExpr = win.paramBindings?.width;
+                        const xStartExpr = win.paramBindings?.xStart;
+                        const xEndExpr = win.paramBindings?.xEnd;
+                        const activeBindField =
+                          openWinBind?.winId === win.id ? openWinBind.field : null;
+                        const isArrayOpen = arraySourceWinId === win.id;
+                        const isRowSelected = selectedWindowIds.includes(win.id);
+                        const featLabel = selectedMask.maskField === 'light-field' ? 'Blocker' : 'Window';
 
                         return (
-                          <tr
-                            key={win.id || `row_${idx}`}
-                            className={`hover:bg-slate-900/40 transition-colors ${
-                              activeWindowId === win.id ? 'bg-sky-950/20' : ''
-                            }`}
-                          >
-                            <td className="px-3.5 py-2 font-mono text-slate-300">
-                              <span
-                                className="inline-block w-2 h-2 rounded-full mr-2"
-                                style={{ backgroundColor: selectedMask.color || '#38bdf8' }}
-                              />
-                              W-{idx + 1}
-                            </td>
-
-                            <td className="px-3.5 py-2">
-                              <div className="flex items-center gap-1.5">
-                                <input
-                                  type="number"
-                                  min="0"
-                                  max={waferWidth}
-                                  step="50"
-                                  value={win.xStart}
-                                  onChange={(e) =>
-                                    handleUpdateWindowCoord(win.id, 'xStart', parseFloat(e.target.value || '0'))
-                                  }
-                                  className="w-24 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                          <React.Fragment key={win.id || `row_${idx}`}>
+                            <tr
+                              onClick={(e) =>
+                                toggleWindowSelection(win.id, e.shiftKey || e.ctrlKey || e.metaKey)
+                              }
+                              className={`hover:bg-slate-900/40 transition-colors cursor-pointer ${
+                                isRowSelected ? 'bg-sky-950/20' : ''
+                              }`}
+                            >
+                              <td className="pl-3 pr-1 py-2">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleWindowSelection(win.id, true);
+                                  }}
+                                  className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${
+                                    isRowSelected
+                                      ? 'bg-sky-600 border-sky-400 text-white'
+                                      : 'bg-slate-900 border-slate-600 hover:border-slate-400'
+                                  }`}
+                                  title={isRowSelected ? 'Deselect' : 'Add to selection'}
+                                >
+                                  {isRowSelected && <Check className="w-2.5 h-2.5" />}
+                                </button>
+                              </td>
+                              <td className="px-3.5 py-2 font-mono text-slate-300">
+                                <span
+                                  className="inline-block w-2 h-2 rounded-full mr-2"
+                                  style={{ backgroundColor: selectedMask.color || '#38bdf8' }}
                                 />
-                                <span className="text-[10px] text-slate-500 font-mono">
-                                  ({(win.xStart / 1000).toFixed(2)} µm)
-                                </span>
-                              </div>
-                            </td>
+                                W-{idx + 1}
+                              </td>
 
-                            <td className="px-3.5 py-2">
-                              <div className="flex items-center gap-1.5">
-                                <input
-                                  type="number"
-                                  min="0"
-                                  max={waferWidth}
-                                  step="50"
-                                  value={win.xEnd}
-                                  onChange={(e) =>
-                                    handleUpdateWindowCoord(win.id, 'xEnd', parseFloat(e.target.value || '0'))
-                                  }
-                                  className="w-24 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
-                                />
-                                <span className="text-[10px] text-slate-500 font-mono">
-                                  ({(win.xEnd / 1000).toFixed(2)} µm)
-                                </span>
-                              </div>
-                            </td>
+                              <td className="px-3.5 py-2">
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max={waferWidth}
+                                    step="50"
+                                    disabled={Boolean(xStartExpr)}
+                                    value={win.xStart}
+                                    title={xStartExpr ? `Bound to: ${xStartExpr}` : 'Start X₁ (nm)'}
+                                    onChange={(e) =>
+                                      handleUpdateWindowCoord(win.id, 'xStart', parseFloat(e.target.value || '0'))
+                                    }
+                                    className={`w-24 px-2 py-1 rounded bg-slate-900 border font-mono text-xs focus:outline-none ${
+                                      xStartExpr
+                                        ? 'border-violet-500/50 text-violet-300 opacity-75 cursor-not-allowed'
+                                        : 'border-slate-700 text-slate-100 focus:border-sky-500'
+                                    }`}
+                                  />
+                                  <ParamBindingBadge
+                                    expression={xStartExpr}
+                                    isOpen={activeBindField === 'xStart'}
+                                    onToggle={() =>
+                                      setOpenWinBind(
+                                        activeBindField === 'xStart'
+                                          ? null
+                                          : { winId: win.id, field: 'xStart' }
+                                      )
+                                    }
+                                    compact
+                                  />
+                                  <span className="text-[10px] text-slate-500 font-mono">
+                                    ({(win.xStart / 1000).toFixed(2)} µm)
+                                  </span>
+                                </div>
+                              </td>
 
-                            <td className="px-3.5 py-2 font-mono text-amber-300 font-semibold">
-                              {widthNm >= 1000 ? `${widthUm} µm` : `${widthNm} nm`}
-                            </td>
+                              <td className="px-3.5 py-2">
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max={waferWidth}
+                                    step="50"
+                                    disabled={Boolean(xEndExpr)}
+                                    value={win.xEnd}
+                                    title={xEndExpr ? `Bound to: ${xEndExpr}` : 'End X₂ (nm)'}
+                                    onChange={(e) =>
+                                      handleUpdateWindowCoord(win.id, 'xEnd', parseFloat(e.target.value || '0'))
+                                    }
+                                    className={`w-24 px-2 py-1 rounded bg-slate-900 border font-mono text-xs focus:outline-none ${
+                                      xEndExpr
+                                        ? 'border-violet-500/50 text-violet-300 opacity-75 cursor-not-allowed'
+                                        : 'border-slate-700 text-slate-100 focus:border-sky-500'
+                                    }`}
+                                  />
+                                  <ParamBindingBadge
+                                    expression={xEndExpr}
+                                    isOpen={activeBindField === 'xEnd'}
+                                    onToggle={() =>
+                                      setOpenWinBind(
+                                        activeBindField === 'xEnd'
+                                          ? null
+                                          : { winId: win.id, field: 'xEnd' }
+                                      )
+                                    }
+                                    compact
+                                  />
+                                  <span className="text-[10px] text-slate-500 font-mono">
+                                    ({(win.xEnd / 1000).toFixed(2)} µm)
+                                  </span>
+                                </div>
+                              </td>
 
-                            <td className="px-3.5 py-2 text-right">
-                              <button
-                                onClick={() => handleRemoveWindow(win.id)}
-                                className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-rose-950/30 transition-colors"
-                                title="Delete this aperture"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </td>
-                          </tr>
+                              <td className="px-3.5 py-2">
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="number"
+                                    min="10"
+                                    max={waferWidth}
+                                    step="50"
+                                    disabled={Boolean(wExpr)}
+                                    value={widthNm}
+                                    title={
+                                      wExpr
+                                        ? `Bound to: ${wExpr}`
+                                        : 'Edit width ΔX (keeps feature centered)'
+                                    }
+                                    onChange={(e) =>
+                                      handleUpdateWindowWidth(win.id, parseFloat(e.target.value || '10'))
+                                    }
+                                    className={`w-24 px-2 py-1 rounded bg-slate-900 border font-mono text-xs font-semibold focus:outline-none ${
+                                      wExpr
+                                        ? 'border-violet-500/50 text-violet-300 opacity-75 cursor-not-allowed'
+                                        : 'border-slate-700 text-amber-300 focus:border-sky-500'
+                                    }`}
+                                  />
+                                  <ParamBindingBadge
+                                    expression={wExpr}
+                                    isOpen={activeBindField === 'width'}
+                                    onToggle={() =>
+                                      setOpenWinBind(
+                                        activeBindField === 'width'
+                                          ? null
+                                          : { winId: win.id, field: 'width' }
+                                      )
+                                    }
+                                    compact
+                                  />
+                                  <span className="text-[10px] text-slate-500 font-mono">
+                                    ({widthUm} µm)
+                                  </span>
+                                </div>
+                              </td>
+
+                              <td className="px-3.5 py-2 text-right">
+                                <div className="inline-flex items-center justify-end gap-0.5">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleDuplicateWindow(win.id);
+                                    }}
+                                    className="p-1 rounded text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 transition-colors"
+                                    title={`Duplicate ${featLabel}`}
+                                  >
+                                    <Copy className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSelectedWindowIds([win.id]);
+                                      setOpenWinBind(null);
+                                      setArraySourceWinId((prev) =>
+                                        prev === win.id ? null : win.id
+                                      );
+                                    }}
+                                    className={`p-1 rounded transition-colors ${
+                                      isArrayOpen
+                                        ? 'text-sky-300 bg-sky-500/20'
+                                        : 'text-slate-400 hover:text-sky-300 hover:bg-sky-500/10'
+                                    }`}
+                                    title={`Make 1D array from ${featLabel}`}
+                                  >
+                                    <LayoutGrid className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleRemoveWindow(win.id);
+                                    }}
+                                    className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-rose-950/30 transition-colors"
+                                    title="Delete this aperture"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                            {isArrayOpen && (
+                              <tr>
+                                <td colSpan={6} className="px-3.5 pb-3 pt-0.5 bg-slate-950/75">
+                                  <MaskWindowArrayPanel
+                                    sourceWindow={win}
+                                    sourceIndex={idx}
+                                    waferWidth={waferWidth}
+                                    featureNounCap={featLabel}
+                                    unit="nm"
+                                    onApply={(opts) => handleCreateWindowArray(win.id, opts)}
+                                    onClose={() => setArraySourceWinId(null)}
+                                  />
+                                </td>
+                              </tr>
+                            )}
+                            {activeBindField && (
+                              <tr>
+                                <td colSpan={6} className="px-3.5 pb-3 pt-0.5 bg-slate-950/75">
+                                  <ParamBindingPanel
+                                    expression={win.paramBindings?.[activeBindField]}
+                                    variables={variables}
+                                    waferWidth={waferWidth}
+                                    currentValue={
+                                      activeBindField === 'width'
+                                        ? Math.max(10, widthNm)
+                                        : activeBindField === 'xStart'
+                                        ? win.xStart
+                                        : win.xEnd
+                                    }
+                                    unit="nm"
+                                    suggestedVarName={
+                                      activeBindField === 'width'
+                                        ? `win_${idx + 1}_w`
+                                        : activeBindField === 'xStart'
+                                        ? `win_${idx + 1}_x1`
+                                        : `win_${idx + 1}_x2`
+                                    }
+                                    targetLabel={`${selectedMask.layerCode || selectedMask.name} · ${featLabel} #${idx + 1} · ${
+                                      activeBindField === 'width'
+                                        ? 'Width ΔX'
+                                        : activeBindField === 'xStart'
+                                        ? 'Start X₁'
+                                        : 'End X₂'
+                                    }`}
+                                    onChangeExpression={(expr) =>
+                                      handleUpdateWindowBinding(win.id, activeBindField, expr)
+                                    }
+                                    onCreateAndBind={(name, val, unit, desc) =>
+                                      handleCreateAndBindWindowVar(win.id, activeBindField, name, val, unit, desc)
+                                    }
+                                    onOpenVariablesModal={onOpenVariablesModal}
+                                    onClose={() => setOpenWinBind(null)}
+                                  />
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
                         );
                       })}
 
                       {selectedMask.windows.length === 0 && (
                         <tr>
-                          <td colSpan={5} className="px-4 py-6 text-center text-slate-500 italic">
+                          <td colSpan={6} className="px-4 py-6 text-center text-slate-500 italic">
                             {selectedMask.maskField === 'light-field'
                               ? 'No chrome blockers defined. This reticle is completely clear quartz (100% light field). Click "Add Blocker" or choose a preset above.'
                               : 'No apertures defined. This reticle is completely opaque chrome (0% clear dark field). Click "Add Window" or choose a preset above.'}

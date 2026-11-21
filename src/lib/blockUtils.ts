@@ -564,6 +564,258 @@ export function reorderStepInTimeline(
 }
 
 /**
+ * Moves multiple selected steps simultaneously (preserving their relative timeline order)
+ * to any target slot: within a block, into a block, or ungrouped before/after a timeline item.
+ */
+export function reorderStepsInTimeline(
+  flow: ProcessFlow,
+  sourceStepIds: string[],
+  target: StepDropTarget
+): ProcessFlow {
+  if (sourceStepIds.length === 0) return flow;
+  if (sourceStepIds.length === 1) {
+    return reorderStepInTimeline(flow, sourceStepIds[0], target);
+  }
+
+  const norm = normalizeFlowBlocksOrder(flow);
+  const items = buildTimelineItems(norm);
+  const selectedSet = new Set(sourceStepIds);
+
+  if (target.kind === 'block-step' && selectedSet.has(target.stepId)) {
+    return norm;
+  }
+
+  // Extract selected steps in their chronological timeline order
+  const movedSteps: ProcessStep[] = [];
+  for (const s of norm.steps) {
+    if (selectedSet.has(s.id)) {
+      movedSteps.push(s);
+    }
+  }
+  if (movedSteps.length === 0) return norm;
+
+  const rawInsertIdx =
+    target.kind === 'timeline-item'
+      ? target.position === 'before'
+        ? target.timelineIndex
+        : target.timelineIndex + 1
+      : -1;
+
+  let removedTopLevelBeforeInsert = 0;
+  const nextItems: TimelineItem[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind === 'step') {
+      if (selectedSet.has(it.step.id)) {
+        if (rawInsertIdx >= 0 && i < rawInsertIdx) {
+          removedTopLevelBeforeInsert += 1;
+        }
+        continue;
+      }
+      nextItems.push(it);
+    } else {
+      const remaining = it.steps.filter((s) => !selectedSet.has(s.step.id));
+      nextItems.push({
+        kind: 'block',
+        block: { ...it.block },
+        steps: remaining,
+      });
+    }
+  }
+
+  if (target.kind === 'into-block') {
+    const blkIdx = nextItems.findIndex(
+      (it) => it.kind === 'block' && it.block.id === target.blockId
+    );
+    if (blkIdx < 0 || nextItems[blkIdx].kind !== 'block') return norm;
+    const blk = nextItems[blkIdx];
+    nextItems[blkIdx] = {
+      kind: 'block',
+      block: { ...blk.block, placeholderStepIndex: undefined },
+      steps: [
+        ...blk.steps,
+        ...movedSteps.map((s) => ({
+          step: { ...s, blockId: target.blockId },
+          idx: -1,
+        })),
+      ],
+    };
+    return rebuildFlowFromTimelineItems(norm, nextItems);
+  }
+
+  if (target.kind === 'block-step') {
+    const blkIdx = nextItems.findIndex(
+      (it) => it.kind === 'block' && it.block.id === target.blockId
+    );
+    if (blkIdx < 0 || nextItems[blkIdx].kind !== 'block') return norm;
+    const blk = nextItems[blkIdx];
+    const targetSubIdx = blk.steps.findIndex((s) => s.step.id === target.stepId);
+    if (targetSubIdx < 0) return norm;
+
+    const insertSubIdx =
+      target.position === 'before' ? targetSubIdx : targetSubIdx + 1;
+    const nextSteps = [...blk.steps];
+    nextSteps.splice(
+      insertSubIdx,
+      0,
+      ...movedSteps.map((s) => ({
+        step: { ...s, blockId: target.blockId },
+        idx: -1,
+      }))
+    );
+    nextItems[blkIdx] = {
+      kind: 'block',
+      block: { ...blk.block, placeholderStepIndex: undefined },
+      steps: nextSteps,
+    };
+    return rebuildFlowFromTimelineItems(norm, nextItems);
+  }
+
+  // target.kind === 'timeline-item' -> insert as ungrouped steps
+  const insertIdx = Math.max(
+    0,
+    Math.min(nextItems.length, rawInsertIdx - removedTopLevelBeforeInsert)
+  );
+  nextItems.splice(
+    insertIdx,
+    0,
+    ...movedSteps.map((s) => ({
+      kind: 'step' as const,
+      step: { ...s, blockId: undefined },
+      idx: -1,
+    }))
+  );
+
+  return rebuildFlowFromTimelineItems(norm, nextItems);
+}
+
+/**
+ * Assigns multiple steps into a target block or ungroups them in place while
+ * keeping block contiguity and empty-block placeholders intact.
+ */
+export function assignStepsToBlock(
+  flow: ProcessFlow,
+  stepIds: string[],
+  targetBlockId: string | null
+): ProcessFlow {
+  if (stepIds.length === 0) return flow;
+  if (targetBlockId) {
+    return reorderStepsInTimeline(flow, stepIds, {
+      kind: 'into-block',
+      blockId: targetBlockId,
+    });
+  }
+
+  const norm = normalizeFlowBlocksOrder(flow);
+  const items = buildTimelineItems(norm);
+  const selectedSet = new Set(stepIds);
+  const nextItems: TimelineItem[] = [];
+
+  for (const it of items) {
+    if (it.kind === 'step') {
+      nextItems.push(it);
+      continue;
+    }
+
+    const firstKeptIdx = it.steps.findIndex((s) => !selectedSet.has(s.step.id));
+    if (firstKeptIdx === -1) {
+      // All steps in this block are being ungrouped
+      nextItems.push({ kind: 'block', block: { ...it.block }, steps: [] });
+      for (const s of it.steps) {
+        nextItems.push({
+          kind: 'step',
+          step: { ...s.step, blockId: undefined },
+          idx: -1,
+        });
+      }
+      continue;
+    }
+
+    const leadingUngrouped: ProcessStep[] = [];
+    const trailingUngrouped: ProcessStep[] = [];
+    const kept: { step: ProcessStep; idx: number }[] = [];
+
+    it.steps.forEach((s, idx) => {
+      if (selectedSet.has(s.step.id)) {
+        if (idx < firstKeptIdx) {
+          leadingUngrouped.push(s.step);
+        } else {
+          trailingUngrouped.push(s.step);
+        }
+      } else {
+        kept.push(s);
+      }
+    });
+
+    for (const s of leadingUngrouped) {
+      nextItems.push({
+        kind: 'step',
+        step: { ...s, blockId: undefined },
+        idx: -1,
+      });
+    }
+    nextItems.push({
+      kind: 'block',
+      block: { ...it.block },
+      steps: kept,
+    });
+    for (const s of trailingUngrouped) {
+      nextItems.push({
+        kind: 'step',
+        step: { ...s, blockId: undefined },
+        idx: -1,
+      });
+    }
+  }
+
+  return rebuildFlowFromTimelineItems(norm, nextItems);
+}
+
+/**
+ * Deletes multiple steps from the timeline while preserving empty block positions
+ * and clearing stale mask assignments.
+ */
+export function deleteStepsFromTimeline(
+  flow: ProcessFlow,
+  stepIds: string[]
+): ProcessFlow {
+  if (stepIds.length === 0) return flow;
+  const norm = normalizeFlowBlocksOrder(flow);
+  const items = buildTimelineItems(norm);
+  const delSet = new Set(stepIds);
+
+  const nextItems: TimelineItem[] = [];
+  for (const it of items) {
+    if (it.kind === 'step') {
+      if (!delSet.has(it.step.id)) {
+        nextItems.push(it);
+      }
+    } else {
+      nextItems.push({
+        kind: 'block',
+        block: { ...it.block },
+        steps: it.steps.filter((s) => !delSet.has(s.step.id)),
+      });
+    }
+  }
+
+  const rebuilt = rebuildFlowFromTimelineItems(norm, nextItems);
+  const updatedMasks = rebuilt.masks
+    ? rebuilt.masks.map((m) =>
+        m.assignedStepId && delSet.has(m.assignedStepId)
+          ? { ...m, assignedStepId: undefined }
+          : m
+      )
+    : rebuilt.masks;
+
+  return {
+    ...rebuilt,
+    masks: updatedMasks,
+  };
+}
+
+/**
  * Moves a single step up or down:
  * - If first in a block and moved up -> removed from block and placed just in front of it.
  * - If last in a block and moved down -> removed from block and placed just after it.

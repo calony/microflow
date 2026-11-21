@@ -197,10 +197,10 @@ function applyStep(
 
     case 'deposition': {
       if (side === 'front' || side === 'both') {
-        applyDepositionSide(columns, step, materials, totalWidth, 'front');
+        applyDepositionSide(columns, step, materials, totalWidth, 'front', scallopWalls);
       }
       if (side === 'back' || side === 'both') {
-        applyDepositionSide(columns, step, materials, totalWidth, 'back');
+        applyDepositionSide(columns, step, materials, totalWidth, 'back', scallopWalls);
       }
       break;
     }
@@ -277,7 +277,8 @@ function applyDepositionSide(
   step: ProcessStep,
   materials: Material[],
   totalWidth: number,
-  targetSide: 'front' | 'back'
+  targetSide: 'front' | 'back',
+  scallopWalls: ScallopWall[] = []
 ): void {
   const cfg = step.deposition;
   const thickness = cfg?.thickness ?? step.thickness ?? 200;
@@ -292,17 +293,22 @@ function applyDepositionSide(
   const seedScope = cfg?.platingSeedScope ?? 'conductive';
   const matCategoryById = new Map(materials.map((m) => [m.id, m.category]));
 
-  const isSeedColumn = (col: ColumnProfile): boolean => {
-    if (col.segments.length === 0) return false;
+  const isSeedMaterialId = (materialId: string): boolean => {
     if (!selectivePlating) return true;
-    const exposedSeg =
-      targetSide === 'front' ? col.segments[col.segments.length - 1] : col.segments[0];
-    const cat = matCategoryById.get(exposedSeg.materialId);
+    const cat = matCategoryById.get(materialId);
     if (!cat) return false;
     if (seedScope === 'metal-only') {
       return cat === 'metal';
     }
     return cat === 'metal' || cat === 'semiconductor' || cat === 'substrate';
+  };
+
+  const isSeedColumn = (col: ColumnProfile): boolean => {
+    if (col.segments.length === 0) return false;
+    if (!selectivePlating) return true;
+    const exposedSeg =
+      targetSide === 'front' ? col.segments[col.segments.length - 1] : col.segments[0];
+    return isSeedMaterialId(exposedSeg.materialId);
   };
 
   if (targetSide === 'front') {
@@ -501,92 +507,17 @@ function applyDepositionSide(
       return;
     }
 
-    const stepCoverage =
-      depType === 'semi-conformal'
-        ? Math.max(0, Math.min(1, (cfg?.stepCoverage ?? 60) / 100))
-        : 1.0;
-    const cornerBoostEnabled =
-      Boolean(cfg?.convexCornerEffect) &&
-      (depType === 'conformal' || depType === 'semi-conformal');
-    const cornerBoostStrength = Math.max(0.05, cfg?.convexCornerStrength ?? 0.6);
-    const cornerFactors = cornerBoostEnabled
-      ? computeConvexCornerFactors(columns, totalWidth, 'front', thickness)
-      : null;
-
-    const dx = totalWidth / Math.max(1, columns.length);
-    const baseTops = new Float64Array(columns.length);
-    const newTops = new Float64Array(columns.length);
-
-    const isSeed = columns.map((col) => isSeedColumn(col));
-    for (let i = 0; i < columns.length; i++) {
-      const col = columns[i];
-      if (col.segments.length === 0) continue;
-      const topY = getTopY(col);
-      baseTops[i] = topY;
-
-      if (!isSeed[i]) {
-        newTops[i] = topY;
-        continue;
-      }
-
-      const cFactor = cornerFactors ? cornerFactors[i] : 0;
-      const verticalThick = thickness * (1 + cornerBoostStrength * cFactor);
-      newTops[i] = topY + verticalThick;
-    }
-
-    // 2D ellipsoidal lateral sidewall coverage:
-    // Top surface stays at 100% vertical thickness; sidewall step coverage scales ONLY lateral thickness (Tx).
-    if (stepCoverage > 0) {
-      for (let i = 0; i < columns.length; i++) {
-        if (columns[i].segments.length === 0 || !isSeed[i]) continue;
-        const cFactor = cornerFactors ? cornerFactors[i] : 0;
-        const tz = thickness * (1 + cornerBoostStrength * cFactor);
-        const tx = tz * stepCoverage;
-        if (tx <= 0) continue;
-
-        const colRadius = Math.ceil(tx / dx + 0.5);
-        const startJ = Math.max(0, i - colRadius);
-        const endJ = Math.min(columns.length - 1, i + colRadius);
-
-        for (let j = startJ; j <= endJ; j++) {
-          if (j === i || columns[j].segments.length === 0 || !isSeed[j]) continue;
-          // Only dilate laterally across step sidewalls where neighbor surface is lower
-          if (baseTops[j] >= baseTops[i]) continue;
-
-          const distX = (Math.abs(j - i) - 0.5) * dx;
-          let candidateTop: number;
-          if (distX > tx) {
-            // Keep sub-column sidewall film continuous down vertical steps when tx < 0.5 * dx
-            if (Math.abs(j - i) === 1 && baseTops[i] - baseTops[j] > 1) {
-              candidateTop = baseTops[i] + Math.min(tz * 0.15, tx * 0.5);
-            } else {
-              continue;
-            }
-          } else {
-            const normX = Math.max(0, distX / tx);
-            candidateTop =
-              baseTops[i] + tz * Math.sqrt(Math.max(0, 1 - normX * normX));
-          }
-          if (candidateTop > newTops[j]) {
-            newTops[j] = candidateTop;
-          }
-        }
-      }
-    }
-
-    for (let i = 0; i < columns.length; i++) {
-      const col = columns[i];
-      if (col.segments.length === 0) continue;
-      if (newTops[i] > baseTops[i]) {
-        col.segments.push({
-          yBottom: baseTops[i],
-          yTop: newTops[i],
-          materialId: matId,
-          stepId: step.id,
-          side: 'front',
-        });
-      }
-    }
+    applyConformalOrSemiConformalDeposition(
+      columns,
+      step,
+      totalWidth,
+      'front',
+      thickness,
+      matId,
+      depType,
+      isSeedMaterialId,
+      scallopWalls
+    );
     return;
   }
 
@@ -783,86 +714,865 @@ function applyDepositionSide(
     return;
   }
 
-  const stepCoverage =
-    depType === 'semi-conformal'
-      ? Math.max(0, Math.min(1, (cfg?.stepCoverage ?? 60) / 100))
-      : 1.0;
-  const cornerBoostEnabled =
-    Boolean(cfg?.convexCornerEffect) &&
-    (depType === 'conformal' || depType === 'semi-conformal');
-  const cornerBoostStrength = Math.max(0.05, cfg?.convexCornerStrength ?? 0.6);
-  const cornerFactors = cornerBoostEnabled
-    ? computeConvexCornerFactors(columns, totalWidth, 'back', thickness)
-    : null;
+  applyConformalOrSemiConformalDeposition(
+    columns,
+    step,
+    totalWidth,
+    'back',
+    thickness,
+    matId,
+    depType,
+    isSeedMaterialId,
+    scallopWalls
+  );
+}
 
-  const dx = totalWidth / Math.max(1, columns.length);
-  const baseBottoms = new Float64Array(columns.length);
-  const newBottoms = new Float64Array(columns.length);
+type VoidSpan = [number, number];
 
-  const isSeedBack = columns.map((col) => isSeedColumn(col));
-  for (let i = 0; i < columns.length; i++) {
-    const col = columns[i];
-    if (col.segments.length === 0) continue;
-    const bottomY = getBottomY(col);
-    baseBottoms[i] = bottomY;
-
-    if (!isSeedBack[i]) {
-      newBottoms[i] = bottomY;
-      continue;
+function intersectVoidSpans(a: VoidSpan[], b: VoidSpan[]): VoidSpan[] {
+  const res: VoidSpan[] = [];
+  let ia = 0;
+  let ib = 0;
+  while (ia < a.length && ib < b.length) {
+    const lo = Math.max(a[ia][0], b[ib][0]);
+    const hi = Math.min(a[ia][1], b[ib][1]);
+    if (hi - lo > 0.25) {
+      res.push([lo, hi]);
     }
+    if (a[ia][1] < b[ib][1]) {
+      ia++;
+    } else {
+      ib++;
+    }
+  }
+  return res;
+}
 
-    const cFactor = cornerFactors ? cornerFactors[i] : 0;
-    const verticalThick = thickness * (1 + cornerBoostStrength * cFactor);
-    newBottoms[i] = bottomY - verticalThick;
+function mergeVoidSpans(spans: VoidSpan[]): VoidSpan[] {
+  if (spans.length === 0) return [];
+  const sorted = [...spans].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: VoidSpan[] = [[sorted[0][0], sorted[0][1]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const last = merged[merged.length - 1];
+    if (cur[0] <= last[1] + 0.25) {
+      if (cur[1] > last[1]) last[1] = cur[1];
+    } else {
+      merged.push([cur[0], cur[1]]);
+    }
+  }
+  return merged;
+}
+
+function clipSpanToIntervals(
+  bot: number,
+  top: number,
+  clipList: VoidSpan[],
+  out: VoidSpan[]
+): void {
+  for (let c = 0; c < clipList.length; c++) {
+    const lo = Math.max(bot, clipList[c][0]);
+    const hi = Math.min(top, clipList[c][1]);
+    if (hi - lo > 0.25) {
+      out.push([lo, hi]);
+    }
+  }
+}
+
+function extractOpenVoidsFromSolids(
+  solids: VoidSpan[][],
+  targetSide: 'front' | 'back',
+  globalMinY: number,
+  globalMaxY: number
+): VoidSpan[][] {
+  const n = solids.length;
+  const rawVoids: VoidSpan[][] = new Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const segs = solids[i];
+    const voids: VoidSpan[] = [];
+    if (segs.length === 0) {
+      if (targetSide === 'front') {
+        voids.push([globalMinY, Infinity]);
+      } else {
+        voids.push([-Infinity, globalMaxY]);
+      }
+    } else {
+      if (targetSide === 'back') {
+        voids.push([-Infinity, segs[0][0]]);
+      }
+      for (let m = 0; m < segs.length - 1; m++) {
+        const gapBot = segs[m][1];
+        const gapTop = segs[m + 1][0];
+        if (gapTop - gapBot > 0.25) {
+          voids.push([gapBot, gapTop]);
+        }
+      }
+      if (targetSide === 'front') {
+        voids.push([segs[segs.length - 1][1], Infinity]);
+      }
+    }
+    rawVoids[i] = voids;
   }
 
-  if (stepCoverage > 0) {
-    for (let i = 0; i < columns.length; i++) {
-      if (columns[i].segments.length === 0 || !isSeedBack[i]) continue;
-      const cFactor = cornerFactors ? cornerFactors[i] : 0;
-      const tz = thickness * (1 + cornerBoostStrength * cFactor);
-      const tx = tz * stepCoverage;
-      if (tx <= 0) continue;
+  const openFlags: Uint8Array[] = rawVoids.map((v) => new Uint8Array(v.length));
+  const queueC: number[] = [];
+  const queueV: number[] = [];
 
-      const colRadius = Math.ceil(tx / dx + 0.5);
-      const startJ = Math.max(0, i - colRadius);
-      const endJ = Math.min(columns.length - 1, i + colRadius);
+  for (let i = 0; i < n; i++) {
+    const voids = rawVoids[i];
+    if (voids.length === 0) continue;
+    if (targetSide === 'front') {
+      const lastIdx = voids.length - 1;
+      if (voids[lastIdx][1] === Infinity) {
+        openFlags[i][lastIdx] = 1;
+        queueC.push(i);
+        queueV.push(lastIdx);
+      }
+    } else {
+      if (voids[0][0] === -Infinity) {
+        openFlags[i][0] = 1;
+        queueC.push(i);
+        queueV.push(0);
+      }
+    }
+  }
 
-      for (let j = startJ; j <= endJ; j++) {
-        if (j === i || columns[j].segments.length === 0 || !isSeedBack[j]) continue;
-        if (baseBottoms[j] <= baseBottoms[i]) continue;
+  let head = 0;
+  while (head < queueC.length) {
+    const c = queueC[head];
+    const vi = queueV[head];
+    head++;
+    const [a, b] = rawVoids[c][vi];
 
-        const distX = (Math.abs(j - i) - 0.5) * dx;
-        let candidateBottom: number;
-        if (distX > tx) {
-          if (Math.abs(j - i) === 1 && baseBottoms[j] - baseBottoms[i] > 1) {
-            candidateBottom = baseBottoms[i] - Math.min(tz * 0.15, tx * 0.5);
-          } else {
-            continue;
-          }
-        } else {
-          const normX = Math.max(0, distX / tx);
-          candidateBottom =
-            baseBottoms[i] - tz * Math.sqrt(Math.max(0, 1 - normX * normX));
-        }
-        if (candidateBottom < newBottoms[j]) {
-          newBottoms[j] = candidateBottom;
+    for (const nc of [c - 1, c + 1]) {
+      if (nc < 0 || nc >= n) continue;
+      const nVoids = rawVoids[nc];
+      const nFlags = openFlags[nc];
+      for (let nvi = 0; nvi < nVoids.length; nvi++) {
+        if (nFlags[nvi]) continue;
+        const [na, nb] = nVoids[nvi];
+        if (Math.min(b, nb) > Math.max(a, na) + 0.25) {
+          nFlags[nvi] = 1;
+          queueC.push(nc);
+          queueV.push(nvi);
         }
       }
     }
   }
 
-  for (let i = 0; i < columns.length; i++) {
-    const col = columns[i];
-    if (col.segments.length === 0) continue;
-    if (newBottoms[i] < baseBottoms[i]) {
-      col.segments.unshift({
-        yBottom: newBottoms[i],
-        yTop: baseBottoms[i],
-        materialId: matId,
-        stepId: step.id,
-        side: 'back',
+  return rawVoids.map((v, i) => v.filter((_, vi) => openFlags[i][vi] === 1));
+}
+
+function voidContainsY(voids: VoidSpan[], y: number, tol: number = 1): boolean {
+  for (let i = 0; i < voids.length; i++) {
+    if (voids[i][0] <= y + tol && voids[i][1] >= y - tol) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findContainingVoid(
+  voids: VoidSpan[],
+  y: number,
+  tol: number = 1
+): VoidSpan | null {
+  for (let i = 0; i < voids.length; i++) {
+    if (voids[i][0] <= y + tol && voids[i][1] >= y - tol) {
+      return voids[i];
+    }
+  }
+  return null;
+}
+
+/**
+ * 2D void-aware progressive Huygens conformal / semi-conformal deposition solver.
+ * Handles overhangs, wet/DRIE undercuts, retrograde lift-off profiles,
+ * interior ceilings & recessed sidewalls, progressive pinch-off freeze (zero deposition
+ * inside sealed cavities once pinched), and Huygens-attenuated scalloped / re-entrant walls.
+ */
+function applyConformalOrSemiConformalDeposition(
+  columns: ColumnProfile[],
+  step: ProcessStep,
+  totalWidth: number,
+  targetSide: 'front' | 'back',
+  thickness: number,
+  matId: string,
+  depType: string,
+  isSeedMaterialId: (materialId: string) => boolean,
+  scallopWalls: ScallopWall[] = []
+): void {
+  const n = columns.length;
+  if (n === 0 || thickness <= 0) return;
+
+  const cfg = step.deposition;
+  const isConformal = depType !== 'semi-conformal';
+  const stepCoverage = isConformal
+    ? 1.0
+    : Math.max(0, Math.min(1, (cfg?.stepCoverage ?? 60) / 100));
+  const cornerBoostEnabled = Boolean(cfg?.convexCornerEffect);
+  const cornerBoostStrength = Math.max(0.05, cfg?.convexCornerStrength ?? 0.6);
+  const cornerFactors = cornerBoostEnabled
+    ? computeConvexCornerFactors(columns, totalWidth, targetSide, thickness)
+    : null;
+  const selectivePlating = Boolean(
+    cfg?.platingSelective &&
+      (cfg?.method === 'Electroplating' || cfg?.method === 'Electroless Plating')
+  );
+
+  // 1. Sort segments per column bottom-to-top and determine substrate Y bounds
+  let globalMinY = Infinity;
+  let globalMaxY = -Infinity;
+  const origSortedSegs: MaterialSegment[][] = new Array(n);
+  const origSolids: VoidSpan[][] = new Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const segs = [...columns[i].segments].sort((a, b) => a.yBottom - b.yBottom);
+    origSortedSegs[i] = segs;
+    const solidSpans: VoidSpan[] = [];
+    for (const s of segs) {
+      if (s.yBottom < globalMinY) globalMinY = s.yBottom;
+      if (s.yTop > globalMaxY) globalMaxY = s.yTop;
+      if (s.yTop - s.yBottom > 0.1) {
+        solidSpans.push([s.yBottom, s.yTop]);
+      }
+    }
+    origSolids[i] = mergeVoidSpans(solidSpans);
+  }
+  if (globalMinY === Infinity) return;
+
+  // 2. Chamber-reachable open voids at t = 0
+  const origOpenVoids = extractOpenVoidsFromSolids(
+    origSolids,
+    targetSide,
+    globalMinY,
+    globalMaxY
+  );
+  const currentSolids: VoidSpan[][] = origSolids.map((list) =>
+    list.map(([a, b]) => [a, b] as VoidSpan)
+  );
+
+  const dx = totalWidth / Math.max(1, n);
+
+  // 3. Identify currently exposed active ScallopWalls to track pinch-off & propagate inner walls
+  interface ActiveWallTracker {
+    w: ScallopWall;
+    dir: 1 | -1;
+    sampleYs: number[];
+    openTau: Float64Array;
+  }
+  const activeWalls: ActiveWallTracker[] = [];
+  if (scallopWalls && scallopWalls.length > 0 && stepCoverage > 0) {
+    for (const w of scallopWalls) {
+      if (w.targetSide !== targetSide) continue;
+      if (
+        !w.isReentrant &&
+        w.scallopDepth <= 0.5 &&
+        Math.abs(w.xTop - w.xBot) <= 0.5
+      ) {
+        continue;
+      }
+      const wallHeight = Math.abs(w.yBot - w.yTop);
+      if (wallHeight <= 5) continue;
+
+      const dir: 1 | -1 = w.wallSide === 'left' ? 1 : -1;
+      const yMid = 0.5 * (w.yTop + w.yBot);
+      const xBaseMid = evalWallXAtY(w, yMid);
+      const wMinY = Math.min(w.yTop, w.yBot);
+      const wMaxY = Math.max(w.yTop, w.yBot);
+
+      // Skip walls already covered by a later wall further into the trench
+      const shadowed = scallopWalls.some((w2) => {
+        if (w2 === w || w2.targetSide !== w.targetSide || w2.wallSide !== w.wallSide) {
+          return false;
+        }
+        const ov = Math.min(wMaxY, Math.max(w2.yTop, w2.yBot)) -
+          Math.max(wMinY, Math.min(w2.yTop, w2.yBot));
+        if (ov <= wallHeight * 0.4) return false;
+        return dir * (evalWallXAtY(w2, yMid) - xBaseMid) > 0.5;
       });
+      if (shadowed) continue;
+
+      // Selective plating check against underlying wall material
+      if (selectivePlating) {
+        const cSolid = Math.max(
+          0,
+          Math.min(n - 1, Math.floor((xBaseMid - dir * dx * 0.45) / dx))
+        );
+        const seedSeg = origSortedSegs[cSolid].find(
+          (s) => s.yBottom <= yMid + 1 && s.yTop >= yMid - 1
+        );
+        if (!seedSeg || !isSeedMaterialId(seedSeg.materialId)) continue;
+      }
+
+      const cProbeA = Math.max(
+        0,
+        Math.min(n - 1, Math.floor((xBaseMid + dir * dx * 0.55) / dx))
+      );
+      const cProbeB = Math.max(
+        0,
+        Math.min(n - 1, Math.floor((xBaseMid + dir * dx * 1.1) / dx))
+      );
+      const isExposed =
+        voidContainsY(origOpenVoids[cProbeA], yMid) ||
+        voidContainsY(origOpenVoids[cProbeB], yMid);
+      if (!isExposed) continue;
+
+      const numSamples = 9;
+      const sampleYs: number[] = [];
+      for (let s = 0; s < numSamples; s++) {
+        const frac = (s + 0.5) / numSamples;
+        sampleYs.push(w.yTop + frac * (w.yBot - w.yTop));
+      }
+      activeWalls.push({
+        w,
+        dir,
+        sampleYs,
+        openTau: new Float64Array(numSamples),
+      });
+    }
+  }
+
+  // 4. Progressive checkpointed Huygens dilation + BFS chamber reachability
+  // Once a throat/mouth pinches off at t_pinch < thickness, cavities behind it drop
+  // out of reachableVoids and receive zero further growth.
+  const stepBudget = Math.max(4, Math.min(12, dx * 0.4));
+  const numSteps =
+    thickness <= 1
+      ? 1
+      : Math.max(4, Math.min(35, Math.ceil(thickness / stepBudget)));
+
+  for (let m = 1; m <= numSteps; m++) {
+    const prevTau = (thickness * (m - 1)) / numSteps;
+    const tau = (thickness * m) / numSteps;
+    const scale = tau / thickness;
+    const reachableVoids =
+      m === 1
+        ? origOpenVoids
+        : extractOpenVoidsFromSolids(
+            currentSolids,
+            targetSide,
+            globalMinY,
+            globalMaxY
+          );
+
+    // Track per-wall sample openness before growing increment [prevTau -> tau]
+    for (const aw of activeWalls) {
+      const probeOffset = Math.max(dx * 0.55, prevTau * stepCoverage + dx * 0.35);
+      for (let s = 0; s < aw.sampleYs.length; s++) {
+        const ys = aw.sampleYs[s];
+        const xBase = evalWallXAtY(aw.w, ys);
+        const cProbe1 = Math.max(
+          0,
+          Math.min(n - 1, Math.floor((xBase + aw.dir * probeOffset) / dx))
+        );
+        const cProbe2 = Math.max(
+          0,
+          Math.min(n - 1, Math.floor((xBase + aw.dir * (probeOffset + dx * 0.6)) / dx))
+        );
+        if (
+          voidContainsY(reachableVoids[cProbe1], ys) ||
+          voidContainsY(reachableVoids[cProbe2], ys)
+        ) {
+          aw.openTau[s] = tau;
+        }
+      }
+    }
+
+    const stepGrown: VoidSpan[][] = Array.from({ length: n }, () => []);
+
+    // 4a. Direct horizontal face growth (floors & undercut ceilings) from origSolids
+    for (let i = 0; i < n; i++) {
+      const segs = origSortedSegs[i];
+      const voids0 = origOpenVoids[i];
+      const voidsReach = reachableVoids[i];
+      if (voids0.length === 0 || voidsReach.length === 0 || segs.length === 0) {
+        continue;
+      }
+
+      const cFactor = cornerFactors ? cornerFactors[i] : 0;
+      const outerThick = thickness * (1 + cornerBoostStrength * cFactor);
+
+      for (let vi = 0; vi < voids0.length; vi++) {
+        const [vBot, vTop] = voids0[vi];
+
+        if (vBot > -Infinity) {
+          const floorSeg = segs.find((s) => Math.abs(s.yTop - vBot) < 0.5);
+          if (floorSeg && isSeedMaterialId(floorSeg.materialId)) {
+            const isOuterSurface = targetSide === 'front' && vTop === Infinity;
+            const tFloor =
+              scale *
+              (isOuterSurface
+                ? outerThick
+                : thickness * (isConformal ? 1.0 : stepCoverage));
+            if (tFloor > 0.25) {
+              clipSpanToIntervals(
+                vBot,
+                Math.min(vTop, vBot + tFloor),
+                voidsReach,
+                stepGrown[i]
+              );
+            }
+          }
+        }
+
+        if (vTop < Infinity) {
+          const ceilSeg = segs.find((s) => Math.abs(s.yBottom - vTop) < 0.5);
+          if (ceilSeg && isSeedMaterialId(ceilSeg.materialId)) {
+            const isOuterSurface = targetSide === 'back' && vBot === -Infinity;
+            const tCeil =
+              scale *
+              (isOuterSurface
+                ? outerThick
+                : thickness * (isConformal ? 1.0 : stepCoverage * 0.7));
+            if (tCeil > 0.25) {
+              clipSpanToIntervals(
+                Math.max(vBot, vTop - tCeil),
+                vTop,
+                voidsReach,
+                stepGrown[i]
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // 4b. 2D Corridor-Aware Huygens Ellipsoidal Sidewall & Corner Growth
+    if (stepCoverage > 0) {
+      for (let i = 0; i < n; i++) {
+        const segs = origSortedSegs[i];
+        if (segs.length === 0) continue;
+
+        const voidsI = origOpenVoids[i];
+        const cFactor = cornerFactors ? cornerFactors[i] : 0;
+        const outerThick = thickness * (1 + cornerBoostStrength * cFactor);
+
+        for (const seg of segs) {
+          if (!isSeedMaterialId(seg.materialId)) continue;
+          const sBot = seg.yBottom;
+          const sTop = seg.yTop;
+          if (sTop - sBot <= 0.25) continue;
+
+          const topVoid = voidsI.find((v) => Math.abs(v[0] - sTop) < 0.5);
+          const botVoid = voidsI.find((v) => Math.abs(v[1] - sBot) < 0.5);
+
+          const tzTop = topVoid
+            ? scale *
+              (topVoid[1] === Infinity && targetSide === 'front'
+                ? outerThick
+                : thickness * (isConformal ? 1.0 : stepCoverage))
+            : 0;
+          const tzBot = botVoid
+            ? scale *
+              (botVoid[0] === -Infinity && targetSide === 'back'
+                ? outerThick
+                : thickness * (isConformal ? 1.0 : stepCoverage * 0.7))
+            : 0;
+
+          const isOuterSegment =
+            (targetSide === 'front' && topVoid?.[1] === Infinity) ||
+            (targetSide === 'back' && botVoid?.[0] === -Infinity);
+          const tx =
+            scale * (isOuterSegment ? outerThick : thickness) * stepCoverage;
+          if (tx <= 0.25) continue;
+
+          const colRadius = Math.max(1, Math.ceil(tx / dx + 0.5));
+          const initCorridor: VoidSpan[] = [
+            [botVoid ? botVoid[0] : sBot, topVoid ? topVoid[1] : sTop],
+          ];
+
+          for (const dir of [-1, 1] as const) {
+            const adjIdx = i + dir;
+            if (adjIdx < 0 || adjIdx >= n) continue;
+
+            const wallSpans = intersectVoidSpans(
+              [[sBot, sTop]],
+              origOpenVoids[adjIdx]
+            );
+            const hasExposedWall = wallSpans.length > 0;
+
+            let corridor: VoidSpan[] = initCorridor;
+
+            for (let stepCols = 1; stepCols <= colRadius; stepCols++) {
+              const k = i + dir * stepCols;
+              if (k < 0 || k >= n) break;
+
+              corridor = intersectVoidSpans(corridor, origOpenVoids[k]);
+              if (corridor.length === 0) break;
+
+              const emitIntervals =
+                reachableVoids[k].length > 0
+                  ? intersectVoidSpans(corridor, reachableVoids[k])
+                  : [];
+              if (emitIntervals.length === 0) continue;
+
+              const distX = (stepCols - 0.5) * dx;
+              const withinRx = distX <= tx;
+              const dropFactor = withinRx
+                ? Math.sqrt(Math.max(0, 1 - (distX / tx) * (distX / tx)))
+                : 0;
+
+              if (hasExposedWall) {
+                for (const [wBot, wTop] of wallSpans) {
+                  const topCornerOpen =
+                    Boolean(topVoid) && Math.abs(wTop - sTop) < 0.5;
+                  const botCornerOpen =
+                    Boolean(botVoid) && Math.abs(wBot - sBot) < 0.5;
+
+                  if (withinRx) {
+                    const extTop = topCornerOpen ? tzTop * dropFactor : 0;
+                    const extBot = botCornerOpen ? tzBot * dropFactor : 0;
+                    clipSpanToIntervals(
+                      wBot - extBot,
+                      wTop + extTop,
+                      emitIntervals,
+                      stepGrown[k]
+                    );
+                  } else if (
+                    m === numSteps &&
+                    stepCols === 1 &&
+                    wTop - wBot > 1 &&
+                    tx >= dx * 0.08
+                  ) {
+                    // Sub-column continuous sidewall strip for very thin (< 0.5*dx) conformal liners,
+                    // applied only at the final step when adjacent column remains open so thin films
+                    // never prematurely pinch narrow slots.
+                    const kNext = k + dir;
+                    const hasRoomToStayOpen =
+                      kNext >= 0 &&
+                      kNext < n &&
+                      intersectVoidSpans(reachableVoids[kNext], emitIntervals).length > 0;
+                    if (hasRoomToStayOpen) {
+                      const bevelTop = topCornerOpen
+                        ? Math.min(tzTop * 0.15, tx * 0.5)
+                        : 0;
+                      const bevelBot = botCornerOpen
+                        ? Math.min(tzBot * 0.15, tx * 0.5)
+                        : 0;
+                      clipSpanToIntervals(
+                        wBot - bevelBot,
+                        wTop + bevelTop,
+                        emitIntervals,
+                        stepGrown[k]
+                      );
+                    }
+                  }
+                }
+              } else if (withinRx) {
+                if (topVoid && tzTop > 0.25) {
+                  const segTopAtK = origSortedSegs[k].find(
+                    (s) => Math.abs(s.yTop - sTop) < 0.5
+                  );
+                  const allowTopCorner =
+                    !selectivePlating ||
+                    !segTopAtK ||
+                    isSeedMaterialId(segTopAtK.materialId);
+                  if (allowTopCorner) {
+                    clipSpanToIntervals(
+                      sTop,
+                      sTop + tzTop * dropFactor,
+                      emitIntervals,
+                      stepGrown[k]
+                    );
+                  }
+                }
+                if (botVoid && tzBot > 0.25) {
+                  const segBotAtK = origSortedSegs[k].find(
+                    (s) => Math.abs(s.yBottom - sBot) < 0.5
+                  );
+                  const allowBotCorner =
+                    !selectivePlating ||
+                    !segBotAtK ||
+                    isSeedMaterialId(segBotAtK.materialId);
+                  if (allowBotCorner) {
+                    clipSpanToIntervals(
+                      sBot - tzBot * dropFactor,
+                      sBot,
+                      emitIntervals,
+                      stepGrown[k]
+                    );
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      if (stepGrown[i].length > 0) {
+        currentSolids[i] = mergeVoidSpans([...currentSolids[i], ...stepGrown[i]]);
+      }
+    }
+  }
+
+  // Heal isolated 1-column sub-grid (<= 1.1*dx) corner pinholes enclosed on all sides
+  // by newly deposited film (discretization artifact at acute concave corners).
+  for (let i = 1; i < n - 1; i++) {
+    const solids = currentSolids[i];
+    if (solids.length < 2) continue;
+    const bridges: VoidSpan[] = [];
+    for (let s = 0; s < solids.length - 1; s++) {
+      const gBot = solids[s][1];
+      const gTop = solids[s + 1][0];
+      if (gTop - gBot > dx * 1.1 || gTop - gBot <= 0.1) continue;
+      // Only bridge gaps inside originally open voids whose flanking columns are now completely solid
+      const wasOpen = origOpenVoids[i].some(([ob, ot]) => ob <= gBot + 0.5 && ot >= gTop - 0.5);
+      if (!wasOpen) continue;
+      const leftSolid = currentSolids[i - 1].some(([sb, st]) => sb <= gBot + 0.5 && st >= gTop - 0.5);
+      const rightSolid = currentSolids[i + 1].some(([sb, st]) => sb <= gBot + 0.5 && st >= gTop - 0.5);
+      if (leftSolid && rightSolid) {
+        bridges.push([gBot, gTop]);
+      }
+    }
+    if (bridges.length > 0) {
+      currentSolids[i] = mergeVoidSpans([...solids, ...bridges]);
+    }
+  }
+
+  // 5. Commit deposited film intervals (currentSolids minus origSolids) into columns
+  for (let i = 0; i < n; i++) {
+    const solids0 = origSolids[i];
+    const finalSolids = currentSolids[i];
+    const col = columns[i];
+
+    let changed = false;
+    for (let [gBot, gTop] of finalSolids) {
+      for (const [sBot, sTop] of solids0) {
+        if (sTop <= gBot + 0.1) continue;
+        if (sBot >= gTop - 0.1) break;
+        if (sBot > gBot + 0.25) {
+          col.segments.push({
+            yBottom: gBot,
+            yTop: sBot,
+            materialId: matId,
+            stepId: step.id,
+            side: targetSide,
+          });
+          changed = true;
+        }
+        gBot = Math.max(gBot, sTop);
+        if (gBot >= gTop - 0.25) break;
+      }
+      if (gTop - gBot > 0.25) {
+        col.segments.push({
+          yBottom: gBot,
+          yTop: gTop,
+          materialId: matId,
+          stepId: step.id,
+          side: targetSide,
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      col.segments.sort((a, b) => a.yBottom - b.yBottom);
+    }
+  }
+
+  // 6. Propagate inner Huygens-attenuated & pinch-aware ScallopWalls for remaining open walls
+  if (activeWalls.length > 0 && scallopWalls) {
+    const finalOpenVoids = extractOpenVoidsFromSolids(
+      currentSolids,
+      targetSide,
+      globalMinY,
+      globalMaxY
+    );
+    const rawFinalVoids = (() => {
+      // Also capture surviving keyhole pockets that were partially open before pinch-off
+      const allVoids: VoidSpan[][] = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const segs = currentSolids[i];
+        const v: VoidSpan[] = [];
+        if (segs.length === 0) {
+          v.push(
+            targetSide === 'front' ? [globalMinY, Infinity] : [-Infinity, globalMaxY]
+          );
+        } else {
+          if (targetSide === 'back') v.push([-Infinity, segs[0][0]]);
+          for (let m = 0; m < segs.length - 1; m++) {
+            if (segs[m + 1][0] - segs[m][1] > 1) {
+              v.push([segs[m][1], segs[m + 1][0]]);
+            }
+          }
+          if (targetSide === 'front') v.push([segs[segs.length - 1][1], Infinity]);
+        }
+        allVoids[i] = v;
+      }
+      return allVoids;
+    })();
+
+    const attenuateScallop = (d0: number, pitch: number, t: number): number => {
+      if (d0 <= 0.5) return 0;
+      const halfP = Math.max(2, pitch * 0.5);
+      const R0 = (d0 * d0 + halfP * halfP) / (2 * d0);
+      const R1 = R0 + t;
+      const rad = Math.sqrt(Math.max(0, R1 * R1 - halfP * halfP));
+      return Math.max(0, R1 - rad);
+    };
+
+    for (const aw of activeWalls) {
+      const w = aw.w;
+      const dir = aw.dir;
+      let maxTau = 0;
+      let sumOpenTau = 0;
+      let countOpen = 0;
+      let openMidVoid: VoidSpan | null = null;
+
+      // Scan mid-to-bottom samples to determine surviving trench/keyhole openness
+      for (let s = 0; s < aw.sampleYs.length; s++) {
+        if (aw.openTau[s] > maxTau) maxTau = aw.openTau[s];
+        const ys = aw.sampleYs[s];
+        const xProbe =
+          evalWallXAtY(w, ys) + dir * (aw.openTau[s] * stepCoverage + dx * 0.65);
+        const cProbe = Math.max(0, Math.min(n - 1, Math.floor(xProbe / dx)));
+        const vOpen =
+          findContainingVoid(finalOpenVoids[cProbe], ys, 2) ||
+          findContainingVoid(rawFinalVoids[cProbe], ys, 2);
+        if (vOpen) {
+          sumOpenTau += aw.openTau[s];
+          countOpen++;
+          if (!openMidVoid) openMidVoid = vOpen;
+        }
+      }
+      if (countOpen === 0 || maxTau <= 0.5 || !openMidVoid) continue;
+
+      const effTau = Math.min(thickness, sumOpenTau / countOpen);
+      const tWall = effTau * stepCoverage;
+      if (tWall <= 0.25) continue;
+
+      const dxLine = w.xBot - w.xTop;
+      const dyLine = w.yBot - w.yTop;
+      const segLen = Math.hypot(dxLine, dyLine);
+      if (segLen <= 1) continue;
+      const secAlpha = segLen / Math.max(1, Math.abs(dyLine));
+
+      // Check whether mouth at w.yTop stayed open to ambient or pinched into a keyhole
+      const topProbeX = w.xTop + dir * (thickness * stepCoverage + dx * 0.55);
+      const cTopProbe = Math.max(0, Math.min(n - 1, Math.floor(topProbeX / dx)));
+      const topVoidOpen = findContainingVoid(finalOpenVoids[cTopProbe], w.yTop, 2);
+      const topAmbientConnected =
+        topVoidOpen !== null &&
+        (targetSide === 'front'
+          ? topVoidOpen[1] === Infinity
+          : topVoidOpen[0] === -Infinity);
+
+      let yTopInner: number;
+      let xTopInner: number;
+      let yBotInner: number;
+      let xBotInner: number;
+
+      if (topAmbientConnected) {
+        if (!w.isReentrant && Math.abs(dxLine) > 0.5) {
+          // Positive taper (<90°): Huygens tangent point sits slightly into the top slope
+          const nyMag = (tWall * Math.abs(dxLine)) / segLen;
+          yTopInner =
+            targetSide === 'front' ? w.yTop + nyMag : w.yTop - nyMag;
+          xTopInner = w.xTop + (dir * tWall * Math.abs(dyLine)) / segLen;
+        } else {
+          yTopInner = w.yTop;
+          xTopInner = w.xTop + dir * tWall;
+        }
+      } else {
+        // Mouth pinched off — keyhole roof closes below w.yTop
+        yTopInner =
+          targetSide === 'front'
+            ? Math.min(w.yTop, openMidVoid[1])
+            : Math.max(w.yTop, openMidVoid[0]);
+        xTopInner = evalWallXAtY(w, yTopInner) + dir * tWall * secAlpha;
+      }
+
+      // Compute floor/pocket bottom along openMidVoid
+      const expectedFloorT = effTau * (isConformal ? 1.0 : stepCoverage);
+      const nominalYBot =
+        targetSide === 'front'
+          ? w.yBot + expectedFloorT
+          : w.yBot - expectedFloorT;
+      if (Number.isFinite(openMidVoid[0]) && Number.isFinite(openMidVoid[1])) {
+        yBotInner =
+          targetSide === 'front'
+            ? Math.max(w.yBot, openMidVoid[0])
+            : Math.min(w.yBot, openMidVoid[1]);
+      } else {
+        const floorLim =
+          targetSide === 'front'
+            ? Math.max(w.yBot, openMidVoid[0])
+            : Math.min(w.yBot, openMidVoid[1]);
+        yBotInner = Number.isFinite(floorLim) ? floorLim : nominalYBot;
+      }
+      xBotInner = evalWallXAtY(w, yBotInner) + dir * tWall * secAlpha;
+
+      const innerHeight =
+        targetSide === 'front'
+          ? yTopInner - yBotInner
+          : yBotInner - yTopInner;
+      if (innerHeight <= 10) continue;
+
+      let colTopInner: number;
+      let colBotInner: number;
+      if (w.wallSide === 'left') {
+        colTopInner = Math.max(
+          0,
+          Math.min(n - 1, Math.floor((xTopInner - 1e-6) / dx))
+        );
+        if (w.isReentrant) {
+          colBotInner = Math.max(
+            0,
+            Math.min(colTopInner, Math.floor((xBotInner + 1e-6) / dx))
+          );
+        } else {
+          colBotInner = Math.max(
+            colTopInner + 1,
+            Math.min(n - 1, Math.floor((xBotInner + 1e-6) / dx))
+          );
+        }
+      } else {
+        colTopInner = Math.max(
+          0,
+          Math.min(n - 1, Math.floor((xTopInner + 1e-6) / dx))
+        );
+        if (w.isReentrant) {
+          colBotInner = Math.max(
+            colTopInner,
+            Math.min(n - 1, Math.floor((xBotInner - 1e-6) / dx))
+          );
+        } else {
+          colBotInner = Math.max(
+            0,
+            Math.min(colTopInner - 1, Math.floor((xBotInner - 1e-6) / dx))
+          );
+        }
+      }
+
+      const dTopInner = attenuateScallop(w.scallopDepth, w.scallopPitch, tWall);
+      const dBotInner = attenuateScallop(
+        w.scallopBottomDepth ?? w.scallopDepth,
+        w.scallopPitch,
+        tWall
+      );
+
+      if (dTopInner > 0.5 || w.isReentrant || Math.abs(xTopInner - xBotInner) > 0.5) {
+        scallopWalls.push({
+          stepId: step.id,
+          targetSide,
+          wallSide: w.wallSide,
+          colTop: colTopInner,
+          colBot: colBotInner,
+          xTop: xTopInner,
+          xBot: xBotInner,
+          yTop: yTopInner,
+          yBot: yBotInner,
+          scallopDepth: dTopInner,
+          scallopBottomDepth: dBotInner,
+          scallopPitch: w.scallopPitch,
+          isReentrant: w.isReentrant,
+          isDepositionWall: true,
+        });
+      }
     }
   }
 }
@@ -2438,41 +3148,75 @@ function applyEtchSide(
         }
       }
 
-      // Carve coherent mask-undercut windows into columns[j] beneath overhanging masks
-      if (leftActive && uMaskL > 0) {
+      // Carve coherent mask-undercut & re-entrant wedge windows into columns[j] beneath overhanging masks
+      if (leftActive && (uMaskL > 0 || (isBoschReentrant && xBotL < xTopL - 1e-6))) {
         const spanMinL = Math.min(yTopL, yBotL);
         const spanMaxL = Math.max(yTopL, yBotL);
+        const minEdgeL = Math.min(xTopL, xBotL);
         for (let j = runStart - 1; j >= 0; j--) {
-          if (columns[j].x < xTopL - 1e-6) break;
+          if (columns[j].x < minEdgeL - 1e-6) break;
           if (!isMaskShoulderCol(j) || columns[j].segments.length === 0) break;
-          const cutReach =
-            isBoschPosTaper && columns[j].x < xBotL
-              ? targetSide === 'front'
-                ? yTopL - (columns[j].x - xTopL) * tanPosAngle
-                : yTopL + (columns[j].x - xTopL) * tanPosAngle
-              : yBotL;
-          const ivs = getFastEtchableIntervals(columns[j], spanMinL, spanMaxL);
-          for (const [winBot, winTop] of ivs) {
-            addLateralWindow(j, winBot, winTop, cutReach);
+          if (columns[j].x >= xTopL - 1e-6) {
+            const cutReach =
+              isBoschPosTaper && columns[j].x < xBotL
+                ? targetSide === 'front'
+                  ? yTopL - (columns[j].x - xTopL) * tanPosAngle
+                  : yTopL + (columns[j].x - xTopL) * tanPosAngle
+                : yBotL;
+            const ivs = getFastEtchableIntervals(columns[j], spanMinL, spanMaxL);
+            for (const [winBot, winTop] of ivs) {
+              addLateralWindow(j, winBot, winTop, cutReach);
+            }
+          } else if (isBoschReentrant && xBotL < xTopL - 1e-6) {
+            const frac = (xTopL - columns[j].x) / (xTopL - xBotL);
+            const yWallJ = yTopL + frac * (yBotL - yTopL);
+            if (targetSide === 'front') {
+              const ivs = getFastEtchableIntervals(columns[j], yBotL, yWallJ);
+              for (const [winBot, winTop] of ivs) {
+                addLateralWindow(j, winBot, winTop, winBot);
+              }
+            } else {
+              const ivs = getFastEtchableIntervals(columns[j], yWallJ, yBotL);
+              for (const [winBot, winTop] of ivs) {
+                addLateralWindow(j, winBot, winTop, winTop);
+              }
+            }
           }
         }
       }
 
-      if (rightActive && uMaskR > 0) {
+      if (rightActive && (uMaskR > 0 || (isBoschReentrant && xBotR > xTopR + 1e-6))) {
         const spanMinR = Math.min(yTopR, yBotR);
         const spanMaxR = Math.max(yTopR, yBotR);
+        const maxEdgeR = Math.max(xTopR, xBotR);
         for (let j = runEnd + 1; j < columns.length; j++) {
-          if (columns[j].x > xTopR + 1e-6) break;
+          if (columns[j].x > maxEdgeR + 1e-6) break;
           if (!isMaskShoulderCol(j) || columns[j].segments.length === 0) break;
-          const cutReach =
-            isBoschPosTaper && columns[j].x > xBotR
-              ? targetSide === 'front'
-                ? yTopR - (xTopR - columns[j].x) * tanPosAngle
-                : yTopR + (xTopR - columns[j].x) * tanPosAngle
-              : yBotR;
-          const ivs = getFastEtchableIntervals(columns[j], spanMinR, spanMaxR);
-          for (const [winBot, winTop] of ivs) {
-            addLateralWindow(j, winBot, winTop, cutReach);
+          if (columns[j].x <= xTopR + 1e-6) {
+            const cutReach =
+              isBoschPosTaper && columns[j].x > xBotR
+                ? targetSide === 'front'
+                  ? yTopR - (xTopR - columns[j].x) * tanPosAngle
+                  : yTopR + (xTopR - columns[j].x) * tanPosAngle
+                : yBotR;
+            const ivs = getFastEtchableIntervals(columns[j], spanMinR, spanMaxR);
+            for (const [winBot, winTop] of ivs) {
+              addLateralWindow(j, winBot, winTop, cutReach);
+            }
+          } else if (isBoschReentrant && xBotR > xTopR + 1e-6) {
+            const frac = (columns[j].x - xTopR) / (xBotR - xTopR);
+            const yWallJ = yTopR + frac * (yBotR - yTopR);
+            if (targetSide === 'front') {
+              const ivs = getFastEtchableIntervals(columns[j], yBotR, yWallJ);
+              for (const [winBot, winTop] of ivs) {
+                addLateralWindow(j, winBot, winTop, winBot);
+              }
+            } else {
+              const ivs = getFastEtchableIntervals(columns[j], yWallJ, yBotR);
+              for (const [winBot, winTop] of ivs) {
+                addLateralWindow(j, winBot, winTop, winTop);
+              }
+            }
           }
         }
       }
@@ -3219,6 +3963,53 @@ function applyEtchSide(
             xBot = Math.min((colBot + 1) * dx, xTop + wallHeight / tanPosAngle);
           }
 
+          let wallColTop = colTop;
+          if (isReentrant && Math.abs(xTop - xBot) > 1) {
+            while (wallColTop > 0 && columns[wallColTop].x >= xTop - 1e-6) {
+              wallColTop--;
+            }
+            const minEdge = Math.min(xTop, xBot);
+            const spanMinW = Math.min(yTopEntry, yBotFloor);
+            const spanMaxW = Math.max(yTopEntry, yBotFloor);
+            for (let j = colTop; j >= 0; j--) {
+              if (columns[j].x < minEdge - 1e-6) break;
+              if (columns[j].segments.length === 0 || etchedDelta[j] > 5) break;
+              let cutBot: number;
+              let cutTop: number;
+              if (columns[j].x >= xTop - 1e-6) {
+                cutBot = spanMinW;
+                cutTop = spanMaxW;
+              } else {
+                const frac = (xTop - columns[j].x) / Math.max(1e-6, xTop - xBot);
+                const yWallJ = yTopEntry + frac * (yBotFloor - yTopEntry);
+                cutBot = targetSide === 'front' ? yBotFloor : yWallJ;
+                cutTop = targetSide === 'front' ? yWallJ : yBotFloor;
+              }
+              if (cutTop - cutBot > 0.5) {
+                const nextSegs: MaterialSegment[] = [];
+                for (const seg of columns[j].segments) {
+                  const isFast =
+                    !isBarrierSegment(seg) &&
+                    (!activeRecipe ||
+                      maxExposedFastRate <= 0 ||
+                      getEtchRateNmMin(activeRecipe, seg.materialId) >=
+                        0.2 * maxExposedFastRate);
+                  if (!isFast || seg.yTop <= cutBot + 0.5 || seg.yBottom >= cutTop - 0.5) {
+                    nextSegs.push(seg);
+                    continue;
+                  }
+                  if (seg.yBottom < cutBot - 0.5) {
+                    nextSegs.push({ ...seg, yTop: cutBot });
+                  }
+                  if (seg.yTop > cutTop + 0.5) {
+                    nextSegs.push({ ...seg, yBottom: cutTop });
+                  }
+                }
+                columns[j].segments = nextSegs;
+              }
+            }
+          }
+
           if (
             safeDepth > 1 ||
             (isReentrant && Math.abs(xTop - xBot) > 1) ||
@@ -3228,7 +4019,7 @@ function applyEtchSide(
               stepId: step.id,
               targetSide,
               wallSide: 'left',
-              colTop,
+              colTop: wallColTop,
               colBot,
               xTop,
               xBot,
@@ -3367,6 +4158,56 @@ function applyEtchSide(
             xBot = Math.max(colBot * dx, xTop - wallHeight / tanPosAngle);
           }
 
+          let wallColTop = colTop;
+          if (isReentrant && Math.abs(xBot - xTop) > 1) {
+            while (
+              wallColTop < columns.length - 1 &&
+              columns[wallColTop].x <= xTop + 1e-6
+            ) {
+              wallColTop++;
+            }
+            const maxEdge = Math.max(xTop, xBot);
+            const spanMinW = Math.min(yTopEntry, yBotFloor);
+            const spanMaxW = Math.max(yTopEntry, yBotFloor);
+            for (let j = colTop; j < columns.length; j++) {
+              if (columns[j].x > maxEdge + 1e-6) break;
+              if (columns[j].segments.length === 0 || etchedDelta[j] > 5) break;
+              let cutBot: number;
+              let cutTop: number;
+              if (columns[j].x <= xTop + 1e-6) {
+                cutBot = spanMinW;
+                cutTop = spanMaxW;
+              } else {
+                const frac = (columns[j].x - xTop) / Math.max(1e-6, xBot - xTop);
+                const yWallJ = yTopEntry + frac * (yBotFloor - yTopEntry);
+                cutBot = targetSide === 'front' ? yBotFloor : yWallJ;
+                cutTop = targetSide === 'front' ? yWallJ : yBotFloor;
+              }
+              if (cutTop - cutBot > 0.5) {
+                const nextSegs: MaterialSegment[] = [];
+                for (const seg of columns[j].segments) {
+                  const isFast =
+                    !isBarrierSegment(seg) &&
+                    (!activeRecipe ||
+                      maxExposedFastRate <= 0 ||
+                      getEtchRateNmMin(activeRecipe, seg.materialId) >=
+                        0.2 * maxExposedFastRate);
+                  if (!isFast || seg.yTop <= cutBot + 0.5 || seg.yBottom >= cutTop - 0.5) {
+                    nextSegs.push(seg);
+                    continue;
+                  }
+                  if (seg.yBottom < cutBot - 0.5) {
+                    nextSegs.push({ ...seg, yTop: cutBot });
+                  }
+                  if (seg.yTop > cutTop + 0.5) {
+                    nextSegs.push({ ...seg, yBottom: cutTop });
+                  }
+                }
+                columns[j].segments = nextSegs;
+              }
+            }
+          }
+
           if (
             safeDepth > 1 ||
             (isReentrant && Math.abs(xBot - xTop) > 1) ||
@@ -3376,7 +4217,7 @@ function applyEtchSide(
               stepId: step.id,
               targetSide,
               wallSide: 'right',
-              colTop,
+              colTop: wallColTop,
               colBot,
               xTop,
               xBot,
@@ -4342,74 +5183,911 @@ export function buildRenderPolygons(
 
   for (let c = 0; c < columns.length; c++) {
     const col = columns[c];
-    for (const seg of col.segments) {
-      const existing = activeRegions.find((r) => {
-        if (r.endCol !== c - 1 || r.materialId !== seg.materialId) return false;
-        const prevTop = r.topYs[r.topYs.length - 1];
-        const prevBottom = r.bottomYs[r.bottomYs.length - 1];
+    const matchedSegs = new Set<number>();
+    const matchedRegs = new Set<ActiveRegion>();
 
-        // Keep sloped polygons (e.g. tapered/retrograde resist, KOH trenches) continuous
-        // when adjacent segments belong to the same step and overlap vertically
-        if (r.stepId && seg.stepId && r.stepId === seg.stepId) {
-          const overlaps =
-            Math.max(prevBottom, seg.yBottom) <= Math.min(prevTop, seg.yTop) + 5;
-          if (overlaps) return true;
+    const attach = (r: ActiveRegion, sIdx: number) => {
+      const seg = col.segments[sIdx];
+      r.endCol = c;
+      r.topYs.push(seg.yTop);
+      r.bottomYs.push(seg.yBottom);
+      matchedSegs.add(sIdx);
+      matchedRegs.add(r);
+    };
+
+    // Pass 1: tight match on both top & bottom edges (<100nm), in activeRegions order
+    for (const r of activeRegions) {
+      if (r.endCol !== c - 1 || matchedRegs.has(r)) continue;
+      const prevTop = r.topYs[r.topYs.length - 1];
+      const prevBottom = r.bottomYs[r.bottomYs.length - 1];
+      let bestIdx = -1;
+      let bestCost = Infinity;
+      for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+        if (matchedSegs.has(sIdx)) continue;
+        const seg = col.segments[sIdx];
+        if (r.materialId !== seg.materialId) continue;
+        const topDiff = Math.abs(prevTop - seg.yTop);
+        const botDiff = Math.abs(prevBottom - seg.yBottom);
+        if (topDiff < 100 && botDiff < 100 && topDiff + botDiff < bestCost) {
+          bestCost = topDiff + botDiff;
+          bestIdx = sIdx;
         }
+      }
+      if (bestIdx !== -1) attach(r, bestIdx);
+    }
 
-        return (
-          Math.abs(prevTop - seg.yTop) < 100 &&
-          Math.abs(prevBottom - seg.yBottom) < 100
-        );
+    // Pass 2: same-step vertical overlap with near-exact top or bottom edge continuity (<5nm)
+    // (prevents ceiling/floor regions from jumping onto detached diagonal ribbons)
+    for (const r of activeRegions) {
+      if (r.endCol !== c - 1 || matchedRegs.has(r) || !r.stepId) continue;
+      const prevTop = r.topYs[r.topYs.length - 1];
+      const prevBottom = r.bottomYs[r.bottomYs.length - 1];
+      let bestIdx = -1;
+      let bestEdgeDiff = Infinity;
+      for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+        if (matchedSegs.has(sIdx)) continue;
+        const seg = col.segments[sIdx];
+        if (r.materialId !== seg.materialId || r.stepId !== seg.stepId) continue;
+        const overlaps = Math.max(prevBottom, seg.yBottom) <= Math.min(prevTop, seg.yTop) + 5;
+        if (!overlaps) continue;
+        const minEdgeDiff = Math.min(Math.abs(prevTop - seg.yTop), Math.abs(prevBottom - seg.yBottom));
+        if (minEdgeDiff < 5 && minEdgeDiff < bestEdgeDiff) {
+          bestEdgeDiff = minEdgeDiff;
+          bestIdx = sIdx;
+        }
+      }
+      if (bestIdx !== -1) attach(r, bestIdx);
+    }
+
+    // Pass 3: remaining same-step vertical overlaps (keeps sloped/tapered polygons continuous)
+    for (const r of activeRegions) {
+      if (r.endCol !== c - 1 || matchedRegs.has(r) || !r.stepId) continue;
+      const prevTop = r.topYs[r.topYs.length - 1];
+      const prevBottom = r.bottomYs[r.bottomYs.length - 1];
+      for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+        if (matchedSegs.has(sIdx)) continue;
+        const seg = col.segments[sIdx];
+        if (r.materialId !== seg.materialId || r.stepId !== seg.stepId) continue;
+        const overlaps = Math.max(prevBottom, seg.yBottom) <= Math.min(prevTop, seg.yTop) + 5;
+        if (overlaps) {
+          attach(r, sIdx);
+          break;
+        }
+      }
+    }
+
+    for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+      if (matchedSegs.has(sIdx)) continue;
+      const seg = col.segments[sIdx];
+      activeRegions.push({
+        materialId: seg.materialId,
+        stepId: seg.stepId,
+        startCol: c,
+        endCol: c,
+        topYs: [seg.yTop],
+        bottomYs: [seg.yBottom],
+      });
+    }
+  }
+
+  // Absorb carved re-entrant overhang child regions back into their monolithic etched substrate base
+  // (only for etched re-entrant walls, never for deposited conformal inner overhangs).
+  for (let k = activeRegions.length - 1; k >= 0; k--) {
+    const regOv = activeRegions[k];
+    let mergedIntoBase = false;
+    for (const w of scallopWalls) {
+      if (!w.isReentrant || w.isDepositionWall || regOv.stepId === w.stepId) continue;
+      const wMinX = Math.min(w.xTop, w.xBot);
+      const wMaxX = Math.max(w.xTop, w.xBot);
+      if (
+        regOv.startCol * dx < wMinX - dx - 1 ||
+        (regOv.endCol + 1) * dx > wMaxX + dx + 1
+      ) {
+        continue;
+      }
+      if (w.wallSide === 'left' && regOv.endCol > w.colTop + 1) continue;
+      if (w.wallSide === 'right' && regOv.startCol < w.colTop - 1) continue;
+
+      const anchorCol = w.wallSide === 'left' ? regOv.startCol - 1 : regOv.endCol + 1;
+      if (anchorCol < 0 || anchorCol >= columns.length) continue;
+
+      const base = activeRegions.find((r, rIdx) => {
+        if (rIdx === k) return false;
+        if (r.materialId !== regOv.materialId || r.stepId !== regOv.stepId) return false;
+        if (
+          r.startCol > Math.min(anchorCol, regOv.startCol) ||
+          r.endCol < Math.max(anchorCol, regOv.endCol)
+        ) {
+          return false;
+        }
+        const aLocal = anchorCol - r.startCol;
+        const ovEdge = w.wallSide === 'left' ? 0 : regOv.topYs.length - 1;
+        if (w.targetSide === 'front') {
+          if (Math.abs(r.topYs[aLocal] - regOv.topYs[ovEdge]) > 120) return false;
+          for (let c = regOv.startCol; c <= regOv.endCol; c++) {
+            if (r.topYs[c - r.startCol] >= regOv.bottomYs[c - regOv.startCol] - 1) {
+              return false;
+            }
+          }
+          return true;
+        } else {
+          if (Math.abs(r.bottomYs[aLocal] - regOv.bottomYs[ovEdge]) > 120) return false;
+          for (let c = regOv.startCol; c <= regOv.endCol; c++) {
+            if (r.bottomYs[c - r.startCol] <= regOv.topYs[c - regOv.startCol] + 1) {
+              return false;
+            }
+          }
+          return true;
+        }
       });
 
-      if (existing) {
-        existing.endCol = c;
-        existing.topYs.push(seg.yTop);
-        existing.bottomYs.push(seg.yBottom);
-      } else {
-        activeRegions.push({
-          materialId: seg.materialId,
-          stepId: seg.stepId,
-          startCol: c,
-          endCol: c,
-          topYs: [seg.yTop],
-          bottomYs: [seg.yBottom],
-        });
+      if (base) {
+        for (let c = regOv.startCol; c <= regOv.endCol; c++) {
+          if (w.targetSide === 'front') {
+            base.topYs[c - base.startCol] = regOv.topYs[c - regOv.startCol];
+          } else {
+            base.bottomYs[c - base.startCol] = regOv.bottomYs[c - regOv.startCol];
+          }
+        }
+        activeRegions.splice(k, 1);
+        mergedIntoBase = true;
+        break;
+      }
+    }
+    if (mergedIntoBase) continue;
+  }
+
+  // Reunite monolithic etched substrate halves that split when the overhang came first in column order
+  // (e.g. backside re-entrant etch left overhang [0..y] before upper roof [y_trench..H]).
+  let reunitedAny = true;
+  while (reunitedAny) {
+    reunitedAny = false;
+    for (let a = 0; a < activeRegions.length && !reunitedAny; a++) {
+      const rA = activeRegions[a];
+      // Never merge conformal/semi-conformal deposited coatings across their own trench air gaps
+      if (scallopWalls.some((wd) => Boolean(wd.isDepositionWall) && wd.stepId === rA.stepId)) {
+        continue;
+      }
+      for (let b = a + 1; b < activeRegions.length && !reunitedAny; b++) {
+        const rB = activeRegions[b];
+        if (rA.materialId !== rB.materialId || rA.stepId !== rB.stepId) continue;
+        const ovStart = Math.max(rA.startCol, rB.startCol);
+        const ovEnd = Math.min(rA.endCol, rB.endCol);
+        if (ovStart > ovEnd) continue;
+
+        for (const w of scallopWalls) {
+          if (!w.isReentrant || w.isDepositionWall || rA.stepId === w.stepId) continue;
+          const wMinX = Math.min(w.xTop, w.xBot);
+          const wMaxX = Math.max(w.xTop, w.xBot);
+          if (ovStart * dx < wMinX - dx - 1 || (ovEnd + 1) * dx > wMaxX + dx + 1) continue;
+
+          const leftReg = rA.startCol <= rB.startCol ? rA : rB;
+          const rightReg = leftReg === rA ? rB : rA;
+          const rightIdx = rightReg === rA ? a : b;
+
+          if (w.wallSide === 'left' && leftReg.endCol > w.colTop + 1) continue;
+          if (w.wallSide === 'right' && rightReg.startCol < w.colTop - 1) continue;
+
+          const extReg = w.wallSide === 'left' ? leftReg : rightReg;
+          const baseReg = w.wallSide === 'left' ? rightReg : leftReg;
+          const extCol = w.wallSide === 'left' ? ovStart - 1 : ovEnd + 1;
+          if (extCol < extReg.startCol || extCol > extReg.endCol) continue;
+
+          const extLocal = extCol - extReg.startCol;
+          const ovEdgeCol = w.wallSide === 'left' ? ovStart : ovEnd;
+          const ovBaseLocal = ovEdgeCol - baseReg.startCol;
+          if (w.targetSide === 'front') {
+            if (Math.abs(extReg.bottomYs[extLocal] - baseReg.bottomYs[ovBaseLocal]) > 120) continue;
+          } else {
+            if (Math.abs(extReg.topYs[extLocal] - baseReg.topYs[ovBaseLocal]) > 120) continue;
+          }
+
+          let validGap = true;
+          for (let c = ovStart; c <= ovEnd; c++) {
+            const extSideTop = extReg.topYs[c - extReg.startCol];
+            const extSideBot = extReg.bottomYs[c - extReg.startCol];
+            const baseTop = baseReg.topYs[c - baseReg.startCol];
+            const baseBot = baseReg.bottomYs[c - baseReg.startCol];
+            if (w.targetSide === 'front') {
+              if (baseTop >= extSideBot - 1) {
+                validGap = false;
+                break;
+              }
+            } else {
+              if (extSideTop >= baseBot - 1) {
+                validGap = false;
+                break;
+              }
+            }
+          }
+          if (!validGap) continue;
+
+          const newStart = Math.min(leftReg.startCol, rightReg.startCol);
+          const newEnd = Math.max(leftReg.endCol, rightReg.endCol);
+          const newTopYs: number[] = [];
+          const newBottomYs: number[] = [];
+          for (let c = newStart; c <= newEnd; c++) {
+            const inL = c >= leftReg.startCol && c <= leftReg.endCol;
+            const inR = c >= rightReg.startCol && c <= rightReg.endCol;
+            if (inL && inR) {
+              const li = c - leftReg.startCol;
+              const ri = c - rightReg.startCol;
+              newTopYs.push(Math.max(leftReg.topYs[li], rightReg.topYs[ri]));
+              newBottomYs.push(Math.min(leftReg.bottomYs[li], rightReg.bottomYs[ri]));
+            } else if (inL) {
+              const li = c - leftReg.startCol;
+              newTopYs.push(leftReg.topYs[li]);
+              newBottomYs.push(leftReg.bottomYs[li]);
+            } else {
+              const ri = c - rightReg.startCol;
+              newTopYs.push(rightReg.topYs[ri]);
+              newBottomYs.push(rightReg.bottomYs[ri]);
+            }
+          }
+          leftReg.startCol = newStart;
+          leftReg.endCol = newEnd;
+          leftReg.topYs = newTopYs;
+          leftReg.bottomYs = newBottomYs;
+          activeRegions.splice(rightIdx, 1);
+          reunitedAny = true;
+          break;
+        }
       }
     }
   }
+
+  // Precompute true branch-seam boundary columns per (materialId, stepId) where another region
+  // actually starts or ends, so interior columns of sloped ribbons never get staircase vertices.
+  const stepRegionSeamXs = new Map<string, Set<number>>();
+  const regsByStep = new Map<string, ActiveRegion[]>();
+  for (const r of activeRegions) {
+    const key = `${r.materialId}::${r.stepId || ''}`;
+    let list = regsByStep.get(key);
+    if (!list) {
+      list = [];
+      regsByStep.set(key, list);
+    }
+    list.push(r);
+  }
+  for (const [key, list] of regsByStep.entries()) {
+    if (list.length < 2) continue;
+    const xs = new Set<number>();
+    for (const r of list) {
+      if (r.startCol > 0) xs.add(r.startCol);
+      if (r.endCol + 1 < columns.length) xs.add(r.endCol + 1);
+    }
+    stepRegionSeamXs.set(key, xs);
+  }
+
+  const hasSeparateWedgeRegion = (w: ScallopWall, reg: ActiveRegion): boolean => {
+    const wMinC = Math.max(0, Math.floor((Math.min(w.xTop, w.xBot) + 1e-6) / dx));
+    const wMaxC = Math.min(
+      columns.length - 1,
+      Math.floor((Math.max(w.xTop, w.xBot) - 1e-6) / dx)
+    );
+    const wMinY = Math.min(w.yTop, w.yBot);
+    const wMaxY = Math.max(w.yTop, w.yBot);
+    return activeRegions.some((other) => {
+      if (
+        other === reg ||
+        other.materialId !== reg.materialId ||
+        other.stepId !== reg.stepId
+      ) {
+        return false;
+      }
+      const cA = Math.max(other.startCol, wMinC);
+      const cB = Math.min(other.endCol, wMaxC);
+      if (cA > cB) return false;
+      for (let c = cA; c <= cB; c++) {
+        const idx = c - other.startCol;
+        if (other.bottomYs[idx] < wMaxY - 5 && other.topYs[idx] > wMinY + 5) {
+          return true;
+        }
+      }
+      return false;
+    });
+  };
+
+  const findPreferredWall = (pred: (w: ScallopWall) => boolean, stepId?: string): ScallopWall | undefined => {
+    let fallback: ScallopWall | undefined;
+    for (const w of scallopWalls) {
+      if (!pred(w)) continue;
+      if (stepId && w.stepId === stepId) return w;
+      if (!fallback) fallback = w;
+    }
+    return fallback;
+  };
 
   let idCounter = 0;
   for (const reg of activeRegions) {
     idCounter++;
     const pts: { x: number; y: number }[] = [];
     const lastIdx = reg.bottomYs.length - 1;
+    const seamCols = stepRegionSeamXs.get(`${reg.materialId}::${reg.stepId || ''}`);
+    const mouthCols = new Set<number>();
+    for (const w of scallopWalls) {
+      if (!w.isReentrant || w.isDepositionWall || w.stepId === reg.stepId) continue;
+      mouthCols.add(w.wallSide === 'left' ? w.colTop + 1 : w.colTop);
+    }
+
+    // Standalone inner overhang wings (front/back) and outer re-entrant wedge regions
+    const standaloneFrontLeftInner = reg.stepId
+      ? scallopWalls.find(
+          (w) =>
+            w.stepId === reg.stepId &&
+            w.targetSide === 'front' &&
+            w.wallSide === 'left' &&
+            Boolean(w.isReentrant) &&
+            w.colBot < w.colTop &&
+            reg.endCol === w.colTop &&
+            reg.startCol === w.colBot + 1 &&
+            reg.bottomYs[0] > w.yBot + 5 &&
+            Math.min(reg.topYs[lastIdx], w.yTop) - Math.max(reg.bottomYs[lastIdx], w.yBot) > 5
+        )
+      : undefined;
+
+    const standaloneFrontRightInner = reg.stepId
+      ? scallopWalls.find(
+          (w) =>
+            w.stepId === reg.stepId &&
+            w.targetSide === 'front' &&
+            w.wallSide === 'right' &&
+            Boolean(w.isReentrant) &&
+            w.colBot > w.colTop &&
+            reg.startCol === w.colTop &&
+            reg.endCol === w.colBot - 1 &&
+            reg.bottomYs[lastIdx] > w.yBot + 5 &&
+            Math.min(reg.topYs[0], w.yTop) - Math.max(reg.bottomYs[0], w.yBot) > 5
+        )
+      : undefined;
+
+    const standaloneBackLeftInner = reg.stepId
+      ? scallopWalls.find(
+          (w) =>
+            w.stepId === reg.stepId &&
+            w.targetSide === 'back' &&
+            w.wallSide === 'left' &&
+            Boolean(w.isReentrant) &&
+            w.colBot < w.colTop &&
+            reg.endCol === w.colTop &&
+            reg.startCol === w.colBot + 1 &&
+            reg.topYs[0] < w.yBot - 5 &&
+            Math.min(reg.topYs[lastIdx], w.yBot) - Math.max(reg.bottomYs[lastIdx], w.yTop) > 5
+        )
+      : undefined;
+
+    const standaloneBackRightInner = reg.stepId
+      ? scallopWalls.find(
+          (w) =>
+            w.stepId === reg.stepId &&
+            w.targetSide === 'back' &&
+            w.wallSide === 'right' &&
+            Boolean(w.isReentrant) &&
+            w.colBot > w.colTop &&
+            reg.startCol === w.colTop &&
+            reg.endCol === w.colBot - 1 &&
+            reg.topYs[lastIdx] < w.yBot - 5 &&
+            Math.min(reg.topYs[0], w.yBot) - Math.max(reg.bottomYs[0], w.yTop) > 5
+        )
+      : undefined;
+
+    // Outer re-entrant wedge regions (tucked under/over an earlier re-entrant wall)
+    const wedgeFrontLeft = findPreferredWall(
+      (w) =>
+        w.targetSide === 'front' &&
+        w.wallSide === 'left' &&
+        Boolean(w.isReentrant) &&
+        w.stepId !== reg.stepId &&
+        reg.endCol <= w.colTop + 1 &&
+        reg.startCol * dx >= Math.min(w.xTop, w.xBot) - dx - 1 &&
+        reg.endCol === Math.floor((w.xTop - 1e-6) / dx) &&
+        reg.bottomYs[lastIdx] <= w.yBot + 5 &&
+        reg.topYs[lastIdx] < w.yTop - 5 &&
+        reg.topYs[0] > w.yBot + 5
+    );
+
+    const wedgeBackLeft = findPreferredWall(
+      (w) =>
+        w.targetSide === 'back' &&
+        w.wallSide === 'left' &&
+        Boolean(w.isReentrant) &&
+        w.stepId !== reg.stepId &&
+        reg.endCol <= w.colTop + 1 &&
+        reg.startCol * dx >= Math.min(w.xTop, w.xBot) - dx - 1 &&
+        reg.endCol === Math.floor((w.xTop - 1e-6) / dx) &&
+        reg.topYs[lastIdx] >= w.yBot - 5 &&
+        reg.bottomYs[lastIdx] > w.yTop + 5 &&
+        reg.bottomYs[0] < w.yBot - 5
+    );
+
+    const wedgeBackRight = findPreferredWall(
+      (w) =>
+        w.targetSide === 'back' &&
+        w.wallSide === 'right' &&
+        Boolean(w.isReentrant) &&
+        w.stepId !== reg.stepId &&
+        reg.startCol === Math.floor((w.xTop + 1e-6) / dx) &&
+        (reg.endCol + 1) * dx <= Math.max(w.xTop, w.xBot) + dx + 1 &&
+        reg.topYs[0] >= w.yBot - 5 &&
+        reg.bottomYs[0] > w.yTop + 5 &&
+        reg.bottomYs[lastIdx] < w.yBot - 5
+    );
+
+    // Helper to look up a same-step neighbor region's top or bottom Y at an adjacent column within [yMin, yMax]
+    const findNeighborEdgeY = (
+      col: number,
+      edge: 'top' | 'bottom',
+      yMin: number,
+      yMax: number
+    ): number | undefined => {
+      for (const other of activeRegions) {
+        if (other === reg || other.materialId !== reg.materialId || other.stepId !== reg.stepId) {
+          continue;
+        }
+        if (col >= other.startCol && col <= other.endCol) {
+          const idx = col - other.startCol;
+          const val = edge === 'top' ? other.topYs[idx] : other.bottomYs[idx];
+          if (val >= yMin - 5 && val <= yMax + 5) {
+            return val;
+          }
+        }
+      }
+      return undefined;
+    };
+
+    const getWallBotCol = (w: ScallopWall): number =>
+      Math.max(
+        0,
+        Math.min(
+          columns.length - 1,
+          Math.floor((w.xBot + (w.wallSide === 'left' ? 1e-6 : -1e-6)) / dx)
+        )
+      );
+
+    // Split outer re-entrant wall matchers for thin conformal coatings (< overhang width)
+    // where a single underlying etched re-entrant wall spans across floor + detached diagonal ribbon(s).
+    let partialOuterFrontLeft: { wall: ScallopWall; splitCol: number } | undefined;
+    for (const w of scallopWalls) {
+      const wBotCol = getWallBotCol(w);
+      if (
+        w.targetSide !== 'front' ||
+        w.wallSide !== 'left' ||
+        !w.isReentrant ||
+        w.stepId === reg.stepId ||
+        reg.startCol > w.colTop ||
+        reg.startCol < wBotCol - 1 ||
+        reg.bottomYs[0] > w.yBot + 5
+      ) {
+        continue;
+      }
+      const maxCheck = Math.min(reg.endCol, w.colTop + 1);
+      for (let sc = reg.startCol + 1; sc <= maxCheck; sc++) {
+        if (!seamCols?.has(sc)) continue;
+        const prevY = reg.topYs[sc - 1 - reg.startCol];
+        const currY = reg.topYs[sc - reg.startCol];
+        if (prevY > w.yBot + 50 && currY < prevY - 50) {
+          partialOuterFrontLeft = { wall: w, splitCol: sc };
+          break;
+        }
+      }
+      if (partialOuterFrontLeft) break;
+    }
+
+    let partialOuterFrontRight: { wall: ScallopWall; splitCol: number } | undefined;
+    for (const w of scallopWalls) {
+      const wBotCol = getWallBotCol(w);
+      if (
+        w.targetSide !== 'front' ||
+        w.wallSide !== 'right' ||
+        !w.isReentrant ||
+        w.stepId === reg.stepId ||
+        reg.endCol < w.colTop ||
+        reg.endCol > wBotCol + 1 ||
+        reg.bottomYs[lastIdx] > w.yBot + 5
+      ) {
+        continue;
+      }
+      const minCheck = Math.max(reg.startCol + 1, w.colTop);
+      for (let sc = reg.endCol; sc >= minCheck; sc--) {
+        if (!seamCols?.has(sc)) continue;
+        const prevY = reg.topYs[sc - 1 - reg.startCol];
+        const currY = reg.topYs[sc - reg.startCol];
+        if (currY > w.yBot + 50 && prevY < currY - 50) {
+          partialOuterFrontRight = { wall: w, splitCol: sc };
+          break;
+        }
+      }
+      if (partialOuterFrontRight) break;
+    }
+
+    let partialOuterBackRight: { wall: ScallopWall; splitCol: number } | undefined;
+    for (const w of scallopWalls) {
+      const wBotCol = getWallBotCol(w);
+      if (
+        w.targetSide !== 'back' ||
+        w.wallSide !== 'right' ||
+        !w.isReentrant ||
+        w.stepId === reg.stepId ||
+        reg.endCol < w.colTop ||
+        reg.endCol > wBotCol + 1 ||
+        reg.topYs[lastIdx] < w.yBot - 5
+      ) {
+        continue;
+      }
+      const minCheck = Math.max(reg.startCol + 1, w.colTop);
+      for (let sc = reg.endCol; sc >= minCheck; sc--) {
+        if (!seamCols?.has(sc)) continue;
+        const prevY = reg.bottomYs[sc - 1 - reg.startCol];
+        const currY = reg.bottomYs[sc - reg.startCol];
+        if (currY < w.yBot - 50 && prevY > currY + 50) {
+          partialOuterBackRight = { wall: w, splitCol: sc };
+          break;
+        }
+      }
+      if (partialOuterBackRight) break;
+    }
+
+    let partialOuterBackLeft: { wall: ScallopWall; splitCol: number } | undefined;
+    for (const w of scallopWalls) {
+      const wBotCol = getWallBotCol(w);
+      if (
+        w.targetSide !== 'back' ||
+        w.wallSide !== 'left' ||
+        !w.isReentrant ||
+        w.stepId === reg.stepId ||
+        reg.startCol > w.colTop ||
+        reg.startCol < wBotCol - 1 ||
+        reg.topYs[0] < w.yBot - 5
+      ) {
+        continue;
+      }
+      const maxCheck = Math.min(reg.endCol, w.colTop + 1);
+      for (let sc = reg.startCol + 1; sc <= maxCheck; sc++) {
+        if (!seamCols?.has(sc)) continue;
+        const prevY = reg.bottomYs[sc - 1 - reg.startCol];
+        const currY = reg.bottomYs[sc - reg.startCol];
+        if (prevY < w.yBot - 50 && currY > prevY + 50) {
+          partialOuterBackLeft = { wall: w, splitCol: sc };
+          break;
+        }
+      }
+      if (partialOuterBackLeft) break;
+    }
+
+    // Detached diagonal ribbon regions resting against upper slice of an underlying re-entrant wall
+    const diagOuterFrontLeft = (() => {
+      for (const w of scallopWalls) {
+        const wBotCol = getWallBotCol(w);
+        if (
+          w.targetSide !== 'front' ||
+          w.wallSide !== 'left' ||
+          !w.isReentrant ||
+          w.stepId === reg.stepId ||
+          reg.endCol !== w.colTop ||
+          reg.startCol <= wBotCol ||
+          reg.bottomYs[0] <= w.yBot + 5
+        ) {
+          continue;
+        }
+        const yJoin = findNeighborEdgeY(reg.startCol - 1, 'top', reg.bottomYs[0], reg.topYs[0]);
+        if (yJoin !== undefined && yJoin > w.yBot + 5) {
+          return { wall: w, yJoin };
+        }
+      }
+      return undefined;
+    })();
+
+    const diagOuterFrontRight = (() => {
+      for (const w of scallopWalls) {
+        const wBotCol = getWallBotCol(w);
+        if (
+          w.targetSide !== 'front' ||
+          w.wallSide !== 'right' ||
+          !w.isReentrant ||
+          w.stepId === reg.stepId ||
+          reg.startCol > w.colTop ||
+          (reg.startCol < w.colTop && seamCols?.has(w.colTop + 1)) ||
+          reg.endCol < w.colTop ||
+          reg.endCol >= wBotCol ||
+          reg.bottomYs[lastIdx] <= w.yBot + 5
+        ) {
+          continue;
+        }
+        const yJoin = findNeighborEdgeY(reg.endCol + 1, 'top', reg.bottomYs[lastIdx], reg.topYs[lastIdx]);
+        if (yJoin !== undefined && yJoin > w.yBot + 5) {
+          return { wall: w, yJoin };
+        }
+      }
+      return undefined;
+    })();
+
+    const diagOuterBackLeft = (() => {
+      for (const w of scallopWalls) {
+        const wBotCol = getWallBotCol(w);
+        if (
+          w.targetSide !== 'back' ||
+          w.wallSide !== 'left' ||
+          !w.isReentrant ||
+          w.stepId === reg.stepId ||
+          reg.endCol !== w.colTop ||
+          reg.topYs[lastIdx] >= w.yBot - 5
+        ) {
+          continue;
+        }
+        if (reg.startCol <= wBotCol && reg.topYs[0] >= w.yBot - 5 && reg.bottomYs[lastIdx] > w.yTop + 5) {
+          return { wall: w, yJoin: w.yBot };
+        }
+        if (reg.startCol > wBotCol && reg.topYs[0] < w.yBot - 5) {
+          const yJoin = findNeighborEdgeY(reg.startCol - 1, 'bottom', reg.bottomYs[0], reg.topYs[0]);
+          if (yJoin !== undefined && yJoin < w.yBot - 5) {
+            return { wall: w, yJoin };
+          }
+        }
+      }
+      return undefined;
+    })();
+
+    const diagOuterBackRight = (() => {
+      for (const w of scallopWalls) {
+        const wBotCol = getWallBotCol(w);
+        if (
+          w.targetSide !== 'back' ||
+          w.wallSide !== 'right' ||
+          !w.isReentrant ||
+          w.stepId === reg.stepId ||
+          reg.startCol !== w.colTop ||
+          reg.topYs[0] >= w.yBot - 5
+        ) {
+          continue;
+        }
+        if (reg.endCol >= wBotCol && reg.topYs[lastIdx] >= w.yBot - 5 && reg.bottomYs[0] > w.yTop + 5) {
+          return { wall: w, yJoin: w.yBot };
+        }
+        if (reg.endCol < wBotCol && reg.topYs[lastIdx] < w.yBot - 5) {
+          const yJoin = findNeighborEdgeY(reg.endCol + 1, 'bottom', reg.bottomYs[lastIdx], reg.topYs[lastIdx]);
+          if (yJoin !== undefined && yJoin < w.yBot - 5) {
+            return { wall: w, yJoin };
+          }
+        }
+      }
+      return undefined;
+    })();
+
+    // Connected outer climbing / inner overhang walls
+    const reentrantOuterFrontLeft =
+      partialOuterFrontLeft || diagOuterFrontLeft
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.targetSide === 'front' &&
+              w.wallSide === 'left' &&
+              Boolean(w.isReentrant) &&
+              w.stepId !== reg.stepId &&
+              reg.startCol <= w.colTop &&
+              reg.endCol > w.colTop &&
+              reg.bottomYs[w.colTop - reg.startCol] <= w.yBot + 5 &&
+              reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
+              reg.topYs[w.colTop + 1 - reg.startCol] < w.yTop - 5 &&
+              (w.colTop === reg.startCol ||
+                reg.topYs[w.colTop - reg.startCol] - reg.topYs[w.colTop - 1 - reg.startCol] > 50) &&
+              reg.startCol * dx <= Math.max(w.xTop, w.xBot) + 1 &&
+              reg.startCol * dx >= Math.min(w.xTop, w.xBot) - dx - 1
+          );
+    const reentrantOuterFrontLeftStartCol = reentrantOuterFrontLeft
+      ? Math.max(
+          reg.startCol,
+          Math.min(
+            reentrantOuterFrontLeft.colTop,
+            Math.floor((Math.min(reentrantOuterFrontLeft.xTop, reentrantOuterFrontLeft.xBot) + 1e-6) / dx)
+          )
+        )
+      : -1;
+
+    const reentrantInnerFrontRightOverhang =
+      !standaloneFrontRightInner && reg.stepId
+        ? scallopWalls.find(
+            (w) =>
+              w.stepId === reg.stepId &&
+              w.targetSide === 'front' &&
+              w.wallSide === 'right' &&
+              Boolean(w.isReentrant) &&
+              w.colTop === reg.startCol &&
+              w.colBot > w.colTop &&
+              reg.endCol > w.colBot &&
+              reg.bottomYs[w.colBot + 1 - reg.startCol] >= w.yTop - 5 &&
+              (!w.isDepositionWall || reg.bottomYs[w.colBot - reg.startCol] < w.yTop - 5) &&
+              Math.min(reg.topYs[0], Math.max(w.yTop, w.yBot)) -
+                Math.max(reg.bottomYs[0], Math.min(w.yTop, w.yBot)) >
+                5
+          )
+        : undefined;
+
+    const reentrantInnerBackRightOverhang =
+      !standaloneBackRightInner && reg.stepId
+        ? scallopWalls.find(
+            (w) =>
+              w.stepId === reg.stepId &&
+              w.targetSide === 'back' &&
+              w.wallSide === 'right' &&
+              Boolean(w.isReentrant) &&
+              w.colTop === reg.startCol &&
+              w.colBot > w.colTop &&
+              reg.endCol > w.colBot &&
+              reg.topYs[w.colBot + 1 - reg.startCol] <= w.yTop + 5 &&
+              (!w.isDepositionWall || reg.topYs[w.colBot - reg.startCol] > w.yTop + 5) &&
+              Math.min(reg.topYs[0], Math.max(w.yTop, w.yBot)) -
+                Math.max(reg.bottomYs[0], Math.min(w.yTop, w.yBot)) >
+                5
+          )
+        : undefined;
+
+    const reentrantOuterBackLeft =
+      partialOuterBackLeft || diagOuterBackLeft
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.targetSide === 'back' &&
+              w.wallSide === 'left' &&
+              Boolean(w.isReentrant) &&
+              w.stepId !== reg.stepId &&
+              reg.startCol <= w.colTop &&
+              reg.endCol > w.colTop &&
+              reg.topYs[w.colTop - reg.startCol] >= w.yBot - 5 &&
+              reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
+              reg.bottomYs[w.colTop + 1 - reg.startCol] > w.yTop + 5 &&
+              (w.colTop === reg.startCol ||
+                reg.bottomYs[w.colTop - 1 - reg.startCol] - reg.bottomYs[w.colTop - reg.startCol] > 50) &&
+              reg.startCol * dx <= Math.max(w.xTop, w.xBot) + 1 &&
+              reg.startCol * dx >= Math.min(w.xTop, w.xBot) - dx - 1
+          );
+    const reentrantOuterBackLeftEndCol = reentrantOuterBackLeft
+      ? Math.max(
+          reg.startCol,
+          Math.min(
+            reentrantOuterBackLeft.colTop,
+            Math.floor((Math.min(reentrantOuterBackLeft.xTop, reentrantOuterBackLeft.xBot) + 1e-6) / dx)
+          )
+        )
+      : -1;
 
     // Left boundary edge (x = reg.startCol * dx): goes bottom -> top
     const xStart = reg.startCol * dx;
-    const leftEdgeWall = scallopWalls.find(
-      (w) =>
-        w.wallSide === 'right' &&
-        (w.colTop === reg.startCol ||
-          (w.targetSide === 'front' &&
-            reg.startCol > w.colBot &&
-            reg.endCol >= w.colTop &&
-            reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
-            reg.bottomYs[0] < w.yTop - 5) ||
-          (w.targetSide === 'back' &&
-            reg.startCol > w.colBot &&
-            reg.endCol >= w.colTop &&
-            reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
-            reg.topYs[0] > w.yTop + 5)) &&
-        Math.min(reg.topYs[0], Math.max(w.yTop, w.yBot)) -
-          Math.max(reg.bottomYs[0], Math.min(w.yTop, w.yBot)) >
-          5
-    );
+    const xEnd = (reg.endCol + 1) * dx;
+    const leftEdgeWall =
+      standaloneFrontLeftInner ||
+      standaloneFrontRightInner ||
+      standaloneBackLeftInner ||
+      standaloneBackRightInner ||
+      wedgeFrontLeft ||
+      wedgeBackLeft ||
+      wedgeBackRight ||
+      partialOuterFrontLeft ||
+      partialOuterBackLeft ||
+      diagOuterFrontLeft ||
+      diagOuterFrontRight ||
+      diagOuterBackLeft ||
+      diagOuterBackRight
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.wallSide === 'right' &&
+              (!w.isReentrant || w.stepId === reg.stepId) &&
+              (w.colTop === reg.startCol ||
+                (w.targetSide === 'front' &&
+                  reg.startCol > w.colBot &&
+                  reg.endCol >= w.colTop &&
+                  reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
+                  reg.bottomYs[0] < w.yTop - 5) ||
+                (w.targetSide === 'back' &&
+                  reg.startCol > w.colBot &&
+                  reg.endCol >= w.colTop &&
+                  reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
+                  reg.topYs[0] > w.yTop + 5)) &&
+              Math.min(reg.topYs[0], Math.max(w.yTop, w.yBot)) -
+                Math.max(reg.bottomYs[0], Math.min(w.yTop, w.yBot)) >
+                5,
+            reg.stepId
+          );
 
     let leftTopTrimX = -Infinity;
     let leftBottomTrimX = -Infinity;
     let topStartIdx = 0;
-    if (leftEdgeWall) {
+    let stopBotAtCol = 0;
+    let skipBottomLoop = false;
+
+    if (standaloneFrontLeftInner) {
+      // Seam edge sits cleanly at xStart from w.yBot up to topYs[0]
+      pts.push({ x: xStart, y: standaloneFrontLeftInner.yBot });
+      pts.push({ x: xStart, y: reg.topYs[0] });
+    } else if (standaloneFrontRightInner) {
+      const w = standaloneFrontRightInner;
+      pts.push({ x: xEnd, y: w.yBot });
+      pts.push({ x: w.xBot, y: w.yBot });
+      pts.push(...sampleScallopWallPoints(w, w.yBot, w.yTop, true));
+      pts.push({ x: xStart, y: reg.topYs[0] });
+      skipBottomLoop = true;
+    } else if (standaloneBackLeftInner) {
+      const w = standaloneBackLeftInner;
+      pts.push({ x: xStart, y: reg.bottomYs[0] });
+      pts.push({ x: xStart, y: w.yBot });
+      pts.push({ x: w.xBot, y: w.yBot });
+      pts.push(...sampleScallopWallPoints(w, w.yBot, w.yTop, true));
+      pts.push({ x: w.xTop, y: w.yTop });
+      topStartIdx = reg.topYs.length;
+    } else if (standaloneBackRightInner) {
+      const w = standaloneBackRightInner;
+      pts.push({ x: xStart, y: reg.bottomYs[0] });
+      pts.push({ x: xStart, y: w.yTop });
+      pts.push(...sampleScallopWallPoints(w, w.yTop, w.yBot, true));
+      pts.push({ x: xEnd, y: w.yBot });
+      topStartIdx = reg.topYs.length;
+    } else if (wedgeFrontLeft) {
+      pts.push({ x: wedgeFrontLeft.xBot, y: reg.bottomYs[0] });
+      leftBottomTrimX = wedgeFrontLeft.xBot;
+    } else if (wedgeBackLeft) {
+      pts.push({ x: wedgeBackLeft.xBot, y: reg.topYs[0] });
+    } else if (wedgeBackRight) {
+      pts.push({ x: xStart, y: wedgeBackRight.yTop });
+      pts.push({ x: xStart, y: reg.topYs[0] });
+    } else if (partialOuterFrontLeft) {
+      pts.push({ x: partialOuterFrontLeft.wall.xBot, y: reg.bottomYs[0] });
+      leftBottomTrimX = partialOuterFrontLeft.wall.xBot;
+    } else if (partialOuterBackLeft) {
+      pts.push({ x: partialOuterBackLeft.wall.xBot, y: reg.topYs[0] });
+    } else if (diagOuterFrontLeft) {
+      pts.push({ x: xStart, y: reg.bottomYs[0] });
+      pts.push({ x: xStart, y: diagOuterFrontLeft.yJoin });
+    } else if (diagOuterFrontRight) {
+      const w = diagOuterFrontRight.wall;
+      pts.push({ x: xStart, y: reg.bottomYs[0] });
+      if (reg.startCol === w.colTop) {
+        pts.push({ x: w.xTop, y: w.yTop });
+      } else {
+        pts.push({ x: xStart, y: reg.topYs[0] });
+      }
+    } else if (diagOuterBackLeft) {
+      const { wall: w, yJoin } = diagOuterBackLeft;
+      if (yJoin === w.yBot) {
+        pts.push({ x: w.xBot, y: reg.topYs[0] });
+      } else {
+        pts.push({ x: xStart, y: yJoin });
+        pts.push({ x: xStart, y: reg.topYs[0] });
+      }
+    } else if (diagOuterBackRight) {
+      const w = diagOuterBackRight.wall;
+      pts.push({ x: w.xTop, y: w.yTop });
+      pts.push({ x: xStart, y: reg.topYs[0] });
+    } else if (reentrantOuterFrontLeft && reentrantOuterFrontLeftStartCol === reg.startCol) {
+      pts.push({ x: reentrantOuterFrontLeft.xBot, y: reg.bottomYs[0] });
+      leftBottomTrimX = reentrantOuterFrontLeft.xBot;
+    } else if (reentrantOuterBackLeft && reentrantOuterBackLeftEndCol === reg.startCol) {
+      pts.push({ x: reentrantOuterBackLeft.xBot, y: reg.topYs[0] });
+    } else if (reentrantInnerFrontRightOverhang) {
+      const w = reentrantInnerFrontRightOverhang;
+      const anchorX = (w.colBot + 1) * dx;
+      pts.push({ x: anchorX, y: w.yBot });
+      const yB = Math.min(w.yTop, reg.topYs[0]);
+      pts.push(...sampleScallopWallPoints(w, w.yBot, yB, true));
+      if (yB < reg.topYs[0] - 0.5) {
+        pts.push({ x: xStart, y: reg.topYs[0] });
+      } else {
+        leftTopTrimX = evalWallXAtY(w, reg.topYs[0]);
+      }
+      stopBotAtCol = w.colBot + 1 - reg.startCol;
+    } else if (reentrantInnerBackRightOverhang) {
+      const w = reentrantInnerBackRightOverhang;
+      const anchorX = (w.colBot + 1) * dx;
+      const yStartWall = Math.max(w.yTop, reg.bottomYs[0]);
+      if (yStartWall > reg.bottomYs[0] + 0.5) {
+        pts.push({ x: xStart, y: reg.bottomYs[0] });
+      }
+      pts.push(...sampleScallopWallPoints(w, yStartWall, w.yBot, true));
+      pts.push({ x: anchorX, y: w.yBot });
+      const resumeLocal = w.colBot + 1 - reg.startCol;
+      pts.push({ x: anchorX, y: reg.topYs[resumeLocal] });
+      topStartIdx = resumeLocal;
+      leftTopTrimX = anchorX;
+    } else if (leftEdgeWall) {
       const spansPartialRightWall =
         leftEdgeWall.colTop > reg.startCol && leftEdgeWall.colBot < reg.startCol;
       const topLocalIdx = Math.max(0, leftEdgeWall.colTop - reg.startCol);
@@ -4430,8 +6108,6 @@ export function buildRenderPolygons(
         (spansPartialRightWall ||
           (reg.startCol === leftEdgeWall.colTop && reg.startCol > leftEdgeWall.colBot))
       ) {
-        // Backside right wall exiting top/left of this partial region is traced upward by
-        // backRightWall in the bottom loop, ending at yEnd on the top or left boundary.
         const yEnd = Math.min(leftEdgeWall.yBot, reg.topYs[0]);
         if (yEnd < reg.topYs[0] - 0.5) {
           pts.push({ x: xStart, y: yEnd });
@@ -4462,16 +6138,85 @@ export function buildRenderPolygons(
       pts.push({ x: xStart, y: reg.topYs[0] });
     }
 
-    // Check right boundary edge early so top surface can be trimmed cleanly if re-entrant at top
-    const xEnd = (reg.endCol + 1) * dx;
-    const rightEdgeWall = scallopWalls.find(
-      (w) =>
-        w.wallSide === 'left' &&
-        w.colTop === reg.endCol &&
-        Math.min(reg.topYs[lastIdx], Math.max(w.yTop, w.yBot)) -
-          Math.max(reg.bottomYs[lastIdx], Math.min(w.yTop, w.yBot)) >
-          5
-    );
+    // Check right boundary edge early
+    const rightEdgeWall =
+      standaloneFrontLeftInner ||
+      standaloneFrontRightInner ||
+      standaloneBackLeftInner ||
+      standaloneBackRightInner ||
+      wedgeFrontLeft ||
+      wedgeBackLeft ||
+      wedgeBackRight ||
+      partialOuterFrontRight ||
+      partialOuterBackRight ||
+      diagOuterFrontLeft ||
+      diagOuterFrontRight ||
+      diagOuterBackLeft ||
+      diagOuterBackRight
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.wallSide === 'left' &&
+              (!w.isReentrant || w.stepId === reg.stepId) &&
+              w.colTop === reg.endCol &&
+              Math.min(reg.topYs[lastIdx], Math.max(w.yTop, w.yBot)) -
+                Math.max(reg.bottomYs[lastIdx], Math.min(w.yTop, w.yBot)) >
+                5,
+            reg.stepId
+          );
+
+    const reentrantOuterFrontRight =
+      partialOuterFrontRight || diagOuterFrontRight
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.targetSide === 'front' &&
+              w.wallSide === 'right' &&
+              Boolean(w.isReentrant) &&
+              w.stepId !== reg.stepId &&
+              reg.startCol < w.colTop &&
+              reg.endCol >= w.colTop &&
+              reg.bottomYs[w.colTop - reg.startCol] <= w.yBot + 5 &&
+              reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
+              reg.topYs[w.colTop - 1 - reg.startCol] < w.yTop - 5 &&
+              (w.colTop === reg.endCol ||
+                reg.topYs[w.colTop - reg.startCol] - reg.topYs[w.colTop + 1 - reg.startCol] > 50) &&
+              (reg.endCol + 1) * dx >= Math.min(w.xTop, w.xBot) - 1 &&
+              (reg.endCol + 1) * dx <= Math.max(w.xTop, w.xBot) + dx + 1
+          );
+
+    const findBackLeftInnerDropCol = (w: ScallopWall): number => {
+      for (const dc of [w.colBot, w.colBot + 1]) {
+        if (dc <= reg.startCol || dc >= reg.endCol) continue;
+        const local = dc - reg.startCol;
+        if (reg.topYs[local - 1] <= w.yTop + 5 && reg.topYs[local] >= w.yBot - 5) {
+          return dc;
+        }
+      }
+      return -1;
+    };
+
+    const reentrantInnerBackLeftOverhang =
+      !standaloneBackLeftInner && reg.stepId
+        ? scallopWalls.find(
+            (w) =>
+              w.stepId === reg.stepId &&
+              w.targetSide === 'back' &&
+              w.wallSide === 'left' &&
+              Boolean(w.isReentrant) &&
+              w.colTop === reg.endCol &&
+              w.colBot < w.colTop &&
+              reg.startCol < w.colBot &&
+              (!w.isDepositionWall || reg.topYs[w.colBot - reg.startCol] > w.yTop + 5) &&
+              findBackLeftInnerDropCol(w) !== -1 &&
+              Math.min(reg.topYs[lastIdx], Math.max(w.yTop, w.yBot)) -
+                Math.max(reg.bottomYs[lastIdx], Math.min(w.yTop, w.yBot)) >
+                5
+          )
+        : undefined;
+    const reentrantInnerBackLeftDropCol = reentrantInnerBackLeftOverhang
+      ? findBackLeftInnerDropCol(reentrantInnerBackLeftOverhang)
+      : -1;
 
     // Top surface left to right
     let minTopXAllowed = leftTopTrimX;
@@ -4480,14 +6225,165 @@ export function buildRenderPolygons(
     for (let i = topStartIdx; i < reg.topYs.length; i++) {
       const colIdx = reg.startCol + i;
 
+      // Front left outer wedge (standalone reg under re-entrant wall): trace w up-right to (xEnd, w.yTop)
+      if (wedgeFrontLeft && i === 0) {
+        pts.push(...sampleScallopWallPoints(wedgeFrontLeft, wedgeFrontLeft.yBot, wedgeFrontLeft.yTop, true));
+        pts.push({ x: wedgeFrontLeft.xTop, y: reg.bottomYs[lastIdx] });
+        handledRightEdgeByWall = true;
+        break;
+      }
+
+      // Partial outer front-left re-entrant climb (thin film split before reaching w.colTop)
+      if (partialOuterFrontLeft && i === 0) {
+        const { wall: w, splitCol } = partialOuterFrontLeft;
+        const yStart = Math.max(w.yBot, reg.bottomYs[0]);
+        const yJoin = Math.min(w.yTop, reg.topYs[splitCol - 1 - reg.startCol]);
+        pts.push(...sampleScallopWallPoints(w, yStart, yJoin, true));
+        pts.push({ x: splitCol * dx, y: yJoin });
+        pts.push({ x: splitCol * dx, y: reg.topYs[splitCol - reg.startCol] });
+        minTopXAllowed = -Infinity;
+        i = splitCol - reg.startCol - 1;
+        continue;
+      }
+
+      // Partial outer front-right re-entrant drop (thin film split before reaching w.colBot)
+      if (partialOuterFrontRight && colIdx === partialOuterFrontRight.splitCol) {
+        const { wall: w, splitCol } = partialOuterFrontRight;
+        const yJoin = Math.min(w.yTop, reg.topYs[i]);
+        const yEnd = Math.max(w.yBot, reg.bottomYs[lastIdx]);
+        pts.push({ x: splitCol * dx, y: reg.topYs[i - 1] });
+        pts.push({ x: splitCol * dx, y: yJoin });
+        pts.push(...sampleScallopWallPoints(w, yJoin, yEnd, true));
+        if (yEnd > reg.bottomYs[lastIdx] + 0.5) {
+          pts.push({ x: w.xBot, y: reg.bottomYs[lastIdx] });
+        } else {
+          botStartTrimMaxX = w.xBot;
+        }
+        handledRightEdgeByWall = true;
+        break;
+      }
+
+      // Detached diagonal ribbon against upper front-left re-entrant wall
+      if (diagOuterFrontLeft && i === 0) {
+        const { wall: w, yJoin } = diagOuterFrontLeft;
+        pts.push(...sampleScallopWallPoints(w, yJoin, w.yTop, true));
+        pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+        handledRightEdgeByWall = true;
+        break;
+      }
+
+      // Detached diagonal ribbon against upper front-right re-entrant wall
+      if (diagOuterFrontRight && colIdx === diagOuterFrontRight.wall.colTop) {
+        const { wall: w, yJoin } = diagOuterFrontRight;
+        if (reg.startCol < w.colTop) {
+          pts.push({ x: w.xTop, y: w.yTop });
+        }
+        pts.push(...sampleScallopWallPoints(w, w.yTop, yJoin, true));
+        pts.push({ x: xEnd, y: yJoin });
+        pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+        handledRightEdgeByWall = true;
+        break;
+      }
+
+      // Re-entrant outer climbing front left wall (regB under left overhang)
+      if (reentrantOuterFrontLeft && colIdx === reentrantOuterFrontLeftStartCol) {
+        const w = reentrantOuterFrontLeft;
+        const dropLocal = w.colTop + 1 - reg.startCol;
+        if (w.yBot > reg.bottomYs[0] + 0.5 || i > 0) {
+          pts.push({ x: w.xBot, y: w.yBot });
+        }
+        pts.push(...sampleScallopWallPoints(w, w.yBot, w.yTop, true));
+        pts.push({ x: (w.colTop + 1) * dx, y: reg.topYs[dropLocal] });
+        minTopXAllowed = -Infinity;
+        i = dropLocal;
+        continue;
+      }
+
+      // Descending outer re-entrant right wall on top edge (e.g. film going down-right into right wedge)
+      if (
+        seamCols?.has(colIdx) &&
+        i > topStartIdx &&
+        reg.topYs[i] < reg.topYs[i - 1] - 50
+      ) {
+        const descendOuterRight = findPreferredWall(
+          (w) =>
+            w.targetSide === 'front' &&
+            w.wallSide === 'right' &&
+            Boolean(w.isReentrant) &&
+            w.stepId !== reg.stepId &&
+            Math.floor((w.xTop + 1e-6) / dx) === colIdx &&
+            reg.topYs[i - 1] >= w.yTop - 5 &&
+            reg.topYs[i] < w.yTop - 5 &&
+            reg.bottomYs[lastIdx] <= w.yBot + 5
+        );
+        if (descendOuterRight) {
+          pts.push({ x: descendOuterRight.xTop, y: descendOuterRight.yTop });
+          pts.push(
+            ...sampleScallopWallPoints(
+              descendOuterRight,
+              descendOuterRight.yTop,
+              descendOuterRight.yBot,
+              true
+            )
+          );
+          if (descendOuterRight.yBot > reg.bottomYs[lastIdx] + 0.5) {
+            pts.push({ x: descendOuterRight.xBot, y: reg.bottomYs[lastIdx] });
+          }
+          botStartTrimMaxX = descendOuterRight.xBot;
+          handledRightEdgeByWall = true;
+          break;
+        }
+      }
+
+      // Re-entrant outer dropping front right wall (regB under right overhang)
+      if (reentrantOuterFrontRight && colIdx === reentrantOuterFrontRight.colTop - 1) {
+        const w = reentrantOuterFrontRight;
+        pts.push({ x: (colIdx + 1) * dx, y: reg.topYs[i] });
+        pts.push(...sampleScallopWallPoints(w, w.yTop, w.yBot, true));
+        if (w.yBot > reg.bottomYs[lastIdx] + 0.5) {
+          pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+        } else {
+          botStartTrimMaxX = w.xBot;
+        }
+        handledRightEdgeByWall = true;
+        break;
+      }
+
+      // Backside re-entrant inner left overhang exiting right edge (emit vertical branch seam across dropCol)
+      if (
+        reentrantInnerBackLeftOverhang &&
+        colIdx === reentrantInnerBackLeftDropCol - 1
+      ) {
+        const w = reentrantInnerBackLeftOverhang;
+        const dropCol = reentrantInnerBackLeftDropCol;
+        const botLocal = dropCol - reg.startCol;
+        pts.push({ x: (colIdx + 1) * dx, y: reg.topYs[i] });
+        if (reg.topYs[botLocal] > w.yBot + 5) {
+          pts.push({ x: dropCol * dx, y: reg.topYs[botLocal] });
+          pts.push({ x: (dropCol + 1) * dx, y: reg.topYs[botLocal] });
+        }
+        pts.push({ x: (dropCol + 1) * dx, y: w.yBot });
+        const yB = Math.max(w.yTop, reg.bottomYs[lastIdx]);
+        pts.push(...sampleScallopWallPoints(w, w.yBot, yB, true));
+        if (yB > reg.bottomYs[lastIdx] + 0.5) {
+          pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+        } else {
+          botStartTrimMaxX = evalWallXAtY(w, reg.bottomYs[lastIdx]);
+        }
+        handledRightEdgeByWall = true;
+        break;
+      }
+
       // Check for frontside left trench wall starting at colTop
-      const frontLeftWall = scallopWalls.find(
+      const frontLeftWall = findPreferredWall(
         (w) =>
           w.targetSide === 'front' &&
           w.wallSide === 'left' &&
           w.colTop === colIdx &&
+          (!w.isReentrant || (w.colBot >= w.colTop && (w.stepId === reg.stepId || reg.endCol > w.colBot))) &&
           reg.topYs[i] > w.yBot + 5 &&
-          reg.bottomYs[i] < w.yTop - 5
+          reg.bottomYs[i] < w.yTop - 5,
+        reg.stepId
       );
       if (frontLeftWall) {
         const yStart = Math.min(frontLeftWall.yTop, reg.topYs[i]);
@@ -4515,7 +6411,6 @@ export function buildRenderPolygons(
             }
           }
         } else {
-          // Wall exits through the bottom / end of this partial upper region (multi-layer or through-wafer)
           const yEnd = Math.max(frontLeftWall.yBot, reg.bottomYs[lastIdx]);
           if (yStart - yEnd > 5) {
             const xWallStart = evalWallXAtY(frontLeftWall, yStart);
@@ -4542,14 +6437,16 @@ export function buildRenderPolygons(
       }
 
       // Check for frontside right trench wall starting at colBot
-      const frontRightWall = scallopWalls.find(
+      const frontRightWall = findPreferredWall(
         (w) =>
           w.targetSide === 'front' &&
           w.wallSide === 'right' &&
           w.colBot === colIdx &&
+          (!w.isReentrant || (w.colBot <= w.colTop && (w.stepId === reg.stepId || reg.startCol < w.colTop))) &&
           reg.endCol >= w.colTop &&
           reg.topYs[w.colTop - reg.startCol] > w.yBot + 5 &&
-          reg.bottomYs[w.colTop - reg.startCol] < w.yTop - 5
+          reg.bottomYs[w.colTop - reg.startCol] < w.yTop - 5,
+        reg.stepId
       );
       if (frontRightWall) {
         const topLocalIdx = frontRightWall.colTop - reg.startCol;
@@ -4566,17 +6463,168 @@ export function buildRenderPolygons(
         }
       }
 
-      const x = colIdx * dx + dx;
+      // Hug underlying backside scalloped / tapered / re-entrant trench walls on film top edge
+      const underlyingBackLeft = scallopWalls.find(
+        (w) =>
+          w.targetSide === 'back' &&
+          w.wallSide === 'left' &&
+          (w.isReentrant || w.scallopDepth > 0.5) &&
+          (!w.isReentrant || w.colBot >= w.colTop) &&
+          w.stepId !== reg.stepId &&
+          w.colTop === colIdx &&
+          reg.endCol >= w.colBot &&
+          reg.topYs[i] <= w.yTop + 5 &&
+          reg.topYs[w.colBot - reg.startCol] >= w.yBot - 5 &&
+          (!w.isReentrant || !hasSeparateWedgeRegion(w, reg))
+      );
+      if (underlyingBackLeft) {
+        const botLocalIdx = underlyingBackLeft.colBot - reg.startCol;
+        const yStart = Math.max(underlyingBackLeft.yTop, reg.topYs[i]);
+        const yEnd = Math.min(underlyingBackLeft.yBot, reg.topYs[botLocalIdx]);
+        if (yEnd - yStart > 5) {
+          const xWallStart = evalWallXAtY(underlyingBackLeft, yStart);
+          while (
+            pts.length > 2 &&
+            pts[pts.length - 1].x >= xWallStart - 0.1 &&
+            Math.abs(pts[pts.length - 1].y - yStart) < 5
+          ) {
+            pts.pop();
+          }
+          const wallPts = sampleScallopWallPoints(underlyingBackLeft, yStart, yEnd, true);
+          if (wallPts.length > 0) {
+            pts.push(...wallPts);
+            minTopXAllowed = -Infinity;
+            i = Math.max(i, botLocalIdx - 1);
+            continue;
+          }
+        }
+      }
+
+      const underlyingBackRight = scallopWalls.find(
+        (w) =>
+          w.targetSide === 'back' &&
+          w.wallSide === 'right' &&
+          (w.isReentrant || w.scallopDepth > 0.5) &&
+          (!w.isReentrant || w.colBot <= w.colTop) &&
+          w.stepId !== reg.stepId &&
+          w.colBot === colIdx &&
+          reg.startCol <= w.colTop &&
+          reg.topYs[w.colTop - reg.startCol] <= w.yTop + 5 &&
+          reg.topYs[i] >= w.yBot - 5 &&
+          (!w.isReentrant || !hasSeparateWedgeRegion(w, reg))
+      );
+      if (underlyingBackRight) {
+        const topLocalIdx = underlyingBackRight.colTop - reg.startCol;
+        const yStart = Math.min(underlyingBackRight.yBot, reg.topYs[i]);
+        const yEnd = Math.max(underlyingBackRight.yTop, reg.topYs[topLocalIdx]);
+        if (yStart - yEnd > 5) {
+          const wallPts = sampleScallopWallPoints(underlyingBackRight, yStart, yEnd, true);
+          if (wallPts.length > 0) {
+            pts.push(...wallPts);
+            minTopXAllowed = evalWallXAtY(underlyingBackRight, yEnd);
+            i = Math.max(i, topLocalIdx - 1);
+            continue;
+          }
+        }
+      }
+
+      const isLocalVMin =
+        i > topStartIdx &&
+        i + 1 < reg.topYs.length &&
+        reg.topYs[i] < reg.topYs[i - 1] - 0.5 &&
+        reg.topYs[i] < reg.topYs[i + 1] - 0.5 &&
+        Math.abs(reg.topYs[i - 1] - reg.topYs[i]) < 200 &&
+        Math.abs(reg.topYs[i + 1] - reg.topYs[i]) < 200 &&
+        !seamCols?.has(colIdx) &&
+        !seamCols?.has(colIdx + 1);
+      const x = isLocalVMin ? (colIdx + 0.5) * dx : colIdx * dx + dx;
       if (x <= minTopXAllowed + 0.1) continue;
       minTopXAllowed = -Infinity;
       pts.push({ x, y: reg.topYs[i] });
+      if (!isLocalVMin && i + 1 < reg.topYs.length) {
+        const dyNext = reg.topYs[i + 1] - reg.topYs[i];
+        const isSeamStep = seamCols?.has(colIdx + 1) && Math.abs(dyNext) > 15;
+        const isMouthCliff =
+          mouthCols.has(colIdx + 1) &&
+          Math.abs(dyNext) > 250 &&
+          ((i > topStartIdx &&
+            (Math.sign(reg.topYs[i] - reg.topYs[i - 1]) !== Math.sign(dyNext) ||
+              Math.abs(dyNext) > 2 * Math.abs(reg.topYs[i] - reg.topYs[i - 1]) + 50)) ||
+            (i + 2 < reg.topYs.length &&
+              (Math.sign(reg.topYs[i + 2] - reg.topYs[i + 1]) !== Math.sign(dyNext) ||
+                Math.abs(dyNext) > 2 * Math.abs(reg.topYs[i + 2] - reg.topYs[i + 1]) + 50)));
+        if (isSeamStep || isMouthCliff) {
+          pts.push({ x, y: reg.topYs[i + 1] });
+        }
+      }
     }
 
     // Right boundary edge (x = (reg.endCol + 1) * dx): goes top -> bottom
     let rightBottomTrimX = botStartTrimMaxX;
     let botStartIdx = lastIdx;
     if (handledRightEdgeByWall) {
-      // Right edge already traced seamlessly via frontLeftWall exit
+      // Right edge already traced seamlessly via wall exit
+    } else if (standaloneFrontLeftInner) {
+      const w = standaloneFrontLeftInner;
+      pts.push({ x: xEnd, y: w.yTop });
+      pts.push(...sampleScallopWallPoints(w, w.yTop, w.yBot, true));
+      pts.push({ x: xStart, y: w.yBot });
+      skipBottomLoop = true;
+    } else if (standaloneFrontRightInner) {
+      pts.push({ x: xEnd, y: standaloneFrontRightInner.yBot });
+    } else if (standaloneBackLeftInner) {
+      pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+    } else if (standaloneBackRightInner) {
+      pts.push({ x: xEnd, y: reg.bottomYs[lastIdx] });
+    } else if (wedgeBackLeft) {
+      pts.push({ x: wedgeBackLeft.xTop, y: wedgeBackLeft.yTop });
+      pts.push(...sampleScallopWallPoints(wedgeBackLeft, wedgeBackLeft.yTop, wedgeBackLeft.yBot, true));
+      skipBottomLoop = true;
+    } else if (wedgeBackRight) {
+      pts.push({ x: wedgeBackRight.xBot, y: wedgeBackRight.yBot });
+      pts.push(...sampleScallopWallPoints(wedgeBackRight, wedgeBackRight.yBot, wedgeBackRight.yTop, true));
+      skipBottomLoop = true;
+    } else if (partialOuterBackRight) {
+      pts.push({ x: partialOuterBackRight.wall.xBot, y: reg.topYs[lastIdx] });
+    } else if (diagOuterBackLeft) {
+      const { wall: w, yJoin } = diagOuterBackLeft;
+      pts.push({ x: w.xTop, y: w.yTop });
+      pts.push(...sampleScallopWallPoints(w, w.yTop, yJoin, true));
+      if (yJoin !== w.yBot) {
+        pts.push({ x: xStart, y: yJoin });
+      }
+      skipBottomLoop = true;
+    } else if (diagOuterBackRight) {
+      const { wall: w, yJoin } = diagOuterBackRight;
+      if (yJoin !== w.yBot) {
+        pts.push({ x: xEnd, y: yJoin });
+      } else {
+        pts.push({ x: w.xBot, y: reg.topYs[lastIdx] });
+      }
+      pts.push(...sampleScallopWallPoints(w, yJoin, w.yTop, true));
+      skipBottomLoop = true;
+    } else if (
+      rightEdgeWall &&
+      rightEdgeWall.targetSide === 'front' &&
+      rightEdgeWall.isReentrant &&
+      rightEdgeWall.colBot < rightEdgeWall.colTop &&
+      reg.startCol < rightEdgeWall.colBot &&
+      reg.bottomYs[rightEdgeWall.colBot - 1 - reg.startCol] >= rightEdgeWall.yTop - 5 &&
+      (!rightEdgeWall.isDepositionWall ||
+        reg.bottomYs[rightEdgeWall.colBot - reg.startCol] < rightEdgeWall.yTop - 5)
+    ) {
+      // Frontside re-entrant inner left overhang bottom-right edge (regA)
+      const w = rightEdgeWall;
+      const yA = Math.min(reg.topYs[lastIdx], w.yTop);
+      if (yA < reg.topYs[lastIdx] - 0.5) {
+        pts.push({ x: xEnd, y: reg.topYs[lastIdx] });
+      }
+      pts.push(...sampleScallopWallPoints(w, yA, w.yBot, true));
+      pts.push({ x: w.colBot * dx, y: w.yBot });
+      const resumeLocal = w.colBot - 1 - reg.startCol;
+      pts.push({ x: w.colBot * dx, y: reg.bottomYs[resumeLocal] });
+      botStartIdx = resumeLocal;
+      rightBottomTrimX = Infinity;
     } else if (rightEdgeWall) {
       const yMinWall = Math.min(rightEdgeWall.yTop, rightEdgeWall.yBot);
       const yMaxWall = Math.max(rightEdgeWall.yTop, rightEdgeWall.yBot);
@@ -4600,15 +6648,16 @@ export function buildRenderPolygons(
         rightBottomTrimX = Infinity;
       }
     } else {
-      // Check if a backside left wall exits cleanly through the right edge of a partial backside region
-      const partialBackLeftRightEdge = scallopWalls.find(
+      const partialBackLeftRightEdge = findPreferredWall(
         (w) =>
           w.targetSide === 'back' &&
           w.wallSide === 'left' &&
+          (!w.isReentrant || w.stepId === reg.stepId) &&
           reg.endCol < w.colBot &&
           reg.startCol <= w.colTop &&
           reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
-          reg.topYs[lastIdx] > w.yTop + 5
+          reg.topYs[lastIdx] > w.yTop + 5,
+        reg.stepId
       );
       if (partialBackLeftRightEdge) {
         const yB = Math.min(partialBackLeftRightEdge.yBot, reg.topYs[lastIdx]);
@@ -4642,19 +6691,93 @@ export function buildRenderPolygons(
       }
     }
 
+    const reentrantOuterBackRight =
+      partialOuterBackRight || diagOuterBackRight
+        ? undefined
+        : findPreferredWall(
+            (w) =>
+              w.targetSide === 'back' &&
+              w.wallSide === 'right' &&
+              Boolean(w.isReentrant) &&
+              w.stepId !== reg.stepId &&
+              reg.startCol < w.colTop &&
+              reg.endCol >= w.colTop &&
+              reg.topYs[w.colTop - reg.startCol] >= w.yBot - 5 &&
+              reg.bottomYs[w.colTop - reg.startCol] < w.yBot - 5 &&
+              reg.bottomYs[w.colTop - 1 - reg.startCol] > w.yTop + 5 &&
+              (w.colTop === reg.endCol ||
+                reg.bottomYs[w.colTop + 1 - reg.startCol] - reg.bottomYs[w.colTop - reg.startCol] > 50) &&
+              (reg.endCol + 1) * dx >= Math.min(w.xTop, w.xBot) - 1 &&
+              (reg.endCol + 1) * dx <= Math.max(w.xTop, w.xBot) + dx + 1
+          );
+    const reentrantOuterBackRightStartCol = reentrantOuterBackRight
+      ? Math.min(
+          reg.endCol,
+          Math.max(
+            reentrantOuterBackRight.colTop,
+            Math.floor((Math.max(reentrantOuterBackRight.xTop, reentrantOuterBackRight.xBot) - 1e-6) / dx)
+          )
+        )
+      : -1;
+
     // Bottom surface right to left
     let maxBotXAllowed = rightBottomTrimX;
-    for (let i = botStartIdx; i >= 0; i--) {
+    for (let i = skipBottomLoop ? -1 : botStartIdx; i >= stopBotAtCol; i--) {
       const colIdx = reg.startCol + i;
 
+      if (partialOuterBackRight && i === lastIdx) {
+        const { wall: w, splitCol } = partialOuterBackRight;
+        const yStart = Math.min(w.yBot, reg.topYs[lastIdx]);
+        const yJoin = Math.max(w.yTop, reg.bottomYs[splitCol - reg.startCol]);
+        pts.push(...sampleScallopWallPoints(w, yStart, yJoin, true));
+        pts.push({ x: splitCol * dx, y: yJoin });
+        pts.push({ x: splitCol * dx, y: reg.bottomYs[splitCol - 1 - reg.startCol] });
+        maxBotXAllowed = Infinity;
+        i = splitCol - reg.startCol;
+        continue;
+      }
+
+      if (partialOuterBackLeft && colIdx === partialOuterBackLeft.splitCol - 1) {
+        const { wall: w, splitCol } = partialOuterBackLeft;
+        const yJoin = Math.max(w.yTop, reg.bottomYs[i]);
+        const yEnd = Math.min(w.yBot, reg.topYs[0]);
+        pts.push({ x: splitCol * dx, y: reg.bottomYs[i + 1] });
+        pts.push({ x: splitCol * dx, y: yJoin });
+        pts.push(...sampleScallopWallPoints(w, yJoin, yEnd, true));
+        break;
+      }
+
+      if (reentrantOuterBackRight && colIdx === reentrantOuterBackRightStartCol) {
+        const w = reentrantOuterBackRight;
+        const dropLocal = w.colTop - 1 - reg.startCol;
+        if (i === lastIdx) {
+          pts.pop();
+        }
+        pts.push({ x: w.xBot, y: w.yBot });
+        pts.push(...sampleScallopWallPoints(w, w.yBot, w.yTop, true));
+        pts.push({ x: w.colTop * dx, y: reg.bottomYs[dropLocal] });
+        maxBotXAllowed = Infinity;
+        i = dropLocal;
+        continue;
+      }
+
+      if (reentrantOuterBackLeft && colIdx === reentrantOuterBackLeft.colTop + 1) {
+        const w = reentrantOuterBackLeft;
+        pts.push({ x: colIdx * dx, y: reg.bottomYs[i] });
+        pts.push(...sampleScallopWallPoints(w, w.yTop, w.yBot, true));
+        break;
+      }
+
       // Backside right trench wall (iterating right-to-left: meets colTop first, goes up to colBot)
-      const backRightWall = scallopWalls.find(
+      const backRightWall = findPreferredWall(
         (w) =>
           w.targetSide === 'back' &&
           w.wallSide === 'right' &&
           w.colTop === colIdx &&
+          (!w.isReentrant || (w.colBot <= w.colTop && (w.stepId === reg.stepId || reg.startCol < w.colBot))) &&
           reg.topYs[i] > w.yTop + 5 &&
-          reg.bottomYs[i] < w.yBot - 5
+          reg.bottomYs[i] < w.yBot - 5,
+        reg.stepId
       );
       if (backRightWall) {
         const yStart = Math.max(backRightWall.yTop, reg.bottomYs[i]);
@@ -4705,13 +6828,15 @@ export function buildRenderPolygons(
       }
 
       // Backside left trench wall (iterating right-to-left: meets colBot first, goes down to colTop)
-      const backLeftWall = scallopWalls.find(
+      const backLeftWall = findPreferredWall(
         (w) =>
           w.targetSide === 'back' &&
           w.wallSide === 'left' &&
           w.colBot === colIdx &&
+          (!w.isReentrant || (w.colBot >= w.colTop && (w.stepId === reg.stepId || reg.endCol > w.colBot))) &&
           reg.startCol <= w.colTop &&
-          reg.bottomYs[i] > w.yTop + 5
+          reg.bottomYs[i] > w.yTop + 5,
+        reg.stepId
       );
       if (backLeftWall) {
         const topLocalIdx = backLeftWall.colTop - reg.startCol;
@@ -4728,17 +6853,19 @@ export function buildRenderPolygons(
         }
       }
 
-      // Hug underlying frontside re-entrant trench walls cleanly when filling/coating a cavity
+      // Hug underlying frontside scalloped, tapered, or re-entrant trench walls cleanly
       const underlyingFrontLeft = scallopWalls.find(
         (w) =>
           w.targetSide === 'front' &&
           w.wallSide === 'left' &&
-          w.isReentrant &&
+          (w.isReentrant || w.scallopDepth > 0.5) &&
+          (!w.isReentrant || w.colBot >= w.colTop) &&
           w.stepId !== reg.stepId &&
           w.colBot === colIdx &&
           reg.startCol <= w.colTop &&
           reg.bottomYs[w.colTop - reg.startCol] >= w.yTop - 5 &&
-          reg.bottomYs[i] <= w.yBot + 5
+          reg.bottomYs[i] <= w.yBot + 5 &&
+          (!w.isReentrant || !hasSeparateWedgeRegion(w, reg))
       );
       if (underlyingFrontLeft) {
         const topLocalIdx = underlyingFrontLeft.colTop - reg.startCol;
@@ -4759,12 +6886,14 @@ export function buildRenderPolygons(
         (w) =>
           w.targetSide === 'front' &&
           w.wallSide === 'right' &&
-          w.isReentrant &&
+          (w.isReentrant || w.scallopDepth > 0.5) &&
+          (!w.isReentrant || w.colBot <= w.colTop) &&
           w.stepId !== reg.stepId &&
           w.colTop === colIdx &&
           reg.startCol <= w.colBot &&
           reg.bottomYs[i] >= w.yTop - 5 &&
-          reg.bottomYs[w.colBot - reg.startCol] <= w.yBot + 5
+          reg.bottomYs[w.colBot - reg.startCol] <= w.yBot + 5 &&
+          (!w.isReentrant || !hasSeparateWedgeRegion(w, reg))
       );
       if (underlyingFrontRight) {
         const botLocalIdx = underlyingFrontRight.colBot - reg.startCol;
@@ -4789,47 +6918,238 @@ export function buildRenderPolygons(
         }
       }
 
-      const x = colIdx * dx;
+      const isLocalVMin =
+        i < botStartIdx &&
+        i > stopBotAtCol &&
+        reg.bottomYs[i] < reg.bottomYs[i - 1] - 0.5 &&
+        reg.bottomYs[i] < reg.bottomYs[i + 1] - 0.5 &&
+        Math.abs(reg.bottomYs[i - 1] - reg.bottomYs[i]) < 200 &&
+        Math.abs(reg.bottomYs[i + 1] - reg.bottomYs[i]) < 200 &&
+        !seamCols?.has(colIdx) &&
+        !seamCols?.has(colIdx + 1);
+      const x = isLocalVMin ? (colIdx + 0.5) * dx : colIdx * dx;
       if (x >= maxBotXAllowed - 0.1) continue;
       if (leftBottomTrimX > -Infinity && x <= leftBottomTrimX + 0.1) continue;
       maxBotXAllowed = Infinity;
       pts.push({ x, y: reg.bottomYs[i] });
+      if (!isLocalVMin && i > stopBotAtCol) {
+        const dyPrev = reg.bottomYs[i - 1] - reg.bottomYs[i];
+        const isSeamStep = seamCols?.has(colIdx) && Math.abs(dyPrev) > 15;
+        const isMouthCliff =
+          mouthCols.has(colIdx) &&
+          Math.abs(dyPrev) > 250 &&
+          ((i < botStartIdx &&
+            (Math.sign(reg.bottomYs[i] - reg.bottomYs[i + 1]) !== Math.sign(dyPrev) ||
+              Math.abs(dyPrev) > 2 * Math.abs(reg.bottomYs[i] - reg.bottomYs[i + 1]) + 50)) ||
+            (i - 2 >= stopBotAtCol &&
+              (Math.sign(reg.bottomYs[i - 2] - reg.bottomYs[i - 1]) !== Math.sign(dyPrev) ||
+                Math.abs(dyPrev) > 2 * Math.abs(reg.bottomYs[i - 2] - reg.bottomYs[i - 1]) + 50)));
+        if (isSeamStep || isMouthCliff) {
+          pts.push({ x, y: reg.bottomYs[i - 1] });
+        }
+      }
+
+      if (stopBotAtCol > 0 && i === stopBotAtCol && reentrantInnerFrontRightOverhang) {
+        pts.push({ x, y: reentrantInnerFrontRightOverhang.yBot });
+        break;
+      }
     }
 
     if (pts.length < 3) continue;
 
-    let path = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
-    for (let i = 1; i < pts.length; i++) {
-      path += ` L ${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)}`;
-    }
-    path += ' Z';
-
-    let yMin = Infinity;
-    let yMax = -Infinity;
-    let xMin = Infinity;
-    let xMax = -Infinity;
-
-    for (const p of pts) {
-      if (p.y < yMin) yMin = p.y;
-      if (p.y > yMax) yMax = p.y;
-      if (p.x < xMin) xMin = p.x;
-      if (p.x > xMax) xMax = p.x;
-    }
-
-    polygons.push({
-      id: `poly_${idCounter}`,
-      materialId: reg.materialId,
-      stepId: reg.stepId,
-      points: pts,
-      pathData: path,
-      yMin,
-      yMax,
-      xMin,
-      xMax,
-    });
+    polygons.push(finalizeRenderedPolygon(`poly_${idCounter}`, reg.materialId, reg.stepId, pts));
   }
 
-  return polygons;
+  return stitchSameStepPolygons(polygons);
+}
+
+function finalizeRenderedPolygon(
+  id: string,
+  materialId: string,
+  stepId: string | undefined,
+  pts: { x: number; y: number }[]
+): RenderedPolygon {
+  let path = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+  for (let i = 1; i < pts.length; i++) {
+    path += ` L ${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)}`;
+  }
+  path += ' Z';
+
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  let xMin = Infinity;
+  let xMax = -Infinity;
+
+  for (const p of pts) {
+    if (p.y < yMin) yMin = p.y;
+    if (p.y > yMax) yMax = p.y;
+    if (p.x < xMin) xMin = p.x;
+    if (p.x > xMax) xMax = p.x;
+  }
+
+  return {
+    id,
+    materialId,
+    stepId,
+    points: pts,
+    pathData: path,
+    yMin,
+    yMax,
+    xMin,
+    xMax,
+  };
+}
+
+function stitchSameStepPolygons(polygons: RenderedPolygon[]): RenderedPolygon[] {
+  const result = [...polygons];
+
+  const cleanLoop = (pts: { x: number; y: number }[]): { x: number; y: number }[] => {
+    const deduped: { x: number; y: number }[] = [];
+    for (const p of pts) {
+      const prev = deduped[deduped.length - 1];
+      if (!prev || Math.abs(prev.x - p.x) > 0.05 || Math.abs(prev.y - p.y) > 0.05) {
+        deduped.push({ x: p.x, y: p.y });
+      }
+    }
+    while (deduped.length > 2) {
+      const first = deduped[0];
+      const last = deduped[deduped.length - 1];
+      if (Math.abs(first.x - last.x) <= 0.05 && Math.abs(first.y - last.y) <= 0.05) {
+        deduped.pop();
+      } else {
+        break;
+      }
+    }
+    // Remove zero-area 180-degree spike folds
+    let trimmed = true;
+    while (trimmed && deduped.length >= 4) {
+      trimmed = false;
+      for (let i = 0; i < deduped.length; i++) {
+        const a = deduped[(i - 1 + deduped.length) % deduped.length];
+        const b = deduped[i];
+        const c = deduped[(i + 1) % deduped.length];
+        if (Math.abs(a.x - c.x) <= 0.05 && Math.abs(a.y - c.y) <= 0.05) {
+          deduped.splice(i, 1);
+          trimmed = true;
+          break;
+        }
+        // Collinear middle point on vertical/horizontal line (both fold-backs and same-direction intermediates)
+        if (Math.abs(a.x - b.x) <= 0.05 && Math.abs(b.x - c.x) <= 0.05) {
+          deduped.splice(i, 1);
+          trimmed = true;
+          break;
+        }
+        if (Math.abs(a.y - b.y) <= 0.05 && Math.abs(b.y - c.y) <= 0.05) {
+          deduped.splice(i, 1);
+          trimmed = true;
+          break;
+        }
+      }
+    }
+    return deduped;
+  };
+
+  for (let i = 0; i < result.length; i++) {
+    const cleaned = cleanLoop(result[i].points);
+    if (cleaned.length !== result[i].points.length && cleaned.length >= 3) {
+      result[i] = finalizeRenderedPolygon(result[i].id, result[i].materialId, result[i].stepId, cleaned);
+    }
+  }
+
+  let mergedAny = true;
+  while (mergedAny) {
+    mergedAny = false;
+    for (let i = 0; i < result.length && !mergedAny; i++) {
+      const pA = result[i];
+      if (!pA.stepId) continue;
+      for (let j = i + 1; j < result.length && !mergedAny; j++) {
+        const pB = result[j];
+        if (pA.materialId !== pB.materialId || pA.stepId !== pB.stepId) continue;
+        if (pA.xMax < pB.xMin - 1 || pB.xMax < pA.xMin - 1) continue;
+        if (pA.yMax < pB.yMin - 1 || pB.yMax < pA.yMin - 1) continue;
+
+        const ptsA = pA.points;
+        const ptsB = pB.points;
+        const nA = ptsA.length;
+        const nB = ptsB.length;
+        const seams: {
+          idxA: number;
+          idxB: number;
+          x: number;
+          yLo: number;
+          yHi: number;
+        }[] = [];
+
+        for (let ia = 0; ia < nA; ia++) {
+          const a0 = ptsA[ia];
+          const a1 = ptsA[(ia + 1) % nA];
+          if (Math.abs(a0.x - a1.x) > 0.35) continue;
+          const dyA = a1.y - a0.y;
+          if (Math.abs(dyA) <= 2) continue;
+
+          for (let ib = 0; ib < nB; ib++) {
+            const b0 = ptsB[ib];
+            const b1 = ptsB[(ib + 1) % nB];
+            if (Math.abs(b0.x - b1.x) > 0.35) continue;
+            if (Math.abs(a0.x - b0.x) > 0.5) continue;
+            const dyB = b1.y - b0.y;
+            if (Math.abs(dyB) <= 2 || dyA * dyB >= 0) continue;
+
+            const yLo = Math.max(Math.min(a0.y, a1.y), Math.min(b0.y, b1.y));
+            const yHi = Math.min(Math.max(a0.y, a1.y), Math.max(b0.y, b1.y));
+            if (yHi - yLo > 2) {
+              seams.push({ idxA: ia, idxB: ib, x: 0.5 * (a0.x + b0.x), yLo, yHi });
+            }
+          }
+        }
+
+        // Stitch only along a single shared vertical branch edge so closed keyhole rings remain valid
+        if (seams.length === 1) {
+          const s = seams[0];
+          const a0 = ptsA[s.idxA];
+          const a1 = ptsA[(s.idxA + 1) % nA];
+          const b0 = ptsB[s.idxB];
+          const b1 = ptsB[(s.idxB + 1) % nB];
+          const aAsc = a1.y > a0.y;
+          const yStartA = aAsc ? s.yLo : s.yHi;
+          const yEndA = aAsc ? s.yHi : s.yLo;
+
+          const spliced: { x: number; y: number }[] = [];
+          for (let k = 0; k <= s.idxA; k++) {
+            spliced.push(ptsA[k]);
+          }
+          if (Math.abs(a0.y - yStartA) > 0.2) {
+            spliced.push({ x: s.x, y: yStartA });
+          }
+          if (Math.abs(b1.y - yStartA) > 0.2) {
+            spliced.push({ x: s.x, y: yStartA });
+          }
+          for (let step = 1; step < nB; step++) {
+            spliced.push(ptsB[(s.idxB + step) % nB]);
+          }
+          spliced.push(b0);
+          if (Math.abs(b0.y - yEndA) > 0.2) {
+            spliced.push({ x: s.x, y: yEndA });
+          }
+          if (Math.abs(a1.y - yEndA) > 0.2) {
+            spliced.push({ x: s.x, y: yEndA });
+          }
+          for (let k = s.idxA + 1; k < nA; k++) {
+            spliced.push(ptsA[k]);
+          }
+
+          const cleaned = cleanLoop(spliced);
+          if (cleaned.length >= 3) {
+            result[i] = finalizeRenderedPolygon(pA.id, pA.materialId, pA.stepId, cleaned);
+            result.splice(j, 1);
+            mergedAny = true;
+          }
+        }
+      }
+    }
+  }
+
+  return result;
 }
 
 // Helpers

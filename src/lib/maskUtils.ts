@@ -615,3 +615,169 @@ export function calculateMaskMetrics(
     minSpaceNm: minSpaceNm === Infinity ? 0 : Math.round(minSpaceNm),
   };
 }
+
+export type MaskWindowArrayDirection = 'right' | 'left' | 'center';
+
+export interface MaskWindowArrayOptions {
+  count: number;
+  pitchNm: number;
+  direction: MaskWindowArrayDirection;
+}
+
+/**
+ * Duplicates a mask window shifted adjacent to the source so it remains visible and editable.
+ */
+export function duplicateMaskWindow(
+  source: MaskWindow,
+  waferWidth: number
+): MaskWindow {
+  const width = Math.max(10, Math.min(waferWidth, Math.round(source.xEnd - source.xStart)));
+  const defaultPitch = Math.max(width + 100, Math.round(width * 2));
+
+  let nextStart: number;
+  if (source.xStart + defaultPitch + width <= waferWidth) {
+    nextStart = source.xStart + defaultPitch;
+  } else if (source.xStart - defaultPitch >= 0) {
+    nextStart = source.xStart - defaultPitch;
+  } else if (source.xEnd + 50 <= waferWidth) {
+    nextStart = Math.min(waferWidth - width, source.xStart + Math.max(50, Math.round((waferWidth - source.xEnd) / 2)));
+  } else if (source.xStart - 50 >= 0) {
+    nextStart = Math.max(0, source.xStart - Math.max(50, Math.round(source.xStart / 2)));
+  } else {
+    nextStart = Math.max(0, Math.min(waferWidth - width, source.xStart + (source.xStart + width + 50 <= waferWidth ? 50 : -50)));
+  }
+
+  const nextEnd = Math.min(waferWidth, Math.round(nextStart) + width);
+  const clampedStart = Math.max(0, nextEnd - width);
+
+  const inheritedBindings = source.paramBindings?.width
+    ? { width: source.paramBindings.width }
+    : undefined;
+
+  return {
+    id: `w_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    xStart: clampedStart,
+    xEnd: nextEnd,
+    ...(source.fixedWidth ? { fixedWidth: true } : {}),
+    ...(inheritedBindings ? { paramBindings: inheritedBindings } : {}),
+  };
+}
+
+/**
+ * Builds a 1D periodic array of apertures/blockers starting from or centered around `sourceId`.
+ */
+export function createMaskWindowArray(
+  windows: MaskWindow[],
+  sourceId: string,
+  options: MaskWindowArrayOptions,
+  waferWidth: number
+): {
+  windows: MaskWindow[];
+  addedIds: string[];
+  totalPlaced: number;
+  skippedOutOfBounds: number;
+} {
+  const sourceIdx = windows.findIndex((w) => w.id === sourceId);
+  if (sourceIdx < 0) {
+    return { windows, addedIds: [], totalPlaced: 0, skippedOutOfBounds: 0 };
+  }
+
+  const source = windows[sourceIdx];
+  const count = Math.max(2, Math.min(100, Math.round(options.count)));
+  const pitchNm = Math.max(10, Math.round(options.pitchNm));
+  const width = Math.max(10, Math.min(waferWidth, Math.round(source.xEnd - source.xStart)));
+  const inheritedBindings = source.paramBindings?.width
+    ? { width: source.paramBindings.width }
+    : undefined;
+  const stamp = Date.now();
+
+  if (options.direction === 'center') {
+    const sourceCenter = (source.xStart + source.xEnd) / 2;
+    const halfSpan = ((count - 1) * pitchNm) / 2;
+    const generated: MaskWindow[] = [];
+    let skipped = 0;
+
+    for (let i = 0; i < count; i++) {
+      const cx = sourceCenter - halfSpan + i * pitchNm;
+      const rawStart = Math.round(cx - width / 2);
+      const rawEnd = rawStart + width;
+      if (rawEnd <= 0 || rawStart >= waferWidth) {
+        skipped++;
+        continue;
+      }
+      const cStart = Math.max(0, rawStart);
+      const cEnd = Math.min(waferWidth, rawEnd);
+      if (cEnd - cStart < 10) {
+        skipped++;
+        continue;
+      }
+      generated.push({
+        id:
+          generated.length === 0
+            ? source.id
+            : `w_arr_${stamp}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+        xStart: cStart,
+        xEnd: cEnd,
+        ...(source.fixedWidth ? { fixedWidth: true } : {}),
+        ...(inheritedBindings ? { paramBindings: inheritedBindings } : {}),
+      });
+    }
+
+    if (generated.length === 0) {
+      return { windows, addedIds: [], totalPlaced: 1, skippedOutOfBounds: skipped };
+    }
+
+    const nextWindows = [
+      ...windows.slice(0, sourceIdx),
+      ...generated,
+      ...windows.slice(sourceIdx + 1),
+    ];
+    return {
+      windows: nextWindows,
+      addedIds: generated.slice(1).map((g) => g.id),
+      totalPlaced: generated.length,
+      skippedOutOfBounds: skipped,
+    };
+  }
+
+  // 'right' or 'left': preserve source window untouched, append valid shifted copies
+  const copies: MaskWindow[] = [];
+  let skipped = 0;
+
+  for (let i = 1; i < count; i++) {
+    const delta = options.direction === 'right' ? i * pitchNm : -i * pitchNm;
+    const rawStart = Math.round(source.xStart + delta);
+    const rawEnd = rawStart + width;
+    if (rawEnd <= 0 || rawStart >= waferWidth) {
+      skipped++;
+      continue;
+    }
+    const cStart = Math.max(0, rawStart);
+    const cEnd = Math.min(waferWidth, rawEnd);
+    if (cEnd - cStart < 10) {
+      skipped++;
+      continue;
+    }
+    copies.push({
+      id: `w_arr_${stamp}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+      xStart: cStart,
+      xEnd: cEnd,
+      ...(source.fixedWidth ? { fixedWidth: true } : {}),
+      ...(inheritedBindings ? { paramBindings: inheritedBindings } : {}),
+    });
+  }
+
+  const nextWindows = [
+    ...windows.slice(0, sourceIdx + 1),
+    ...copies,
+    ...windows.slice(sourceIdx + 1),
+  ];
+
+  return {
+    windows: nextWindows,
+    addedIds: copies.map((c) => c.id),
+    totalPlaced: 1 + copies.length,
+    skippedOutOfBounds: skipped,
+  };
+}
+

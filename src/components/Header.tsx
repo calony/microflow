@@ -20,6 +20,7 @@ import {
   X,
   FlaskConical,
   Info,
+  Variable,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -31,6 +32,8 @@ interface HeaderProps {
   onOpenMaterials: () => void;
   onOpenEtchLibrary: () => void;
   onOpenMaskLevels: () => void;
+  onOpenVariables?: () => void;
+  variableCount?: number;
   onOpenRunSheet: () => void;
   onOpenMultiStepView: () => void;
   onOpenAbout: () => void;
@@ -51,6 +54,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMaterials,
   onOpenEtchLibrary,
   onOpenMaskLevels,
+  onOpenVariables,
+  variableCount = 0,
   onOpenRunSheet,
   onOpenMultiStepView,
   onOpenAbout,
@@ -272,6 +277,22 @@ export const Header: React.FC<HeaderProps> = ({
             <span>Mask Levels</span>
           </button>
 
+          {onOpenVariables && (
+            <button
+              onClick={onOpenVariables}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+              title="Design Variables & Parametric Geometries"
+            >
+              <Variable className="w-3.5 h-3.5 text-violet-400" />
+              <span>Variables</span>
+              {variableCount > 0 && (
+                <span className="px-1 py-0.2 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 font-mono text-[10px]">
+                  {variableCount}
+                </span>
+              )}
+            </button>
+          )}
+
           <button
             onClick={onOpenRunSheet}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
@@ -285,7 +306,7 @@ export const Header: React.FC<HeaderProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-md transition-all"
           >
             <LayoutGrid className="w-3.5 h-3.5" />
-            <span>Publication Figure</span>
+            <span>Process Figure</span>
           </button>
 
           {/* JSON Import / Export */}
@@ -384,6 +405,26 @@ export const Header: React.FC<HeaderProps> = ({
                 <Scan className="w-4 h-4 text-sky-400" />
                 <span>Mask Levels &amp; 2D GDS</span>
               </button>
+              {onOpenVariables && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onOpenVariables();
+                  }}
+                  className="w-full flex items-center justify-between gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+                >
+                  <span className="flex items-center gap-2.5">
+                    <Variable className="w-4 h-4 text-violet-400" />
+                    <span>Design Variables</span>
+                  </span>
+                  {variableCount > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 font-mono text-[10px]">
+                      {variableCount}
+                    </span>
+                  )}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -404,7 +445,7 @@ export const Header: React.FC<HeaderProps> = ({
                 className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-sky-300 font-semibold hover:bg-slate-800"
               >
                 <LayoutGrid className="w-4 h-4 text-indigo-400" />
-                <span>Publication Figure</span>
+                <span>Process Figure</span>
               </button>
 
               <div className="my-1 border-t border-slate-800" />

@@ -19,6 +19,8 @@ import {
   DicingConfig,
   TapeFrameConfig,
   EtchRecipe,
+  DesignVariable,
+  VariableUnit,
 } from '../types/microfab';
 import { ThicknessUnit, getUnitLabel, formatThickness } from '../lib/units';
 import { resolveResistMaterialId, isCrystallineKohMaterial } from '../lib/materials';
@@ -31,6 +33,11 @@ import {
 } from '../lib/etchRates';
 import { getDefaultStepTitle } from '../lib/stepDefaults';
 import { ThicknessInput } from './ThicknessInput';
+import {
+  ParametricThicknessInput,
+  ParamBindingBadge,
+  ParamBindingPanel,
+} from './ParamBindingControl';
 import {
   Layers,
   Sliders,
@@ -77,6 +84,9 @@ interface StepEditorProps {
   masks?: PhotomaskLevel[];
   onOpenMaskLevelsModal?: (maskId?: string) => void;
   onCreateBlock?: (name?: string) => void;
+  variables?: DesignVariable[];
+  onCreateVariable?: (name: string, value: number, unit: VariableUnit, description?: string) => void;
+  onOpenVariablesModal?: () => void;
 }
 
 export const StepEditor: React.FC<StepEditorProps> = ({
@@ -93,6 +103,9 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   masks,
   onOpenMaskLevelsModal,
   onCreateBlock,
+  variables = [],
+  onCreateVariable,
+  onOpenVariablesModal,
 }) => {
   const [activeTab, setActiveTab] = useState<'process' | 'equipment' | 'notes'>('process');
   const [isAddingBlockInline, setIsAddingBlockInline] = useState<boolean>(false);
@@ -100,6 +113,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   const [isEditingMaskName, setIsEditingMaskName] = useState<boolean>(false);
   const [editingMaskName, setEditingMaskName] = useState<string>('');
   const [bondingImportError, setBondingImportError] = useState<string | null>(null);
+  const [openStreetBindId, setOpenStreetBindId] = useState<string | null>(null);
 
   useEffect(() => {
     setIsEditingMaskName(false);
@@ -109,6 +123,18 @@ export const StepEditor: React.FC<StepEditorProps> = ({
 
   const handleUpdate = (patch: Partial<ProcessStep>) => {
     onUpdateStep({ ...step, ...patch });
+  };
+
+  const setStepParamBinding = (key: string, expr: string | undefined) => {
+    const next = { ...(step.paramBindings || {}) };
+    if (expr && expr.trim()) {
+      next[key] = expr.trim();
+    } else {
+      delete next[key];
+    }
+    handleUpdate({
+      paramBindings: Object.keys(next).length > 0 ? next : undefined,
+    });
   };
 
   const handleUpdateRecipe = (field: keyof ToolRecipe, val: string) => {
@@ -557,7 +583,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Film Thickness ({getUnitLabel(thicknessUnit)})
                     </label>
-                    <ThicknessInput
+                    <ParametricThicknessInput
                       valueNm={step.deposition?.thickness ?? step.thickness ?? 200}
                       onChangeNm={(val) => {
                         handleUpdate({
@@ -576,6 +602,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       minNm={5}
                       stepNm={10}
                       className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      expression={step.paramBindings?.['deposition.thickness']}
+                      variables={variables}
+                      waferWidth={waferWidth}
+                      suggestedVarName="dep_thick"
+                      targetLabel={`${step.title} · Film Thickness`}
+                      onChangeExpression={(expr) => setStepParamBinding('deposition.thickness', expr)}
+                      onCreateVariable={onCreateVariable}
+                      onOpenVariablesModal={onOpenVariablesModal}
                     />
                   </div>
 
@@ -1614,7 +1648,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   <label className="block text-[11px] text-slate-400 mb-1">
                     Resist Thickness ({getUnitLabel(thicknessUnit)})
                   </label>
-                  <ThicknessInput
+                  <ParametricThicknessInput
                     valueNm={step.lithography?.resistThickness ?? 1000}
                     onChangeNm={(val) =>
                       handleUpdate({
@@ -1635,6 +1669,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     minNm={100}
                     stepNm={100}
                     className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                    expression={step.paramBindings?.['lithography.resistThickness']}
+                    variables={variables}
+                    waferWidth={waferWidth}
+                    suggestedVarName="pr_thick"
+                    targetLabel={`${step.title} · Resist Thickness`}
+                    onChangeExpression={(expr) => setStepParamBinding('lithography.resistThickness', expr)}
+                    onCreateVariable={onCreateVariable}
+                    onOpenVariablesModal={onOpenVariablesModal}
                   />
                 </div>
 
@@ -2043,7 +2085,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <label className="block text-[11px] text-slate-400 mb-1">
                         Etch Depth ({getUnitLabel(thicknessUnit)})
                       </label>
-                      <ThicknessInput
+                      <ParametricThicknessInput
                         valueNm={step.etch?.depth ?? step.thickness ?? 300}
                         onChangeNm={(val) => {
                           handleUpdate({
@@ -2064,6 +2106,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                         minNm={10}
                         stepNm={25}
                         className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                        expression={step.paramBindings?.['etch.depth']}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        suggestedVarName="etch_depth"
+                        targetLabel={`${step.title} · Etch Depth`}
+                        onChangeExpression={(expr) => setStepParamBinding('etch.depth', expr)}
+                        onCreateVariable={onCreateVariable}
+                        onOpenVariablesModal={onOpenVariablesModal}
                       />
                       {linkedRecipe && refRate > 0 && (
                         <span className="text-[10px] font-mono text-amber-300/90 block mt-0.5">
@@ -2748,7 +2798,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Removed Thickness / Grind Depth ({getUnitLabel(thicknessUnit)})
                     </label>
-                    <ThicknessInput
+                    <ParametricThicknessInput
                       valueNm={step.cmp?.depth ?? 300}
                       onChangeNm={(val) =>
                         handleUpdate({
@@ -2762,6 +2812,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       minNm={10}
                       stepNm={25}
                       className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      expression={step.paramBindings?.['cmp.depth']}
+                      variables={variables}
+                      waferWidth={waferWidth}
+                      suggestedVarName="cmp_depth"
+                      targetLabel={`${step.title} · CMP Removal Depth`}
+                      onChangeExpression={(expr) => setStepParamBinding('cmp.depth', expr)}
+                      onCreateVariable={onCreateVariable}
+                      onOpenVariablesModal={onOpenVariablesModal}
                     />
                   </div>
                 )}
@@ -2771,7 +2829,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Target Z Plane Coordinate ({getUnitLabel(thicknessUnit)})
                     </label>
-                    <ThicknessInput
+                    <ParametricThicknessInput
                       valueNm={step.cmp?.targetHeight ?? 2500}
                       onChangeNm={(val) =>
                         handleUpdate({
@@ -2785,6 +2843,14 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       minNm={-10000}
                       stepNm={50}
                       className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      expression={step.paramBindings?.['cmp.targetHeight']}
+                      variables={variables}
+                      waferWidth={waferWidth}
+                      suggestedVarName="cmp_z"
+                      targetLabel={`${step.title} · CMP Target Z`}
+                      onChangeExpression={(expr) => setStepParamBinding('cmp.targetHeight', expr)}
+                      onCreateVariable={onCreateVariable}
+                      onOpenVariablesModal={onOpenVariablesModal}
                     />
                   </div>
                 )}
@@ -3243,8 +3309,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             </option>
                           ))}
                         </select>
-                        <div className="flex items-center gap-1">
-                          <ThicknessInput
+                        <div>
+                          <ParametricThicknessInput
                             valueNm={bondCfg.interfaceLayer.thickness}
                             onChangeNm={(val) =>
                               updateBonding({
@@ -3258,10 +3324,17 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                             minNm={5}
                             stepNm={25}
                             className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-[11px] font-mono text-white focus:outline-none focus:border-sky-500"
+                            expression={step.paramBindings?.['bonding.interfaceLayer.thickness']}
+                            variables={variables}
+                            waferWidth={waferWidth}
+                            suggestedVarName="bond_seam"
+                            targetLabel={`${step.title} · Bond Seam`}
+                            onChangeExpression={(expr) =>
+                              setStepParamBinding('bonding.interfaceLayer.thickness', expr)
+                            }
+                            onCreateVariable={onCreateVariable}
+                            onOpenVariablesModal={onOpenVariablesModal}
                           />
-                          <span className="text-[10px] text-slate-500">
-                            {getUnitLabel(thicknessUnit)}
-                          </span>
                         </div>
                       </div>
                     )}
@@ -3360,13 +3433,21 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                           <label className="block text-[11px] text-slate-400 mb-1">
                             Tape Thickness ({getUnitLabel(thicknessUnit)})
                           </label>
-                          <ThicknessInput
+                          <ParametricThicknessInput
                             valueNm={tfCfg.thickness}
                             onChangeNm={(val) => updateTf({ thickness: val })}
                             unit={thicknessUnit}
                             minNm={25}
                             stepNm={50}
                             className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                            expression={step.paramBindings?.['tapeFrame.thickness']}
+                            variables={variables}
+                            waferWidth={waferWidth}
+                            suggestedVarName="tape_thick"
+                            targetLabel={`${step.title} · Tape Thickness`}
+                            onChangeExpression={(expr) => setStepParamBinding('tapeFrame.thickness', expr)}
+                            onCreateVariable={onCreateVariable}
+                            onOpenVariablesModal={onOpenVariablesModal}
                           />
                         </div>
 
@@ -3488,13 +3569,21 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <label className="block text-[11px] text-slate-400 mb-1">
                         Kerf Width ({getUnitLabel(thicknessUnit)})
                       </label>
-                      <ThicknessInput
+                      <ParametricThicknessInput
                         valueNm={dCfg.kerfWidth}
                         onChangeNm={(val) => updateDicing({ kerfWidth: val })}
                         unit={thicknessUnit}
                         minNm={20}
                         stepNm={25}
                         className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                        expression={step.paramBindings?.['dicing.kerfWidth']}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        suggestedVarName="kerf_w"
+                        targetLabel={`${step.title} · Kerf Width`}
+                        onChangeExpression={(expr) => setStepParamBinding('dicing.kerfWidth', expr)}
+                        onCreateVariable={onCreateVariable}
+                        onOpenVariablesModal={onOpenVariablesModal}
                       />
                     </div>
                   </div>
@@ -3534,13 +3623,21 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <label className="block text-[11px] text-slate-400 mb-1">
                         Pre-Cut Kerf Depth ({getUnitLabel(thicknessUnit)})
                       </label>
-                      <ThicknessInput
+                      <ParametricThicknessInput
                         valueNm={dCfg.cutDepth ?? 1500}
                         onChangeNm={(val) => updateDicing({ cutDepth: val })}
                         unit={thicknessUnit}
                         minNm={20}
                         stepNm={100}
                         className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                        expression={step.paramBindings?.['dicing.cutDepth']}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        suggestedVarName="cut_depth"
+                        targetLabel={`${step.title} · Pre-Cut Depth`}
+                        onChangeExpression={(expr) => setStepParamBinding('dicing.cutDepth', expr)}
+                        onCreateVariable={onCreateVariable}
+                        onOpenVariablesModal={onOpenVariablesModal}
                       />
                     </div>
                   ) : (
@@ -3548,13 +3645,21 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       <label className="block text-[11px] text-slate-400 mb-1">
                         Dicing Tape Overcut Depth ({getUnitLabel(thicknessUnit)})
                       </label>
-                      <ThicknessInput
+                      <ParametricThicknessInput
                         valueNm={dCfg.tapeOvercut ?? 120}
                         onChangeNm={(val) => updateDicing({ tapeOvercut: val })}
                         unit={thicknessUnit}
                         minNm={0}
                         stepNm={25}
                         className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                        expression={step.paramBindings?.['dicing.tapeOvercut']}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        suggestedVarName="tape_overcut"
+                        targetLabel={`${step.title} · Tape Overcut`}
+                        onChangeExpression={(expr) => setStepParamBinding('dicing.tapeOvercut', expr)}
+                        onCreateVariable={onCreateVariable}
+                        onOpenVariablesModal={onOpenVariablesModal}
                       />
                       <span className="text-[10px] text-slate-500 block mt-0.5">
                         Stops cleanly inside mounted dicing tape while cutting all wafer &amp; DAF layers.
@@ -3626,50 +3731,105 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       ))}
                     </div>
 
-                    <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
-                      {streets.map((st, idx) => (
-                        <div
-                          key={st.id}
-                          className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800"
-                        >
-                          <span className="text-[10px] font-mono text-orange-400 w-7 shrink-0">
-                            #{idx + 1}
-                          </span>
-                          <input
-                            type="range"
-                            min={Math.round(waferWidth * 0.05)}
-                            max={Math.round(waferWidth * 0.95)}
-                            step={50}
-                            value={st.xCenter}
-                            onChange={(e) => {
-                              const val = parseInt(e.target.value, 10);
-                              updateDicing({
-                                streets: streets.map((s) =>
-                                  s.id === st.id ? { ...s, xCenter: val } : s
-                                ),
-                              });
-                            }}
-                            className="flex-1 accent-orange-500 min-w-0"
-                          />
-                          <span className="text-[10px] font-mono text-slate-300 w-14 text-right shrink-0">
-                            {(st.xCenter / 1000).toFixed(2)}µm
-                          </span>
-                          <button
-                            type="button"
-                            disabled={streets.length <= 1}
-                            onClick={() => {
-                              if (streets.length <= 1) return;
-                              updateDicing({
-                                streets: streets.filter((s) => s.id !== st.id),
-                              });
-                            }}
-                            className="p-0.5 text-slate-400 hover:text-rose-400 disabled:opacity-20 shrink-0"
-                            title="Remove dicing street"
+                    <div className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5">
+                      {streets.map((st, idx) => {
+                        const streetExpr = st.paramBindings?.xCenter;
+                        const isStreetOpen = openStreetBindId === st.id;
+                        return (
+                          <div
+                            key={st.id}
+                            className="p-2 rounded-lg bg-slate-900 border border-slate-800 space-y-1.5"
                           >
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        </div>
-                      ))}
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-mono text-orange-400 w-7 shrink-0">
+                                #{idx + 1}
+                              </span>
+                              {streetExpr ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenStreetBindId(isStreetOpen ? null : st.id)
+                                  }
+                                  className="flex-1 min-w-0 px-2 py-0.5 rounded bg-violet-950/40 border border-violet-500/40 text-left text-[10px] font-mono text-violet-200 truncate"
+                                >
+                                  = {streetExpr}
+                                </button>
+                              ) : (
+                                <input
+                                  type="range"
+                                  min={Math.round(waferWidth * 0.05)}
+                                  max={Math.round(waferWidth * 0.95)}
+                                  step={50}
+                                  value={st.xCenter}
+                                  onChange={(e) => {
+                                    const val = parseInt(e.target.value, 10);
+                                    updateDicing({
+                                      streets: streets.map((s) =>
+                                        s.id === st.id ? { ...s, xCenter: val } : s
+                                      ),
+                                    });
+                                  }}
+                                  className="flex-1 accent-orange-500 min-w-0"
+                                />
+                              )}
+                              <span className="text-[10px] font-mono text-slate-300 w-14 text-right shrink-0">
+                                {(st.xCenter / 1000).toFixed(2)}µm
+                              </span>
+                              <ParamBindingBadge
+                                expression={streetExpr}
+                                isOpen={isStreetOpen}
+                                onToggle={() =>
+                                  setOpenStreetBindId(isStreetOpen ? null : st.id)
+                                }
+                                compact
+                              />
+                              <button
+                                type="button"
+                                disabled={streets.length <= 1}
+                                onClick={() => {
+                                  if (streets.length <= 1) return;
+                                  updateDicing({
+                                    streets: streets.filter((s) => s.id !== st.id),
+                                  });
+                                }}
+                                className="p-0.5 text-slate-400 hover:text-rose-400 disabled:opacity-20 shrink-0"
+                                title="Remove dicing street"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                            {isStreetOpen && (
+                              <ParamBindingPanel
+                                expression={streetExpr}
+                                variables={variables}
+                                waferWidth={waferWidth}
+                                currentValue={st.xCenter}
+                                unit="um"
+                                suggestedVarName={`street_x_${idx + 1}`}
+                                targetLabel={`Dicing Street #${idx + 1} X`}
+                                onChangeExpression={(expr) => {
+                                  updateDicing({
+                                    streets: streets.map((s) => {
+                                      if (s.id !== st.id) return s;
+                                      const nextB = { ...(s.paramBindings || {}) };
+                                      if (expr) nextB.xCenter = expr;
+                                      else delete nextB.xCenter;
+                                      return {
+                                        ...s,
+                                        paramBindings:
+                                          Object.keys(nextB).length > 0 ? nextB : undefined,
+                                      };
+                                    }),
+                                  });
+                                }}
+                                onCreateVariable={onCreateVariable}
+                                onOpenVariablesModal={onOpenVariablesModal}
+                                onClose={() => setOpenStreetBindId(null)}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>

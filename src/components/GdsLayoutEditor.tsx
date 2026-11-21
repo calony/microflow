@@ -46,6 +46,8 @@ import {
   withSectionPoints,
 } from '../lib/gdsUtils';
 import { createNewMaskInFlow, updateMaskAndSyncSteps } from '../lib/maskUtils';
+import { resolveFlowParameters } from '../lib/variableUtils';
+import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
 import { GdsTopCellModal } from './GdsTopCellModal';
 import {
   MousePointer2,
@@ -85,6 +87,12 @@ import {
   HelpCircle,
   Eraser,
   Pencil,
+  Ruler,
+  Magnet,
+  Undo2,
+  Redo2,
+  Focus,
+  Search,
 } from 'lucide-react';
 
 function getGdsPatternDefId(color: string, pattern: GdsPatternType): string {
@@ -307,9 +315,10 @@ interface GdsLayoutEditorProps {
   selectedMask: PhotomaskLevel | null;
   onUpdateFlow: (updatedFlow: ProcessFlow) => void;
   onNotify?: (message: string, type: 'success' | 'warn') => void;
+  onOpenVariablesModal?: () => void;
 }
 
-type DrawTool = 'select' | 'pan' | 'rect' | 'path' | 'polygon' | 'circle' | 'section';
+type DrawTool = 'select' | 'pan' | 'zoom' | 'rect' | 'path' | 'polygon' | 'circle' | 'section' | 'ruler';
 type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
 export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
@@ -317,6 +326,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   selectedMask,
   onUpdateFlow,
   onNotify,
+  onOpenVariablesModal,
 }) => {
   const waferWidth = flow.substrateWidth || 10000;
   const masks = flow.masks || [];
@@ -327,15 +337,111 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     return createDefaultGdsLayout(masks, waferWidth);
   }, [flow.gdsLayout, masks, waferWidth]);
 
-  const updateLayout = useCallback(
-    (nextLayout: GdsLayoutData) => {
-      onUpdateFlow({
-        ...flow,
-        gdsLayout: nextLayout,
-      });
+  const MAX_HISTORY = 60;
+  const undoStackRef = useRef<GdsLayoutData[]>([]);
+  const redoStackRef = useRef<GdsLayoutData[]>([]);
+  const dragStartLayoutRef = useRef<GdsLayoutData | null>(null);
+  const latestFlowRef = useRef(flow);
+  latestFlowRef.current = flow;
+  const latestLayoutRef = useRef(layout);
+  latestLayoutRef.current = layout;
+  const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+
+  const syncHistoryState = useCallback(() => {
+    setHistoryState({
+      canUndo: undoStackRef.current.length > 0,
+      canRedo: redoStackRef.current.length > 0,
+    });
+  }, []);
+
+  const layoutsEqual = useCallback((a: GdsLayoutData, b: GdsLayoutData): boolean => {
+    if (a === b) return true;
+    if (a.shapes.length !== b.shapes.length || a.layers.length !== b.layers.length) return false;
+    if (Math.max(a.shapes.length, b.shapes.length) <= 2500) {
+      return JSON.stringify(a) === JSON.stringify(b);
+    }
+    return false;
+  }, []);
+
+  const pushLayoutHistorySnapshot = useCallback(
+    (snapshot: GdsLayoutData, nextCandidate?: GdsLayoutData) => {
+      if (nextCandidate && layoutsEqual(snapshot, nextCandidate)) return;
+      undoStackRef.current = [...undoStackRef.current.slice(-(MAX_HISTORY - 1)), snapshot];
+      redoStackRef.current = [];
+      syncHistoryState();
     },
-    [flow, onUpdateFlow]
+    [layoutsEqual, syncHistoryState]
   );
+
+  const finalizeDragHistory = useCallback(() => {
+    if (!dragStartLayoutRef.current) return;
+    const startSnap = dragStartLayoutRef.current;
+    dragStartLayoutRef.current = null;
+    pushLayoutHistorySnapshot(startSnap, latestLayoutRef.current);
+  }, [pushLayoutHistorySnapshot]);
+
+  const updateLayout = useCallback(
+    (nextLayout: GdsLayoutData, options?: { skipHistory?: boolean }) => {
+      if (!options?.skipHistory) {
+        pushLayoutHistorySnapshot(latestLayoutRef.current, nextLayout);
+      }
+      onUpdateFlow(
+        resolveFlowParameters({
+          ...latestFlowRef.current,
+          gdsLayout: nextLayout,
+        })
+      );
+    },
+    [onUpdateFlow, pushLayoutHistorySnapshot]
+  );
+
+  const handleUndo = useCallback(() => {
+    if (undoStackRef.current.length === 0) return;
+    const prevLayout = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [
+      ...redoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      latestLayoutRef.current,
+    ];
+    dragStartLayoutRef.current = null;
+    setPointerOp(null);
+    setDragBox(null);
+    setMarqueeBox(null);
+    setZoomBox(null);
+    setDraftPoints([]);
+    setDraftHoverPoint(null);
+    syncHistoryState();
+    onUpdateFlow(
+      resolveFlowParameters({
+        ...latestFlowRef.current,
+        gdsLayout: prevLayout,
+      })
+    );
+  }, [onUpdateFlow, syncHistoryState]);
+
+  const handleRedo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    const nextLayout = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = [
+      ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      latestLayoutRef.current,
+    ];
+    dragStartLayoutRef.current = null;
+    setPointerOp(null);
+    setDragBox(null);
+    setMarqueeBox(null);
+    setZoomBox(null);
+    setDraftPoints([]);
+    setDraftHoverPoint(null);
+    syncHistoryState();
+    onUpdateFlow(
+      resolveFlowParameters({
+        ...latestFlowRef.current,
+        gdsLayout: nextLayout,
+      })
+    );
+  }, [onUpdateFlow, syncHistoryState]);
 
   // Active tool & drawing preferences
   const [tool, setTool] = useState<DrawTool>('rect');
@@ -379,8 +485,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [editLayerName, setEditLayerName] = useState<string>('');
   const [editLayerDatatype, setEditLayerDatatype] = useState<string>('0');
 
-  // Selected shape / multi-click draft state
-  const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
+  // Selected shapes / multi-click draft state
+  const [selectedShapeIds, setSelectedShapeIds] = useState<string[]>([]);
+  const [marqueeBox, setMarqueeBox] = useState<{ start: GdsPoint; current: GdsPoint } | null>(null);
+  const [zoomBox, setZoomBox] = useState<{ start: GdsPoint; current: GdsPoint } | null>(null);
+  const [multiShiftDx, setMultiShiftDx] = useState<number>(0);
+  const [multiShiftDy, setMultiShiftDy] = useState<number>(0);
+  const [openGdsBindField, setOpenGdsBindField] = useState<string | null>(null);
   const [showArrayTool, setShowArrayTool] = useState<boolean>(false);
   const [arrayCols, setArrayCols] = useState<number>(3);
   const [arrayRows, setArrayRows] = useState<number>(2);
@@ -391,6 +502,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [dragOverLayerIdx, setDragOverLayerIdx] = useState<number | null>(null);
   const [mobileLayersOpen, setMobileLayersOpen] = useState<boolean>(false);
   const [desktopLayersOpen, setDesktopLayersOpen] = useState<boolean>(true);
+  const [expandedObjectsLayerKey, setExpandedObjectsLayerKey] = useState<string | null>(null);
   const [showCutPanel, setShowCutPanel] = useState<boolean>(true);
   const [scaleXInput, setScaleXInput] = useState<string>('1.5');
   const [scaleYInput, setScaleYInput] = useState<string>('1.5');
@@ -402,7 +514,21 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [dragBox, setDragBox] = useState<{ start: GdsPoint; current: GdsPoint } | null>(null);
   const [cursorWorld, setCursorWorld] = useState<GdsPoint | null>(null);
   const [draftHoverPoint, setDraftHoverPoint] = useState<GdsPoint | null>(null);
+  const [hoverScreenPos, setHoverScreenPos] = useState<{ sx: number; sy: number } | null>(null);
+  const [rulerPoints, setRulerPoints] = useState<GdsPoint[]>([]);
+  const [rulerSnapToGeom, setRulerSnapToGeom] = useState<boolean>(true);
+  const [rulerAngleSnap, setRulerAngleSnap] = useState<boolean>(true);
+  const [shiftKeyDown, setShiftKeyDown] = useState<boolean>(false);
+  const [ctrlKeyDown, setCtrlKeyDown] = useState<boolean>(false);
   const [targetMaskId, setTargetMaskId] = useState<string>(() => selectedMask?.id || masks[0]?.id || '');
+
+  useEffect(() => {
+    const validIds = new Set(layout.shapes.map((s) => s.id));
+    setSelectedShapeIds((prev) => {
+      const next = prev.filter((id) => validIds.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [layout.shapes]);
 
   useEffect(() => {
     if (selectedMask?.id) {
@@ -454,6 +580,37 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     [svgSize.w, svgSize.h, waferWidth]
   );
 
+  const fitCameraToShapes = useCallback(
+    (targets: GdsShape[]) => {
+      if (targets.length === 0) return;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const s of targets) {
+        const b = getGdsShapeBounds(s);
+        minX = Math.min(minX, b.minX);
+        minY = Math.min(minY, b.minY);
+        maxX = Math.max(maxX, b.minX + b.width);
+        maxY = Math.max(maxY, b.minY + b.height);
+      }
+      if (!Number.isFinite(minX)) return;
+      const spanX = Math.max(200, maxX - minX);
+      const spanY = Math.max(200, maxY - minY);
+      const aspect = svgSize.w > 0 && svgSize.h > 0 ? svgSize.w / svgSize.h : 1.6;
+      const neededSpanX = Math.max(
+        400,
+        Math.min(2000000, Math.max(spanX * 1.35, spanY * 1.35 * aspect))
+      );
+      setCamera({
+        cx: (minX + maxX) * 0.5,
+        cy: (minY + maxY) * 0.5,
+        spanX: neededSpanX,
+      });
+    },
+    [svgSize.w, svgSize.h]
+  );
+
   // Coordinate conversions: GDS Y+ is UP; SVG Y+ is DOWN
   const pxPerNm = svgSize.w / Math.max(100, camera.spanX);
   const worldToScreen = useCallback(
@@ -484,7 +641,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const [pointerOp, setPointerOp] = useState<
     | null
     | { kind: 'pan'; startClientX: number; startClientY: number; initCx: number; initCy: number }
-    | { kind: 'move-shape'; shape: GdsShape; startWorld: GdsPoint }
+    | { kind: 'move-shapes'; shapes: GdsShape[]; startWorld: GdsPoint }
+    | {
+        kind: 'marquee-select';
+        startWorld: GdsPoint;
+        startClientX: number;
+        startClientY: number;
+        additive: boolean;
+      }
     | {
         kind: 'resize-shape';
         shape: GdsShape;
@@ -495,6 +659,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     | { kind: 'drag-section-move'; initSection: GdsSectionLine; startWorld: GdsPoint }
     | { kind: 'draw-drag'; startWorld: GdsPoint }
     | { kind: 'tap-draft-point'; startWorld: GdsPoint; startClientX: number; startClientY: number }
+    | { kind: 'ruler-drag'; startWorld: GdsPoint; startClientX: number; startClientY: number }
+    | { kind: 'zoom-drag'; startWorld: GdsPoint; startClientX: number; startClientY: number }
   >(null);
 
   // Multi-touch pinch-to-zoom state
@@ -529,33 +695,36 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   );
 
   const updateSectionLines = useCallback(
-    (nextLines: GdsSectionLine[], nextActiveId?: string) => {
+    (nextLines: GdsSectionLine[], nextActiveId?: string, skipHistory?: boolean) => {
       const targetId = nextActiveId ?? activeSectionLine?.id;
       const active =
         nextLines.length > 0
           ? nextLines.find((s) => s.id === targetId) || nextLines[0]
           : undefined;
-      updateLayout({
-        ...layout,
-        sectionLines: nextLines,
-        activeSectionId: active?.id,
-        sectionLine: active,
-        concat:
-          nextLines.length === 0 && layout.concat
-            ? { ...layout.concat, enabled: false, sectionIds: [] }
-            : layout.concat,
-      });
+      updateLayout(
+        {
+          ...layout,
+          sectionLines: nextLines,
+          activeSectionId: active?.id,
+          sectionLine: active,
+          concat:
+            nextLines.length === 0 && layout.concat
+              ? { ...layout.concat, enabled: false, sectionIds: [] }
+              : layout.concat,
+        },
+        skipHistory ? { skipHistory: true } : undefined
+      );
     },
     [layout, activeSectionLine?.id, updateLayout]
   );
 
   const updateSingleSection = useCallback(
-    (updatedCut: GdsSectionLine) => {
+    (updatedCut: GdsSectionLine, skipHistory?: boolean) => {
       const exists = sectionLines.some((s) => s.id === updatedCut.id);
       const nextLines = exists
         ? sectionLines.map((s) => (s.id === updatedCut.id ? updatedCut : s))
         : [...sectionLines, updatedCut];
-      updateSectionLines(nextLines, updatedCut.id);
+      updateSectionLines(nextLines, updatedCut.id, skipHistory);
     },
     [sectionLines, updateSectionLines]
   );
@@ -589,24 +758,103 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     [layout, updateLayout]
   );
 
-  // Keyboard shortcuts: Escape cancels draft, Delete removes selected shape, Enter finishes polyline
+  // Keyboard shortcuts: Undo/Redo (Ctrl+Z / Ctrl+Y / Cmd+Shift+Z), Escape cancels/clears, Delete removes selected shapes, Ctrl/Cmd+A selects all visible shapes, Arrows nudge
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.defaultPrevented || pendingGdsImport) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const keyLower = e.key.toLowerCase();
+        if (keyLower === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            handleRedo();
+          } else {
+            handleUndo();
+          }
+          return;
+        }
+        if (keyLower === 'y' && !e.shiftKey) {
+          e.preventDefault();
+          handleRedo();
+          return;
+        }
+      }
+
+      if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        if (selectedShapeIds.length > 0) {
+          const selSet = new Set(selectedShapeIds);
+          const targets = layout.shapes.filter((s) => selSet.has(s.id));
+          if (targets.length > 0) {
+            fitCameraToShapes(targets);
+            return;
+          }
+        }
+        if (!e.shiftKey) {
+          fitCameraToLayout(layout);
+        }
+        return;
+      }
 
       if (e.key === 'Escape') {
         setDraftPoints([]);
         setDraftHoverPoint(null);
         setDragBox(null);
-        setSelectedShapeId(null);
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedShapeId) {
+        setMarqueeBox(null);
+        setZoomBox(null);
+        setRulerPoints([]);
+        setSelectedShapeIds([]);
+        setShowArrayTool(false);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
         e.preventDefault();
+        const visibleKeys = new Set(
+          layout.layers.filter((l) => l.visible).map((l) => gdsLayerKey(l.layer, l.datatype ?? 0))
+        );
+        const visibleLayers = new Set(layout.layers.filter((l) => l.visible).map((l) => l.layer));
+        const allVisibleIds = orderedShapes
+          .filter((s) => {
+            const sKey = gdsLayerKey(s.layer, s.datatype ?? 0);
+            const isLayerKnown = layerByKey.has(sKey);
+            return isLayerKnown ? visibleKeys.has(sKey) : visibleLayers.has(s.layer);
+          })
+          .map((s) => s.id);
+        setSelectedShapeIds(allVisibleIds);
+        setShowArrayTool(false);
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedShapeIds.length > 0) {
+        e.preventDefault();
+        const delSet = new Set(selectedShapeIds);
         updateLayout({
           ...layout,
-          shapes: layout.shapes.filter((s) => s.id !== selectedShapeId),
+          shapes: layout.shapes.filter((s) => !delSet.has(s.id)),
         });
-        setSelectedShapeId(null);
+        setSelectedShapeIds([]);
+        setShowArrayTool(false);
+      } else if (
+        tool === 'select' &&
+        selectedShapeIds.length > 0 &&
+        (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')
+      ) {
+        e.preventDefault();
+        const baseStep = gridSnapNm > 1 ? gridSnapNm : 50;
+        const step = e.shiftKey ? baseStep * 5 : baseStep;
+        const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
+        const dy = e.key === 'ArrowDown' ? -step : e.key === 'ArrowUp' ? step : 0;
+        const selSet = new Set(selectedShapeIds);
+        updateLayout({
+          ...layout,
+          shapes: layout.shapes.map((s) => (selSet.has(s.id) ? moveGdsShape(s, dx, dy) : s)),
+        });
       } else if (e.key === 'Enter' && draftPoints.length >= 2) {
         finalizeMultiClickShape(draftPoints);
       }
@@ -614,6 +862,25 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   });
+
+  useEffect(() => {
+    const syncModifierKeys = (e: KeyboardEvent) => {
+      setCtrlKeyDown(e.ctrlKey);
+      setShiftKeyDown(e.shiftKey);
+    };
+    const resetModifierKeys = () => {
+      setCtrlKeyDown(false);
+      setShiftKeyDown(false);
+    };
+    window.addEventListener('keydown', syncModifierKeys);
+    window.addEventListener('keyup', syncModifierKeys);
+    window.addEventListener('blur', resetModifierKeys);
+    return () => {
+      window.removeEventListener('keydown', syncModifierKeys);
+      window.removeEventListener('keyup', syncModifierKeys);
+      window.removeEventListener('blur', resetModifierKeys);
+    };
+  }, []);
 
   const finalizeMultiClickShape = (pts: GdsPoint[]) => {
     if (tool === 'polygon' && pts.length >= 3) {
@@ -625,7 +892,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         points: pts,
       };
       updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
-      setSelectedShapeId(newShape.id);
+      setSelectedShapeIds([newShape.id]);
     } else if (tool === 'path' && pts.length >= 2) {
       const newShape: GdsShape = {
         id: `gds_path_${Date.now()}`,
@@ -636,7 +903,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         pathWidth: pathWidthNm,
       };
       updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
-      setSelectedShapeId(newShape.id);
+      setSelectedShapeIds([newShape.id]);
     } else if (tool === 'section' && pts.length >= 2) {
       const nextCut = activeSectionLine
         ? withSectionPoints(activeSectionLine, pts)
@@ -719,8 +986,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       const { sx, sy } = getLocalCoords(midClientX, midClientY);
       const anchor = screenToWorld(sx, sy, false);
 
+      finalizeDragHistory();
       setPointerOp(null);
       setDragBox(null);
+      setZoomBox(null);
       pinchStateRef.current = {
         initialDistance: Math.max(10, dist),
         initialSpanX: camera.spanX,
@@ -760,18 +1029,93 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     const worldPt = screenToWorld(sx, sy, true);
     const rawWorldPt = screenToWorld(sx, sy, false);
 
-    if (tool === 'select') {
-      const hit = findShapeAtPoint(rawWorldPt);
-      if (hit) {
-        setSelectedShapeId(hit.id);
+    if (tool === 'zoom') {
+      setCtrlKeyDown(e.ctrlKey);
+      setShiftKeyDown(e.shiftKey);
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      setZoomBox({ start: rawWorldPt, current: rawWorldPt });
+      setPointerOp({
+        kind: 'zoom-drag',
+        startWorld: rawWorldPt,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+      });
+      return;
+    }
+
+    if (tool === 'ruler') {
+      setShiftKeyDown(e.shiftKey);
+      const snapped = rulerSnapToGeom ? findGdsGeometrySnap(sx, sy) : null;
+      const basePt = snapped ? snapped.point : worldPt;
+      if (rulerPoints.length === 1) {
+        const useAngleLock = rulerAngleSnap && (e.shiftKey || shiftKeyDown);
+        const finalPt = useAngleLock
+          ? constrainGdsRulerPoint(rulerPoints[0], basePt).point
+          : basePt;
+        setRulerPoints([rulerPoints[0], finalPt]);
+      } else {
+        setRulerPoints([basePt]);
         (e.currentTarget as Element).setPointerCapture(e.pointerId);
         setPointerOp({
-          kind: 'move-shape',
-          shape: hit,
-          startWorld: worldPt,
+          kind: 'ruler-drag',
+          startWorld: basePt,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
         });
+      }
+      return;
+    }
+
+    if (tool === 'select') {
+      const hit = findShapeAtPoint(rawWorldPt);
+      const isAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
+      if (hit) {
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+        if (isAdditive) {
+          const alreadySelected = selectedShapeIds.includes(hit.id);
+          if (alreadySelected) {
+            setSelectedShapeIds((prev) => prev.filter((id) => id !== hit.id));
+            setShowArrayTool(false);
+          } else {
+            const nextIds = [...selectedShapeIds, hit.id];
+            setSelectedShapeIds(nextIds);
+            setShowArrayTool(false);
+            const nextIdSet = new Set(nextIds);
+            const moveTargets = layout.shapes.filter((s) => nextIdSet.has(s.id));
+            dragStartLayoutRef.current = latestLayoutRef.current;
+            setPointerOp({
+              kind: 'move-shapes',
+              shapes: moveTargets.length > 0 ? moveTargets : [hit],
+              startWorld: worldPt,
+            });
+          }
+        } else {
+          const alreadySelected = selectedShapeIds.includes(hit.id);
+          const selSet = new Set(selectedShapeIds);
+          const moveTargets = alreadySelected
+            ? layout.shapes.filter((s) => selSet.has(s.id))
+            : [hit];
+          if (!alreadySelected) {
+            setSelectedShapeIds([hit.id]);
+            setShowArrayTool(false);
+          }
+          dragStartLayoutRef.current = latestLayoutRef.current;
+          setPointerOp({
+            kind: 'move-shapes',
+            shapes: moveTargets.length > 0 ? moveTargets : [hit],
+            startWorld: worldPt,
+          });
+        }
       } else {
-        setSelectedShapeId(null);
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+        setMarqueeBox({ start: rawWorldPt, current: rawWorldPt });
+        setPointerOp({
+          kind: 'marquee-select',
+          startWorld: rawWorldPt,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          additive: isAdditive,
+        });
       }
       return;
     }
@@ -868,15 +1212,40 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
     const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
     const worldPt = screenToWorld(sx, sy, true);
+    if (e.shiftKey !== shiftKeyDown) {
+      setShiftKeyDown(e.shiftKey);
+    }
+    if (e.ctrlKey !== ctrlKeyDown) {
+      setCtrlKeyDown(e.ctrlKey);
+    }
     if (e.pointerType !== 'touch') {
+      setHoverScreenPos({ sx, sy });
       setCursorWorld(worldPt);
       setDraftHoverPoint(worldPt);
     } else {
+      setHoverScreenPos(null);
       setDraftHoverPoint(null);
       setCursorWorld(null);
     }
 
     if (!pointerOp) return;
+
+    if (pointerOp.kind === 'ruler-drag') {
+      const distPx = Math.hypot(
+        e.clientX - pointerOp.startClientX,
+        e.clientY - pointerOp.startClientY
+      );
+      if (distPx > 6) {
+        const snapped = rulerSnapToGeom ? findGdsGeometrySnap(sx, sy) : null;
+        const basePt = snapped ? snapped.point : worldPt;
+        const useAngleLock = rulerAngleSnap && (e.shiftKey || shiftKeyDown);
+        const nextPt = useAngleLock
+          ? constrainGdsRulerPoint(pointerOp.startWorld, basePt).point
+          : basePt;
+        setRulerPoints([pointerOp.startWorld, nextPt]);
+      }
+      return;
+    }
 
     if (pointerOp.kind === 'pan') {
       const dxNm = (e.clientX - pointerOp.startClientX) / pxPerNm;
@@ -894,14 +1263,32 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       return;
     }
 
-    if (pointerOp.kind === 'move-shape') {
+    if (pointerOp.kind === 'marquee-select') {
+      const rawPt = screenToWorld(sx, sy, false);
+      setMarqueeBox({ start: pointerOp.startWorld, current: rawPt });
+      return;
+    }
+
+    if (pointerOp.kind === 'zoom-drag') {
+      const rawPt = screenToWorld(sx, sy, false);
+      setZoomBox({ start: pointerOp.startWorld, current: rawPt });
+      return;
+    }
+
+    if (pointerOp.kind === 'move-shapes') {
       const dx = worldPt.x - pointerOp.startWorld.x;
       const dy = worldPt.y - pointerOp.startWorld.y;
-      const moved = moveGdsShape(pointerOp.shape, dx, dy);
-      updateLayout({
-        ...layout,
-        shapes: layout.shapes.map((s) => (s.id === moved.id ? moved : s)),
-      });
+      const movedById = new Map<string, GdsShape>();
+      for (const orig of pointerOp.shapes) {
+        movedById.set(orig.id, moveGdsShape(orig, dx, dy));
+      }
+      updateLayout(
+        {
+          ...layout,
+          shapes: layout.shapes.map((s) => movedById.get(s.id) || s),
+        },
+        { skipHistory: true }
+      );
       return;
     }
 
@@ -977,10 +1364,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         resized = resizePointShapeToBounds(shape, newX, newY, newW, newH);
       }
 
-      updateLayout({
-        ...layout,
-        shapes: layout.shapes.map((s) => (s.id === resized.id ? resized : s)),
-      });
+      updateLayout(
+        {
+          ...layout,
+          shapes: layout.shapes.map((s) => (s.id === resized.id ? resized : s)),
+        },
+        { skipHistory: true }
+      );
       return;
     }
 
@@ -988,19 +1378,99 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       const nextPts = getSectionPoints(pointerOp.initSection).map((p, idx) =>
         idx === pointerOp.vertexIndex ? worldPt : p
       );
-      updateSingleSection(withSectionPoints(pointerOp.initSection, nextPts));
+      updateSingleSection(withSectionPoints(pointerOp.initSection, nextPts), true);
       return;
     }
 
     if (pointerOp.kind === 'drag-section-move') {
       const dx = worldPt.x - pointerOp.startWorld.x;
       const dy = worldPt.y - pointerOp.startWorld.y;
-      updateSingleSection(moveGdsSectionLine(pointerOp.initSection, dx, dy));
+      updateSingleSection(moveGdsSectionLine(pointerOp.initSection, dx, dy), true);
     }
   };
 
   const handleSvgPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (pointerOp?.kind === 'draw-drag' && dragBox) {
+    if (pointerOp?.kind === 'zoom-drag') {
+      if (e.type !== 'pointercancel' && activePointersRef.current.size <= 1) {
+        const isZoomOut = e.ctrlKey || ctrlKeyDown || e.shiftKey;
+        const distPx = Math.hypot(
+          e.clientX - pointerOp.startClientX,
+          e.clientY - pointerOp.startClientY
+        );
+        if (distPx >= 8 && zoomBox) {
+          const minX = Math.min(zoomBox.start.x, zoomBox.current.x);
+          const maxX = Math.max(zoomBox.start.x, zoomBox.current.x);
+          const minY = Math.min(zoomBox.start.y, zoomBox.current.y);
+          const maxY = Math.max(zoomBox.start.y, zoomBox.current.y);
+          const boxW = Math.max(200, maxX - minX);
+          const boxH = Math.max(200, maxY - minY);
+          const aspect = svgSize.w > 0 && svgSize.h > 0 ? svgSize.w / svgSize.h : 1.6;
+          const boxSpanX = Math.max(400, Math.max(boxW, boxH * aspect));
+          if (isZoomOut) {
+            const zoomOutRatio = Math.max(1.25, Math.min(8, camera.spanX / boxSpanX));
+            const nextSpanX = Math.min(2000000, camera.spanX * zoomOutRatio);
+            setCamera({
+              cx: (minX + maxX) * 0.5,
+              cy: (minY + maxY) * 0.5,
+              spanX: nextSpanX,
+            });
+          } else {
+            const neededSpanX = Math.max(400, Math.min(2000000, boxSpanX));
+            setCamera({
+              cx: (minX + maxX) * 0.5,
+              cy: (minY + maxY) * 0.5,
+              spanX: neededSpanX,
+            });
+          }
+        } else {
+          const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
+          const anchor = screenToWorld(sx, sy, false);
+          const factor = isZoomOut ? 1.65 : 0.55;
+          const nextSpanX = Math.max(400, Math.min(2000000, camera.spanX * factor));
+          const nextPxPerNm = svgSize.w > 0 ? svgSize.w / nextSpanX : pxPerNm;
+          setCamera({
+            cx: anchor.x - (sx - svgSize.w * 0.5) / nextPxPerNm,
+            cy: anchor.y + (sy - svgSize.h * 0.5) / nextPxPerNm,
+            spanX: nextSpanX,
+          });
+        }
+      }
+      setZoomBox(null);
+    } else if (pointerOp?.kind === 'marquee-select') {
+      const distPx = Math.hypot(
+        e.clientX - pointerOp.startClientX,
+        e.clientY - pointerOp.startClientY
+      );
+      if (distPx >= 5 && marqueeBox) {
+        const minX = Math.min(marqueeBox.start.x, marqueeBox.current.x);
+        const maxX = Math.max(marqueeBox.start.x, marqueeBox.current.x);
+        const minY = Math.min(marqueeBox.start.y, marqueeBox.current.y);
+        const maxY = Math.max(marqueeBox.start.y, marqueeBox.current.y);
+        const visibleKeys = new Set(
+          layout.layers.filter((l) => l.visible).map((l) => gdsLayerKey(l.layer, l.datatype ?? 0))
+        );
+        const visibleLayers = new Set(layout.layers.filter((l) => l.visible).map((l) => l.layer));
+        const hitIds = orderedShapes
+          .filter((s) => {
+            const sKey = gdsLayerKey(s.layer, s.datatype ?? 0);
+            const isLayerKnown = layerByKey.has(sKey);
+            if (isLayerKnown ? !visibleKeys.has(sKey) : !visibleLayers.has(s.layer)) return false;
+            const b = getGdsShapeBounds(s);
+            return b.minX <= maxX && b.minX + b.width >= minX && b.minY <= maxY && b.minY + b.height >= minY;
+          })
+          .map((s) => s.id);
+        if (pointerOp.additive) {
+          setSelectedShapeIds((prev) => Array.from(new Set([...prev, ...hitIds])));
+        } else {
+          setSelectedShapeIds(hitIds);
+        }
+        setShowArrayTool(false);
+      } else if (!pointerOp.additive) {
+        setSelectedShapeIds([]);
+        setShowArrayTool(false);
+      }
+      setMarqueeBox(null);
+    } else if (pointerOp?.kind === 'draw-drag' && dragBox) {
       const { start, current } = dragBox;
 
       if (tool === 'rect') {
@@ -1020,7 +1490,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             height,
           };
           updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
-          setSelectedShapeId(newShape.id);
+          setSelectedShapeIds([newShape.id]);
         }
       } else if (tool === 'circle') {
         const radius = Math.round(Math.hypot(current.x - start.x, current.y - start.y));
@@ -1035,7 +1505,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             radius,
           };
           updateLayout({ ...layout, shapes: [...layout.shapes, newShape] });
-          setSelectedShapeId(newShape.id);
+          setSelectedShapeIds([newShape.id]);
         }
       } else if (tool === 'section') {
         const sStart = worldToScreen(start.x, start.y);
@@ -1095,6 +1565,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       pinchStateRef.current = null;
     }
 
+    finalizeDragHistory();
+
     try {
       (e.currentTarget as Element).releasePointerCapture(e.pointerId);
     } catch {
@@ -1146,7 +1618,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   ) => {
     updateLayout(loadedLayout);
     setPendingGdsImport(null);
-    setSelectedShapeId(null);
+    setSelectedShapeIds([]);
+    setMarqueeBox(null);
     setDraftPoints([]);
     setEditingLayerKey(null);
     if (loadedLayout.layers.length > 0) {
@@ -1167,7 +1640,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
   const handleLoadSample = () => {
     const sample = createSampleGdsLayout(masks, waferWidth);
     updateLayout(sample);
-    setSelectedShapeId(null);
+    setSelectedShapeIds([]);
+    setMarqueeBox(null);
     setDraftPoints([]);
     setEditingLayerKey(null);
     setActiveLayer({
@@ -1362,10 +1836,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       (s) => !shapeMatchesLayer(s, target.layer, targetDt)
     );
 
-    if (selectedShapeId) {
-      const sel = layout.shapes.find((s) => s.id === selectedShapeId);
-      if (sel && shapeMatchesLayer(sel, target.layer, targetDt)) {
-        setSelectedShapeId(null);
+    if (selectedShapeIds.length > 0) {
+      const removedIdSet = new Set(
+        layout.shapes
+          .filter((s) => shapeMatchesLayer(s, target.layer, targetDt))
+          .map((s) => s.id)
+      );
+      if (selectedShapeIds.some((id) => removedIdSet.has(id))) {
+        setSelectedShapeIds((prev) => prev.filter((id) => !removedIdSet.has(id)));
         setShowArrayTool(false);
       }
     }
@@ -1381,8 +1859,12 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       });
     }
 
-    if (editingLayerKey === gdsLayerKey(target.layer, targetDt)) {
+    const removedKey = gdsLayerKey(target.layer, targetDt);
+    if (editingLayerKey === removedKey) {
       setEditingLayerKey(null);
+    }
+    if (expandedObjectsLayerKey === removedKey) {
+      setExpandedObjectsLayerKey(null);
     }
 
     updateLayout({
@@ -1410,12 +1892,20 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       (s) => !shapeMatchesLayer(s, targetLayer.layer, targetDt)
     );
 
-    if (selectedShapeId) {
-      const sel = layout.shapes.find((s) => s.id === selectedShapeId);
-      if (sel && shapeMatchesLayer(sel, targetLayer.layer, targetDt)) {
-        setSelectedShapeId(null);
+    if (selectedShapeIds.length > 0) {
+      const removedIdSet = new Set(
+        layout.shapes
+          .filter((s) => shapeMatchesLayer(s, targetLayer.layer, targetDt))
+          .map((s) => s.id)
+      );
+      if (selectedShapeIds.some((id) => removedIdSet.has(id))) {
+        setSelectedShapeIds((prev) => prev.filter((id) => !removedIdSet.has(id)));
         setShowArrayTool(false);
       }
+    }
+
+    if (expandedObjectsLayerKey === gdsLayerKey(targetLayer.layer, targetDt)) {
+      setExpandedObjectsLayerKey(null);
     }
 
     updateLayout({
@@ -1733,12 +2223,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       if (targetLayer) targetLayer.assignedMaskId = newMask.id;
     }
 
+    const nextGdsLayout: GdsLayoutData = {
+      ...layout,
+      layers: nextLayers,
+    };
+    pushLayoutHistorySnapshot(latestLayoutRef.current, nextGdsLayout);
     onUpdateFlow({
       ...nextFlow,
-      gdsLayout: {
-        ...layout,
-        layers: nextLayers,
-      },
+      gdsLayout: nextGdsLayout,
     });
     onNotify?.(
       `Created ${unmappedWithShapes.length} reticle(s) linked to imported GDS layers.`,
@@ -1824,6 +2316,161 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     return Array.from(map.values());
   }, [layout.layers, layout.shapes, getLayerForShape]);
 
+  // Screen-space geometry snap for GDS Measurement Ruler (vertices/centers > midpoints > edges)
+  const findGdsGeometrySnap = useCallback(
+    (
+      sx: number,
+      sy: number
+    ): { point: GdsPoint; kind: 'vertex' | 'midpoint' | 'edge' } | null => {
+      const visibleKeys = new Set(
+        layout.layers.filter((l) => l.visible).map((l) => gdsLayerKey(l.layer, l.datatype ?? 0))
+      );
+      const visibleLayers = new Set(layout.layers.filter((l) => l.visible).map((l) => l.layer));
+
+      let bestVertex: GdsPoint | null = null;
+      let bestVertexDist = 12;
+
+      let bestMidpoint: GdsPoint | null = null;
+      let bestMidpointDist = 9;
+
+      let bestEdge: GdsPoint | null = null;
+      let bestEdgeDist = 10;
+
+      for (const shape of orderedShapes) {
+        const sKey = gdsLayerKey(shape.layer, shape.datatype ?? 0);
+        const isLayerKnown = layerByKey.has(sKey);
+        if (isLayerKnown ? !visibleKeys.has(sKey) : !visibleLayers.has(shape.layer)) continue;
+
+        if (shape.type === 'circle' && shape.cx !== undefined && shape.cy !== undefined) {
+          const sc = worldToScreen(shape.cx, shape.cy);
+          const cDist = Math.hypot(sx - sc.x, sy - sc.y);
+          if (cDist < bestVertexDist) {
+            bestVertexDist = cDist;
+            bestVertex = { x: Math.round(shape.cx), y: Math.round(shape.cy) };
+          }
+        }
+
+        const polys = shapeToPolygons(shape);
+        for (const poly of polys) {
+          const n = poly.length;
+          if (n < 2) continue;
+          for (let i = 0; i < n; i++) {
+            const a = poly[i];
+            const sA = worldToScreen(a.x, a.y);
+            const vDist = Math.hypot(sx - sA.x, sy - sA.y);
+            if (vDist < bestVertexDist) {
+              bestVertexDist = vDist;
+              bestVertex = { x: Math.round(a.x), y: Math.round(a.y) };
+            }
+
+            const b = poly[(i + 1) % n];
+            const sB = worldToScreen(b.x, b.y);
+            const dx = sB.x - sA.x;
+            const dy = sB.y - sA.y;
+            const lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-6) continue;
+
+            if (Math.sqrt(lenSq) >= 16) {
+              const midSx = (sA.x + sB.x) * 0.5;
+              const midSy = (sA.y + sB.y) * 0.5;
+              const mDist = Math.hypot(sx - midSx, sy - midSy);
+              if (mDist < bestMidpointDist) {
+                bestMidpointDist = mDist;
+                bestMidpoint = {
+                  x: Math.round((a.x + b.x) * 0.5),
+                  y: Math.round((a.y + b.y) * 0.5),
+                };
+              }
+            }
+
+            const t = Math.max(0, Math.min(1, ((sx - sA.x) * dx + (sy - sA.y) * dy) / lenSq));
+            const projSx = sA.x + t * dx;
+            const projSy = sA.y + t * dy;
+            const eDist = Math.hypot(sx - projSx, sy - projSy);
+            if (eDist < bestEdgeDist) {
+              bestEdgeDist = eDist;
+              bestEdge = {
+                x: Math.round(a.x + t * (b.x - a.x)),
+                y: Math.round(a.y + t * (b.y - a.y)),
+              };
+            }
+          }
+        }
+      }
+
+      if (bestVertex) return { point: bestVertex, kind: 'vertex' };
+      if (bestMidpoint) return { point: bestMidpoint, kind: 'midpoint' };
+      if (bestEdge) return { point: bestEdge, kind: 'edge' };
+      return null;
+    },
+    [layout.layers, orderedShapes, layerByKey, worldToScreen]
+  );
+
+  const rulerSnapTarget = useMemo(() => {
+    if (tool !== 'ruler' || !rulerSnapToGeom || !hoverScreenPos) return null;
+    return findGdsGeometrySnap(hoverScreenPos.sx, hoverScreenPos.sy);
+  }, [tool, rulerSnapToGeom, hoverScreenPos, findGdsGeometrySnap]);
+
+  const constrainGdsRulerPoint = useCallback(
+    (
+      startPt: GdsPoint,
+      rawTargetPt: GdsPoint
+    ): { point: GdsPoint; modeLabel: 'H' | 'V' | '45°' } => {
+      const dx = rawTargetPt.x - startPt.x;
+      const dy = rawTargetPt.y - startPt.y;
+      if (Math.hypot(dx, dy) < 1e-3) {
+        return { point: { ...rawTargetPt }, modeLabel: 'H' };
+      }
+      const angle = Math.atan2(dy, dx);
+      const sector = ((Math.round(angle / (Math.PI / 4)) % 8) + 8) % 8;
+
+      if (sector === 0 || sector === 4) {
+        return { point: { x: Math.round(rawTargetPt.x), y: startPt.y }, modeLabel: 'H' };
+      }
+      if (sector === 2 || sector === 6) {
+        return { point: { x: startPt.x, y: Math.round(rawTargetPt.y) }, modeLabel: 'V' };
+      }
+      const theta = sector * (Math.PI / 4);
+      const ux = Math.cos(theta);
+      const uy = Math.sin(theta);
+      const proj = dx * ux + dy * uy;
+      const diagMag = Math.round(Math.abs(proj) * Math.SQRT1_2);
+      const signX = proj >= 0 ? Math.sign(ux) : -Math.sign(ux);
+      const signY = proj >= 0 ? Math.sign(uy) : -Math.sign(uy);
+      return {
+        point: {
+          x: startPt.x + (signX >= 0 ? diagMag : -diagMag),
+          y: startPt.y + (signY >= 0 ? diagMag : -diagMag),
+        },
+        modeLabel: '45°',
+      };
+    },
+    []
+  );
+
+  // Track Shift key state dynamically while GDS Ruler tool is active
+  useEffect(() => {
+    if (tool !== 'ruler') {
+      setShiftKeyDown(false);
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setShiftKeyDown(true);
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setShiftKeyDown(false);
+    };
+    const handleBlur = () => setShiftKeyDown(false);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [tool]);
+
   const handleMoveLayerOrder = (idx: number, dir: -1 | 1) => {
     const swapIdx = idx + dir;
     if (swapIdx < 0 || swapIdx >= layout.layers.length) return;
@@ -1846,7 +2493,36 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
     setDragOverLayerIdx(null);
   };
 
-  const selectedShape = layout.shapes.find((s) => s.id === selectedShapeId) || null;
+  const selectedShapeIdSet = useMemo(() => new Set(selectedShapeIds), [selectedShapeIds]);
+  const selectedShapes = useMemo(
+    () => layout.shapes.filter((s) => selectedShapeIdSet.has(s.id)),
+    [layout.shapes, selectedShapeIdSet]
+  );
+  const selectedShape = selectedShapes.length === 1 ? selectedShapes[0] : null;
+  const multiSelectBounds = useMemo(() => {
+    if (selectedShapes.length <= 1) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const s of selectedShapes) {
+      const b = getGdsShapeBounds(s);
+      minX = Math.min(minX, b.minX);
+      minY = Math.min(minY, b.minY);
+      maxX = Math.max(maxX, b.minX + b.width);
+      maxY = Math.max(maxY, b.minY + b.height);
+    }
+    if (!Number.isFinite(minX)) return null;
+    return {
+      minX,
+      minY,
+      maxX,
+      maxY,
+      width: Math.max(0, maxX - minX),
+      height: Math.max(0, maxY - minY),
+    };
+  }, [selectedShapes]);
+
   const activeLayerInfo =
     layerByKey.get(gdsLayerKey(activeLayerNum, activeDatatype)) ||
     layerByNum.get(activeLayerNum) ||
@@ -1902,7 +2578,38 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
       id: `gds_${dup.type}_${Date.now()}`,
     };
     updateLayout({ ...layout, shapes: [...layout.shapes, cloned] });
-    setSelectedShapeId(cloned.id);
+    setSelectedShapeIds([cloned.id]);
+  };
+
+  const handleMoveSelectedShapes = (dx: number, dy: number) => {
+    if (selectedShapes.length === 0 || (dx === 0 && dy === 0)) return;
+    updateLayout({
+      ...layout,
+      shapes: layout.shapes.map((s) =>
+        selectedShapeIdSet.has(s.id) ? moveGdsShape(s, dx, dy) : s
+      ),
+    });
+  };
+
+  const handleDuplicateSelectedShapes = () => {
+    if (selectedShapes.length === 0) return;
+    const baseTs = Date.now();
+    const clones: GdsShape[] = selectedShapes.map((s, idx) => ({
+      ...moveGdsShape(s, 250, 250),
+      id: `gds_${s.type}_${baseTs}_${idx}`,
+    }));
+    updateLayout({ ...layout, shapes: [...layout.shapes, ...clones] });
+    setSelectedShapeIds(clones.map((c) => c.id));
+  };
+
+  const handleDeleteSelectedShapes = () => {
+    if (selectedShapes.length === 0) return;
+    updateLayout({
+      ...layout,
+      shapes: layout.shapes.filter((s) => !selectedShapeIdSet.has(s.id)),
+    });
+    setSelectedShapeIds([]);
+    setShowArrayTool(false);
   };
 
   return (
@@ -1922,11 +2629,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             [
               { id: 'select', label: 'Select', icon: MousePointer2 },
               { id: 'pan', label: 'Pan', icon: Hand },
+              { id: 'zoom', label: 'Zoom', icon: ZoomIn },
               { id: 'rect', label: 'Rect', icon: Square },
               { id: 'path', label: 'Path', icon: Spline },
               { id: 'polygon', label: 'Poly', icon: Pentagon },
               { id: 'circle', label: 'Circle', icon: Circle },
               { id: 'section', label: `Cut`, icon: Scissors },
+              { id: 'ruler', label: 'Ruler', icon: Ruler },
             ] as const
           ).map((item) => {
             const Icon = item.icon;
@@ -1941,6 +2650,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   setDraftPoints([]);
                   setDraftHoverPoint(null);
                   setDragBox(null);
+                  setZoomBox(null);
                 }}
                 className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium border shrink-0 transition-colors ${
                   active
@@ -1958,6 +2668,24 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0 pl-1 border-l border-slate-800">
+          <button
+            type="button"
+            onClick={handleUndo}
+            disabled={!historyState.canUndo}
+            className="p-1 rounded-md bg-slate-800 border border-slate-700 text-slate-200 disabled:opacity-35 disabled:pointer-events-none"
+            title="Undo GDS edit (Ctrl+Z)"
+          >
+            <Undo2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={handleRedo}
+            disabled={!historyState.canRedo}
+            className="p-1 rounded-md bg-slate-800 border border-slate-700 text-slate-200 disabled:opacity-35 disabled:pointer-events-none"
+            title="Redo GDS edit (Ctrl+Y)"
+          >
+            <Redo2 className="w-3.5 h-3.5" />
+          </button>
           <button
             type="button"
             onClick={() => setShowCutPanel((v) => !v)}
@@ -1993,7 +2721,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               setMobileLayersOpen(true);
             }}
             className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold transition-colors ${
-              selectedShape
+              selectedShapes.length > 0
                 ? 'bg-sky-600/25 border-sky-500 text-sky-300'
                 : 'bg-slate-800 border-slate-700 text-slate-200'
             }`}
@@ -2114,7 +2842,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   type="button"
                   onClick={() => {
                     updateLayout({ ...layout, shapes: [] });
-                    setSelectedShapeId(null);
+                    setSelectedShapeIds([]);
                     setMobileToolsMenuOpen(false);
                   }}
                   className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-[11px] font-medium"
@@ -2134,8 +2862,19 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
         <div className="flex items-center gap-1 flex-wrap">
           {(
             [
-              { id: 'select', label: 'Select', icon: MousePointer2, tip: 'Select & Move GDS Shapes or Cut Lines' },
+              {
+                id: 'select',
+                label: 'Select',
+                icon: MousePointer2,
+                tip: 'Click or drag marquee box to select shapes (Shift/Ctrl+Click to multi-select, drag any selected to move all)',
+              },
               { id: 'pan', label: 'Pan', icon: Hand, tip: 'Pan Canvas (or Alt/Middle-drag)' },
+              {
+                id: 'zoom',
+                label: 'Zoom',
+                icon: ZoomIn,
+                tip: 'Magnifying glass: drag box or click to zoom in (hold Ctrl to zoom out)',
+              },
               { id: 'rect', label: 'Rect', icon: Square, tip: 'Draw GDS Box / Rectangle' },
               { id: 'path', label: 'Path', icon: Spline, tip: 'Draw Wire / Path (dbl-click to finish)' },
               { id: 'polygon', label: 'Poly', icon: Pentagon, tip: 'Draw Polygon (dbl-click or click start to close)' },
@@ -2145,6 +2884,12 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 label: sectionLine ? `Cut ${sectionLine.label}` : 'Add Cut',
                 icon: Scissors,
                 tip: 'Drag for 2-pt cut, or click multiple points & double-click for multi-point cut',
+              },
+              {
+                id: 'ruler',
+                label: 'Ruler',
+                icon: Ruler,
+                tip: 'Measure ΔX, ΔY, and distance on GDS layout (click two points or drag)',
               },
             ] as const
           ).map((item) => {
@@ -2160,6 +2905,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   setDraftPoints([]);
                   setDraftHoverPoint(null);
                   setDragBox(null);
+                  setZoomBox(null);
                 }}
                 title={item.tip}
                 className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
@@ -2207,6 +2953,26 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
 
         {/* File Import & Layout Actions */}
         <div className="flex items-center gap-1.5 flex-wrap">
+          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={!historyState.canUndo}
+              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              title="Undo GDS edit (Ctrl+Z)"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={handleRedo}
+              disabled={!historyState.canRedo}
+              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              title="Redo GDS edit (Ctrl+Y)"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
@@ -2268,7 +3034,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               type="button"
               onClick={() => {
                 updateLayout({ ...layout, shapes: [] });
-                setSelectedShapeId(null);
+                setSelectedShapeIds([]);
               }}
               className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/50 text-slate-400 hover:text-rose-400 border border-slate-700 transition-colors"
               title="Clear all GDS shapes"
@@ -2311,7 +3077,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             type="button"
             onClick={() => setMobileLayersOpen(true)}
             className={`lg:hidden flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-semibold transition-colors ${
-              selectedShape
+              selectedShapes.length > 0
                 ? 'bg-sky-600/20 border-sky-500/60 text-sky-300'
                 : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
             }`}
@@ -2333,6 +3099,10 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
           className={`relative flex-1 bg-[#050811] overflow-hidden select-none touch-none ${
             tool === 'pan' || pointerOp?.kind === 'pan'
               ? 'cursor-grab'
+              : tool === 'zoom'
+              ? ctrlKeyDown || shiftKeyDown
+                ? 'cursor-zoom-out'
+                : 'cursor-zoom-in'
               : tool === 'select'
               ? 'cursor-default'
               : 'cursor-crosshair'
@@ -2347,6 +3117,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             onPointerUp={handleSvgPointerUp}
             onPointerCancel={handleSvgPointerUp}
             onPointerLeave={() => {
+              setHoverScreenPos(null);
               setDraftHoverPoint(null);
               setCursorWorld(null);
             }}
@@ -2445,7 +3216,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                     ? color
                     : `url(#${getGdsPatternDefId(color, effectivePattern)})`;
                 const fillOpacity = effectivePattern === 'solid' ? 0.35 : undefined;
-                const isSel = selectedShapeId === shape.id;
+                const isSel = selectedShapeIdSet.has(shape.id);
                 const polys = shapeToPolygons(shape);
 
                 return (
@@ -2527,9 +3298,19 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         fill="#0f172a"
                         stroke="#38bdf8"
                         strokeWidth="1.6"
-                        style={{ cursor: h.cursor }}
+                        style={{
+                          cursor:
+                            tool === 'ruler'
+                              ? 'crosshair'
+                              : tool === 'zoom'
+                              ? ctrlKeyDown || shiftKeyDown
+                                ? 'zoom-out'
+                                : 'zoom-in'
+                              : h.cursor,
+                        }}
+                        pointerEvents={tool === 'ruler' || tool === 'zoom' ? 'none' : undefined}
                         onPointerDown={(e) => {
-                          if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
+                          if (e.button !== 0 || e.altKey || tool === 'pan' || tool === 'ruler' || tool === 'zoom' || draftPoints.length > 0) return;
                           e.stopPropagation();
                           const captureTarget =
                             (e.currentTarget as SVGGraphicsElement).ownerSVGElement || e.currentTarget;
@@ -2538,6 +3319,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                           } catch {
                             // ignore
                           }
+                          dragStartLayoutRef.current = latestLayoutRef.current;
                           setPointerOp({
                             kind: 'resize-shape',
                             shape: selectedShape,
@@ -2550,6 +3332,117 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   </g>
                 );
               })()}
+
+            {/* Multi-Selection Combined Bounding Box */}
+            {multiSelectBounds &&
+              !dragBox &&
+              !marqueeBox &&
+              (() => {
+                const tl = worldToScreen(multiSelectBounds.minX, multiSelectBounds.maxY);
+                const br = worldToScreen(multiSelectBounds.maxX, multiSelectBounds.minY);
+                const boxX = Math.min(tl.x, br.x);
+                const boxY = Math.min(tl.y, br.y);
+                const boxW = Math.max(4, Math.abs(br.x - tl.x));
+                const boxH = Math.max(4, Math.abs(br.y - tl.y));
+                return (
+                  <g pointerEvents="none">
+                    <rect
+                      x={boxX - 3}
+                      y={boxY - 3}
+                      width={boxW + 6}
+                      height={boxH + 6}
+                      fill="#38bdf8"
+                      fillOpacity="0.06"
+                      stroke="#38bdf8"
+                      strokeWidth="1.4"
+                      strokeDasharray="5 3"
+                    />
+                    <g transform={`translate(${boxX - 3}, ${Math.max(18, boxY - 8)})`}>
+                      <rect x="0" y="-14" width="112" height="15" rx="3" fill="#0284c7" />
+                      <text
+                        x="6"
+                        y="-4"
+                        fill="#ffffff"
+                        fontSize="9.5"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="700"
+                      >
+                        {selectedShapes.length} selected · drag
+                      </text>
+                    </g>
+                  </g>
+                );
+              })()}
+
+            {/* Marquee Drag Selection Box */}
+            {marqueeBox && (() => {
+              const p1 = worldToScreen(marqueeBox.start.x, marqueeBox.start.y);
+              const p2 = worldToScreen(marqueeBox.current.x, marqueeBox.current.y);
+              const x = Math.min(p1.x, p2.x);
+              const y = Math.min(p1.y, p2.y);
+              const w = Math.abs(p2.x - p1.x);
+              const h = Math.abs(p2.y - p1.y);
+              return (
+                <rect
+                  x={x}
+                  y={y}
+                  width={w}
+                  height={h}
+                  fill="#38bdf8"
+                  fillOpacity="0.14"
+                  stroke="#38bdf8"
+                  strokeWidth="1.4"
+                  strokeDasharray="4 3"
+                  pointerEvents="none"
+                />
+              );
+            })()}
+
+            {/* Magnifying Glass Drag-to-Zoom Box */}
+            {zoomBox && (() => {
+              const p1 = worldToScreen(zoomBox.start.x, zoomBox.start.y);
+              const p2 = worldToScreen(zoomBox.current.x, zoomBox.current.y);
+              const x = Math.min(p1.x, p2.x);
+              const y = Math.min(p1.y, p2.y);
+              const w = Math.abs(p2.x - p1.x);
+              const h = Math.abs(p2.y - p1.y);
+              const spanWUm = (Math.abs(zoomBox.current.x - zoomBox.start.x) / 1000).toFixed(2);
+              const spanHUm = (Math.abs(zoomBox.current.y - zoomBox.start.y) / 1000).toFixed(2);
+              const isOutMode = ctrlKeyDown || shiftKeyDown;
+              const strokeCol = isOutMode ? '#f59e0b' : '#22d3ee';
+              const badgeBg = isOutMode ? '#451a03' : '#083344';
+              const textCol = isOutMode ? '#fef3c7' : '#cffafe';
+              return (
+                <g pointerEvents="none">
+                  <rect
+                    x={x}
+                    y={y}
+                    width={w}
+                    height={h}
+                    fill={strokeCol}
+                    fillOpacity="0.12"
+                    stroke={strokeCol}
+                    strokeWidth="1.6"
+                    strokeDasharray="6 3"
+                  />
+                  {w >= 14 && h >= 14 && (
+                    <g transform={`translate(${x}, ${Math.max(18, y - 6)})`}>
+                      <rect x="0" y="-14" width={isOutMode ? 148 : 138} height="15" rx="3" fill={badgeBg} stroke={strokeCol} strokeWidth="0.9" />
+                      <text
+                        x="6"
+                        y="-3.5"
+                        fill={textCol}
+                        fontSize="9.5"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="700"
+                      >
+                        {isOutMode ? 'Zoom Out' : 'Zoom In'} {spanWUm} × {spanHUm} µm
+                      </text>
+                    </g>
+                  )}
+                </g>
+              );
+            })()}
 
             {/* Rubber-band Draw Preview (Rect / Circle / Section) */}
             {dragBox && tool === 'rect' && (() => {
@@ -2721,7 +3614,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               const [lblStart, lblEnd] = getSectionEndLabels(cut.label);
               const midWorld = getSectionMidpoint(cut);
               const midScr = worldToScreen(midWorld.x, midWorld.y);
-              const canDragLineBody = tool !== 'pan' && draftPoints.length === 0;
+              const canDragLineBody = tool !== 'pan' && tool !== 'ruler' && tool !== 'zoom' && draftPoints.length === 0;
               const isSmallCanvas = svgSize.w < 640;
               const hitStrokeWidth = tool === 'select' || tool === 'section' ? (isSmallCanvas ? 24 : 16) : isSmallCanvas ? 16 : 9;
               const showIntervals = isActiveCut || isIncludedInConcat;
@@ -2732,12 +3625,13 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 : { cutLength: 0, intervals: [] };
 
               const startLineDrag = (e: React.PointerEvent<Element>) => {
-                if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
+                if (e.button !== 0 || e.altKey || tool === 'pan' || tool === 'ruler' || tool === 'zoom' || draftPoints.length > 0) return;
                 e.stopPropagation();
                 const { sx, sy } = getLocalCoords(e.clientX, e.clientY);
                 const startWorld = screenToWorld(sx, sy, true);
+                dragStartLayoutRef.current = latestLayoutRef.current;
                 if (cut.id !== activeSectionLine?.id) {
-                  updateSectionLines(sectionLines, cut.id);
+                  updateSectionLines(sectionLines, cut.id, true);
                 }
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
                 setPointerOp({
@@ -2748,18 +3642,20 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               };
 
               const startVertexDrag = (vertexIndex: number, e: React.PointerEvent<Element>) => {
-                if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
+                if (e.button !== 0 || e.altKey || tool === 'pan' || tool === 'ruler' || tool === 'zoom' || draftPoints.length > 0) return;
                 e.stopPropagation();
+                dragStartLayoutRef.current = latestLayoutRef.current;
                 if (cut.id !== activeSectionLine?.id) {
-                  updateSectionLines(sectionLines, cut.id);
+                  updateSectionLines(sectionLines, cut.id, true);
                 }
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
                 setPointerOp({ kind: 'drag-section-vertex', initSection: cut, vertexIndex });
               };
 
               const startInsertVertexDrag = (segIdx: number, e: React.PointerEvent<Element>) => {
-                if (e.button !== 0 || e.altKey || tool === 'pan' || draftPoints.length > 0) return;
+                if (e.button !== 0 || e.altKey || tool === 'pan' || tool === 'ruler' || tool === 'zoom' || draftPoints.length > 0) return;
                 e.stopPropagation();
+                dragStartLayoutRef.current = latestLayoutRef.current;
                 const segMid: GdsPoint = {
                   x: Math.round((pts[segIdx].x + pts[segIdx + 1].x) * 0.5),
                   y: Math.round((pts[segIdx].y + pts[segIdx + 1].y) * 0.5),
@@ -2770,7 +3666,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   ...pts.slice(segIdx + 1),
                 ];
                 const updatedCut = withSectionPoints(cut, nextPts);
-                updateSingleSection(updatedCut);
+                updateSingleSection(updatedCut, true);
                 (e.currentTarget as Element).setPointerCapture(e.pointerId);
                 setPointerOp({
                   kind: 'drag-section-vertex',
@@ -2903,6 +3799,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   {/* Center label badge (also acts as explicit drag handle for moving cut line) */}
                   <g
                     className={canDragLineBody ? 'cursor-grab active:cursor-grabbing' : ''}
+                    pointerEvents={canDragLineBody ? undefined : 'none'}
                     onPointerEnter={() => setHoveredSectionId(cut.id)}
                     onPointerLeave={() =>
                       setHoveredSectionId((prev) => (prev === cut.id ? null : prev))
@@ -2957,7 +3854,8 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                     return (
                       <g
                         key={`cut_vtx_${cut.id}_${vIdx}`}
-                        className="cursor-move"
+                        className={canDragLineBody ? 'cursor-move' : ''}
+                        pointerEvents={canDragLineBody ? undefined : 'none'}
                         onPointerDown={(e) => startVertexDrag(vIdx, e)}
                         onDoubleClick={(e) => handleRemoveInteriorVertex(vIdx, e)}
                       >
@@ -2989,6 +3887,221 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                 </g>
               );
             })}
+
+            {/* GDS MEASUREMENT RULER & GEOMETRY SNAP RETICLE */}
+            {(rulerPoints.length > 0 || (tool === 'ruler' && rulerSnapTarget)) && (() => {
+              const formatRulerVal = (nm: number) =>
+                Math.abs(nm) >= 1000
+                  ? `${+(nm / 1000).toFixed(3)} µm`
+                  : `${Math.round(nm)} nm`;
+
+              const rawPreviewEnd: GdsPoint | null =
+                tool === 'ruler' && rulerPoints.length === 1
+                  ? rulerSnapTarget?.point ?? cursorWorld
+                  : null;
+              const isShiftPreviewConstrained =
+                tool === 'ruler' &&
+                rulerPoints.length === 1 &&
+                rulerAngleSnap &&
+                shiftKeyDown &&
+                rawPreviewEnd !== null;
+              const constrainedPreview =
+                isShiftPreviewConstrained && rawPreviewEnd
+                  ? constrainGdsRulerPoint(rulerPoints[0], rawPreviewEnd)
+                  : null;
+              const previewEnd = constrainedPreview
+                ? constrainedPreview.point
+                : rawPreviewEnd;
+
+              const activeDragAngleBadge: 'H' | 'V' | '45°' | undefined =
+                tool === 'ruler' &&
+                pointerOp?.kind === 'ruler-drag' &&
+                rulerPoints.length === 2 &&
+                rulerAngleSnap &&
+                shiftKeyDown
+                  ? constrainGdsRulerPoint(rulerPoints[0], rulerPoints[1]).modeLabel
+                  : undefined;
+
+              const renderRulerSpan = (
+                ptA: GdsPoint,
+                ptB: GdsPoint,
+                isPreview: boolean,
+                angleBadge?: 'H' | 'V' | '45°'
+              ) => {
+                const sA = worldToScreen(ptA.x, ptA.y);
+                const sB = worldToScreen(ptB.x, ptB.y);
+                const dxNm = Math.abs(ptB.x - ptA.x);
+                const dyNm = Math.abs(ptB.y - ptA.y);
+                const distNm = Math.hypot(dxNm, dyNm);
+                const midX = (sA.x + sB.x) * 0.5;
+                const midY = (sA.y + sB.y) * 0.5;
+                const color = angleBadge ? '#a78bfa' : isPreview ? '#38bdf8' : '#f59e0b';
+                const labelText = angleBadge
+                  ? `ΔX: ${formatRulerVal(dxNm)} | ΔY: ${formatRulerVal(dyNm)} | L: ${formatRulerVal(distNm)} · ${angleBadge}`
+                  : `ΔX: ${formatRulerVal(dxNm)} | ΔY: ${formatRulerVal(dyNm)} | L: ${formatRulerVal(distNm)}`;
+                const boxW = Math.max(176, labelText.length * 6.3 + 16);
+
+                return (
+                  <g opacity={isPreview ? 0.88 : 1} pointerEvents="none">
+                    {/* Orthogonal ΔX / ΔY reference legs */}
+                    {dxNm > 1 && dyNm > 1 && (
+                      <path
+                        d={`M ${sA.x.toFixed(1)} ${sA.y.toFixed(1)} L ${sB.x.toFixed(1)} ${sA.y.toFixed(1)} L ${sB.x.toFixed(1)} ${sB.y.toFixed(1)}`}
+                        fill="none"
+                        stroke={color}
+                        strokeOpacity="0.4"
+                        strokeWidth="1.2"
+                        strokeDasharray="3 3"
+                      />
+                    )}
+                    <line
+                      x1={sA.x}
+                      y1={sA.y}
+                      x2={sB.x}
+                      y2={sB.y}
+                      stroke={color}
+                      strokeWidth="2"
+                      strokeDasharray={isPreview ? '5 3' : undefined}
+                    />
+                    <g
+                      transform={`translate(${Math.max(boxW * 0.5 + 8, Math.min(svgSize.w - boxW * 0.5 - 8, midX))}, ${Math.max(30, midY - 14)})`}
+                    >
+                      <rect
+                        x={-boxW * 0.5}
+                        y={-12}
+                        width={boxW}
+                        height={21}
+                        rx="5"
+                        fill="#0f172a"
+                        fillOpacity="0.94"
+                        stroke={color}
+                        strokeWidth="1.2"
+                      />
+                      <text
+                        x="0"
+                        y="2"
+                        fill={angleBadge ? '#ddd6fe' : isPreview ? '#7dd3fc' : '#fbbf24'}
+                        fontSize="10"
+                        fontWeight="600"
+                        fontFamily="JetBrains Mono, monospace"
+                        textAnchor="middle"
+                      >
+                        {labelText}
+                      </text>
+                    </g>
+                  </g>
+                );
+              };
+
+              return (
+                <g pointerEvents="none">
+                  {rulerPoints.length === 1 &&
+                    previewEnd &&
+                    renderRulerSpan(
+                      rulerPoints[0],
+                      previewEnd,
+                      true,
+                      constrainedPreview?.modeLabel
+                    )}
+
+                  {rulerPoints.length === 2 &&
+                    renderRulerSpan(
+                      rulerPoints[0],
+                      rulerPoints[1],
+                      pointerOp?.kind === 'ruler-drag',
+                      activeDragAngleBadge
+                    )}
+
+                  {rulerPoints.map((pt, idx) => {
+                    const sp = worldToScreen(pt.x, pt.y);
+                    return (
+                      <circle
+                        key={`gds_ruler_pt_${idx}`}
+                        cx={sp.x}
+                        cy={sp.y}
+                        r="4.5"
+                        fill="#f59e0b"
+                        stroke="#ffffff"
+                        strokeWidth="1.5"
+                      />
+                    );
+                  })}
+
+                  {tool === 'ruler' && rulerSnapTarget && (() => {
+                    const sp = worldToScreen(rulerSnapTarget.point.x, rulerSnapTarget.point.y);
+                    const sz = 5.5;
+                    const snapColor =
+                      rulerSnapTarget.kind === 'vertex'
+                        ? '#34d399'
+                        : rulerSnapTarget.kind === 'midpoint'
+                        ? '#38bdf8'
+                        : '#fbbf24';
+                    const snapTag =
+                      rulerSnapTarget.kind === 'vertex'
+                        ? 'VERTEX'
+                        : rulerSnapTarget.kind === 'midpoint'
+                        ? 'MID'
+                        : 'EDGE';
+                    return (
+                      <g>
+                        {rulerSnapTarget.kind === 'vertex' && (
+                          <rect
+                            x={sp.x - sz}
+                            y={sp.y - sz}
+                            width={sz * 2}
+                            height={sz * 2}
+                            fill="rgba(52, 211, 153, 0.18)"
+                            stroke={snapColor}
+                            strokeWidth="1.8"
+                          />
+                        )}
+                        {rulerSnapTarget.kind === 'midpoint' && (
+                          <polygon
+                            points={`${sp.x},${sp.y - sz * 1.25} ${sp.x + sz * 1.25},${sp.y} ${sp.x},${sp.y + sz * 1.25} ${sp.x - sz * 1.25},${sp.y}`}
+                            fill="rgba(56, 189, 248, 0.18)"
+                            stroke={snapColor}
+                            strokeWidth="1.8"
+                          />
+                        )}
+                        {rulerSnapTarget.kind === 'edge' && (
+                          <circle
+                            cx={sp.x}
+                            cy={sp.y}
+                            r={sz}
+                            fill="rgba(251, 191, 36, 0.16)"
+                            stroke={snapColor}
+                            strokeWidth="1.8"
+                          />
+                        )}
+                        <circle cx={sp.x} cy={sp.y} r="2" fill={snapColor} />
+                        <rect
+                          x={sp.x + 8}
+                          y={sp.y - 17}
+                          width={42}
+                          height={14}
+                          rx="3"
+                          fill="#0f172a"
+                          fillOpacity="0.92"
+                          stroke={snapColor}
+                          strokeWidth="0.9"
+                        />
+                        <text
+                          x={sp.x + 29}
+                          y={sp.y - 7}
+                          fill={snapColor}
+                          fontSize="8.5"
+                          fontWeight="700"
+                          fontFamily="JetBrains Mono, monospace"
+                          textAnchor="middle"
+                        >
+                          {snapTag}
+                        </text>
+                      </g>
+                    );
+                  })()}
+                </g>
+              );
+            })()}
           </svg>
 
           {/* Top-left Active Drawing Layer Chip on Mobile/Tablet (< lg) */}
@@ -3023,6 +4136,24 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             </button>
             <button
               type="button"
+              onClick={() => {
+                setTool((prev) => (prev === 'zoom' ? 'select' : 'zoom'));
+                setDraftPoints([]);
+                setDraftHoverPoint(null);
+                setDragBox(null);
+                setZoomBox(null);
+              }}
+              className={`p-0.5 rounded transition-colors ${
+                tool === 'zoom'
+                  ? 'bg-sky-600 text-white shadow-sm'
+                  : 'text-slate-300 hover:text-white hover:bg-slate-800'
+              }`}
+              title="Magnifying Glass Zoom Tool (drag or click to zoom in, hold Ctrl to zoom out)"
+            >
+              <Search className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
               onClick={() => setCamera((c) => ({ ...c, spanX: Math.min(2000000, c.spanX * 1.33) }))}
               className="p-0.5 hover:text-white"
               title="Zoom Out"
@@ -3033,9 +4164,22 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               type="button"
               onClick={() => fitCameraToLayout(layout)}
               className="p-0.5 hover:text-white"
-              title="Fit Layout to View"
+              title="Fit Layout to View (F)"
             >
               <Maximize2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => fitCameraToShapes(selectedShapes)}
+              disabled={selectedShapes.length === 0}
+              className="p-0.5 text-sky-300 hover:text-white disabled:text-slate-500 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              title={
+                selectedShapes.length > 0
+                  ? `Zoom Fit to Selection (${selectedShapes.length} shape${selectedShapes.length > 1 ? 's' : ''}) — F / Shift+F`
+                  : 'Zoom Fit to Selection (Shift+F) — Select 1+ shapes first'
+              }
+            >
+              <Focus className="w-3.5 h-3.5" />
             </button>
             {cursorWorld && (
               <span className="hidden sm:inline pl-1.5 border-l border-slate-700 text-sky-300">
@@ -3075,14 +4219,106 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             </div>
           )}
 
-          {layout.shapes.length === 0 && draftPoints.length === 0 && (
+          {/* Active GDS Measurement Ruler HUD Banner */}
+          {tool === 'ruler' && (
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              className="absolute top-10 lg:top-3 left-2 sm:left-3 z-10 flex flex-wrap items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/92 border border-amber-500/60 text-amber-200 text-[11px] font-medium shadow-lg backdrop-blur-md"
+            >
+              <Ruler className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              {rulerPoints.length === 2 ? (() => {
+                const dxNm = Math.abs(rulerPoints[1].x - rulerPoints[0].x);
+                const dyNm = Math.abs(rulerPoints[1].y - rulerPoints[0].y);
+                const distNm = Math.hypot(dxNm, dyNm);
+                const fmt = (v: number) =>
+                  Math.abs(v) >= 1000 ? `${+(v / 1000).toFixed(3)} µm` : `${Math.round(v)} nm`;
+                return (
+                  <span className="font-mono text-[11px] text-amber-200">
+                    ΔX {fmt(dxNm)} · ΔY {fmt(dyNm)} · L {fmt(distNm)}
+                  </span>
+                );
+              })() : (
+                <span>
+                  {rulerPoints.length === 0
+                    ? 'Click & drag or pick 2 points to measure'
+                    : 'Click end point to complete measurement'}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => setRulerSnapToGeom((v) => !v)}
+                aria-pressed={rulerSnapToGeom}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium transition-colors ${
+                  rulerSnapToGeom
+                    ? 'bg-emerald-500/20 border-emerald-500/60 text-emerald-300'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+                title="Toggle snapping ruler to shape vertices, centers, midpoints & edges"
+              >
+                <Magnet className="w-3 h-3" />
+                <span>Snap Geom: {rulerSnapToGeom ? 'On' : 'Off'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRulerAngleSnap((v) => !v)}
+                aria-pressed={rulerAngleSnap}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium transition-colors ${
+                  rulerAngleSnap
+                    ? shiftKeyDown && (rulerPoints.length === 1 || pointerOp?.kind === 'ruler-drag')
+                      ? 'bg-violet-500/30 border-violet-400 text-violet-200'
+                      : 'bg-sky-500/20 border-sky-500/60 text-sky-300'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+                title="When On, holding Shift forces horizontal, vertical, or 45° measurement"
+              >
+                <span>Shift H/V/45°: {rulerAngleSnap ? 'On' : 'Off'}</span>
+              </button>
+              {rulerAngleSnap &&
+                shiftKeyDown &&
+                (rulerPoints.length === 1 ||
+                  (pointerOp?.kind === 'ruler-drag' && rulerPoints.length === 2)) && (
+                  <span className="px-1.5 py-0.5 rounded bg-violet-500/25 border border-violet-400/60 text-violet-200 text-[10px] font-mono font-semibold">
+                    {(() => {
+                      const target =
+                        pointerOp?.kind === 'ruler-drag' && rulerPoints.length === 2
+                          ? rulerPoints[1]
+                          : rulerSnapTarget?.point ?? cursorWorld;
+                      if (!target) return '0/45/90°';
+                      const { modeLabel } = constrainGdsRulerPoint(rulerPoints[0], target);
+                      return modeLabel === 'H' ? '0° (H)' : modeLabel === 'V' ? '90° (V)' : '45°';
+                    })()}
+                  </span>
+                )}
+              {rulerPoints.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setRulerPoints([])}
+                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[10px]"
+                >
+                  Clear
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setTool('select');
+                  setRulerPoints([]);
+                }}
+                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[10px]"
+              >
+                Done
+              </button>
+            </div>
+          )}
+
+          {layout.shapes.length === 0 && draftPoints.length === 0 && tool !== 'ruler' && (
             <div className="pointer-events-none hidden sm:block absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-lg bg-slate-900/85 border border-slate-800 text-[11px] text-slate-300 text-center max-w-[92%]">
               Draw shapes on the grid, click <span className="text-indigo-300 font-semibold">Import .GDS</span>, or load the <span className="text-amber-300 font-semibold">Example GDS</span>.
             </div>
           )}
 
           {/* Quick Inspector Shortcut when Layers panel is hidden or on Mobile/Tablet */}
-          {selectedShape && (!desktopLayersOpen || !mobileLayersOpen) && (
+          {selectedShapes.length > 0 && (!desktopLayersOpen || !mobileLayersOpen) && (
             <button
               type="button"
               onClick={() => {
@@ -3094,7 +4330,11 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               } absolute bottom-2 right-2 sm:bottom-3 sm:right-3 items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold shadow-lg`}
             >
               <Layers className="w-3.5 h-3.5" />
-              <span className="capitalize">Edit {selectedShape.type}</span>
+              <span className="capitalize">
+                {selectedShape
+                  ? `Edit ${selectedShape.type}`
+                  : `Edit ${selectedShapes.length} Shapes`}
+              </span>
             </button>
           )}
         </div>
@@ -3165,9 +4405,12 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               const isActive =
                 layer.layer === activeLayerNum && layerDt === activeDatatype;
               const isEditing = editingLayerKey === layerKey;
-              const shapeCount = layout.shapes.filter((s) =>
+              const layerShapes = layout.shapes.filter((s) =>
                 shapeMatchesLayer(s, layer.layer, layerDt)
-              ).length;
+              );
+              const shapeCount = layerShapes.length;
+              const isObjectsExpanded =
+                expandedObjectsLayerKey === layerKey && shapeCount > 0;
               const layerPattern: GdsPatternType = layer.pattern || 'diagonal-right';
               const isDragging = draggingLayerIdx === layerIdx;
               const isDropTarget =
@@ -3232,9 +4475,39 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                       className="flex items-center gap-0.5 shrink-0"
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <span className="text-[10px] font-mono text-slate-500 mr-0.5">
-                        {shapeCount}
-                      </span>
+                      <button
+                        type="button"
+                        disabled={shapeCount === 0}
+                        onClick={() => {
+                          if (shapeCount === 0) return;
+                          setActiveLayer({ layer: layer.layer, datatype: layerDt });
+                          setExpandedObjectsLayerKey((prev) =>
+                            prev === layerKey ? null : layerKey
+                          );
+                        }}
+                        className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded border text-[10px] font-mono mr-0.5 transition-colors ${
+                          shapeCount === 0
+                            ? 'border-transparent text-slate-600 cursor-default'
+                            : isObjectsExpanded
+                            ? 'bg-sky-600/30 border-sky-400/70 text-sky-200'
+                            : 'bg-slate-900 border-slate-700/80 text-slate-300 hover:border-sky-500/60 hover:text-sky-300'
+                        }`}
+                        title={
+                          shapeCount === 0
+                            ? `No objects on L${layer.layer}/${layerDt}`
+                            : isObjectsExpanded
+                            ? `Hide object list for L${layer.layer}/${layerDt}`
+                            : `Click to list & select ${shapeCount} object(s) on L${layer.layer}/${layerDt}`
+                        }
+                      >
+                        <span>{shapeCount}</span>
+                        {shapeCount > 0 &&
+                          (isObjectsExpanded ? (
+                            <ChevronDown className="w-2.5 h-2.5" />
+                          ) : (
+                            <ChevronRight className="w-2.5 h-2.5 opacity-70" />
+                          ))}
+                      </button>
                       <button
                         type="button"
                         onClick={() =>
@@ -3427,6 +4700,209 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                       ))}
                     </select>
                   </div>
+
+                  {/* Per-Layer Object Selection List */}
+                  {isObjectsExpanded && (() => {
+                    const selectedOnLayer = layerShapes.filter((s) =>
+                      selectedShapeIdSet.has(s.id)
+                    );
+                    const allLayerSelected =
+                      layerShapes.length > 0 &&
+                      selectedOnLayer.length === layerShapes.length;
+                    return (
+                      <div
+                        className="mt-1.5 pt-1.5 border-t border-slate-800/90 space-y-1.5"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="flex items-center justify-between gap-1 text-[10px]">
+                          <span className="font-semibold text-sky-300">
+                            Objects ({layerShapes.length})
+                            {selectedOnLayer.length > 0 && (
+                              <span className="text-slate-400 font-normal ml-1">
+                                · {selectedOnLayer.length} sel
+                              </span>
+                            )}
+                          </span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const layerIds = layerShapes.map((s) => s.id);
+                                const layerIdSet = new Set(layerIds);
+                                if (allLayerSelected) {
+                                  setSelectedShapeIds((prev) =>
+                                    prev.filter((id) => !layerIdSet.has(id))
+                                  );
+                                } else {
+                                  setSelectedShapeIds(layerIds);
+                                }
+                                setShowArrayTool(false);
+                              }}
+                              className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[9.5px] font-medium border border-slate-700 transition-colors"
+                              title={
+                                allLayerSelected
+                                  ? `Deselect all shapes on L${layer.layer}/${layerDt}`
+                                  : `Select all ${layerShapes.length} shapes on L${layer.layer}/${layerDt}`
+                              }
+                            >
+                              {allLayerSelected ? 'Deselect' : 'Select All'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                fitCameraToShapes(
+                                  selectedOnLayer.length > 0
+                                    ? selectedOnLayer
+                                    : layerShapes
+                                )
+                              }
+                              className="p-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 hover:text-white border border-slate-700 transition-colors"
+                              title={
+                                selectedOnLayer.length > 0
+                                  ? 'Zoom fit to selected objects on this layer'
+                                  : 'Zoom fit to all objects on this layer'
+                              }
+                            >
+                              <Focus className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="max-h-44 overflow-y-auto space-y-1 pr-0.5">
+                          {layerShapes.map((shape, sIdx) => {
+                            const isSel = selectedShapeIdSet.has(shape.id);
+                            const b = getGdsShapeBounds(shape);
+                            const ShapeIcon =
+                              shape.type === 'circle'
+                                ? Circle
+                                : shape.type === 'path'
+                                ? Spline
+                                : shape.type === 'polygon'
+                                ? Pentagon
+                                : Square;
+                            const typeLabel =
+                              shape.type === 'circle'
+                                ? 'Circle'
+                                : shape.type === 'path'
+                                ? 'Path'
+                                : shape.type === 'polygon'
+                                ? 'Poly'
+                                : 'Rect';
+                            const dimSummary =
+                              shape.type === 'circle'
+                                ? `R ${((shape.radius ?? 0) / 1000).toFixed(2)} µm`
+                                : `${(b.width / 1000).toFixed(2)}×${(b.height / 1000).toFixed(2)} µm`;
+                            const posSummary =
+                              shape.type === 'circle'
+                                ? `(${((shape.cx ?? 0) / 1000).toFixed(1)}, ${((shape.cy ?? 0) / 1000).toFixed(1)})`
+                                : `(${(b.minX / 1000).toFixed(1)}, ${(b.minY / 1000).toFixed(1)})`;
+
+                            return (
+                              <div
+                                key={shape.id}
+                                onClick={(e) => {
+                                  if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                                    setSelectedShapeIds((prev) =>
+                                      prev.includes(shape.id)
+                                        ? prev.filter((id) => id !== shape.id)
+                                        : [...prev, shape.id]
+                                    );
+                                  } else {
+                                    setSelectedShapeIds([shape.id]);
+                                  }
+                                  setShowArrayTool(false);
+                                }}
+                                onDoubleClick={() => {
+                                  setSelectedShapeIds([shape.id]);
+                                  setShowArrayTool(false);
+                                  fitCameraToShapes([shape]);
+                                }}
+                                className={`group flex items-center justify-between gap-1 px-1.5 py-1 rounded border text-[10px] cursor-pointer transition-colors ${
+                                  isSel
+                                    ? 'bg-sky-600/25 border-sky-500/70 text-sky-100'
+                                    : 'bg-slate-900/90 border-slate-800 hover:border-slate-700 text-slate-300'
+                                }`}
+                                title="Click to select · Ctrl/Shift+Click to multi-select · Double-click to zoom"
+                              >
+                                <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSelectedShapeIds((prev) =>
+                                        prev.includes(shape.id)
+                                          ? prev.filter((id) => id !== shape.id)
+                                          : [...prev, shape.id]
+                                      );
+                                      setShowArrayTool(false);
+                                    }}
+                                    className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 transition-colors ${
+                                      isSel
+                                        ? 'bg-sky-500 border-sky-400 text-white'
+                                        : 'bg-slate-950 border-slate-700 hover:border-sky-500'
+                                    }`}
+                                    title="Toggle object in selection"
+                                  >
+                                    {isSel && <Check className="w-2.5 h-2.5" />}
+                                  </button>
+                                  <ShapeIcon className="w-3 h-3 text-sky-400 shrink-0" />
+                                  <div className="min-w-0 flex-1 leading-tight">
+                                    <div className="flex items-center gap-1 truncate">
+                                      <span className="font-semibold text-slate-200">
+                                        {typeLabel} #{sIdx + 1}
+                                      </span>
+                                      <span className="font-mono text-[9.5px] text-sky-300 truncate">
+                                        {dimSummary}
+                                      </span>
+                                    </div>
+                                    <div className="font-mono text-[9px] text-slate-500 truncate">
+                                      {posSummary} µm
+                                    </div>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-0.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (!isSel) {
+                                        setSelectedShapeIds([shape.id]);
+                                      }
+                                      setShowArrayTool(false);
+                                      fitCameraToShapes([shape]);
+                                    }}
+                                    className="p-0.5 rounded text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                                    title="Zoom to this object"
+                                  >
+                                    <Focus className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      updateLayout({
+                                        ...layout,
+                                        shapes: layout.shapes.filter(
+                                          (s) => s.id !== shape.id
+                                        ),
+                                      });
+                                      setSelectedShapeIds((prev) =>
+                                        prev.filter((id) => id !== shape.id)
+                                      );
+                                    }}
+                                    className="p-0.5 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition-colors"
+                                    title="Delete this object"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
@@ -3442,8 +4918,156 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             )}
           </div>
 
-          {/* Selected Object Properties Inspector */}
-          {selectedShape ? (
+          {/* Selected Object(s) Properties Inspector */}
+          {selectedShapes.length > 1 && multiSelectBounds ? (
+            <div className="p-2.5 border-t border-slate-800 bg-slate-950/90 space-y-2.5 text-[11px] max-h-[48%] overflow-y-auto shrink-0">
+              <div className="flex items-center justify-between gap-1">
+                <span className="font-semibold text-white flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-sky-400" />
+                  <span>{selectedShapes.length} Shapes Selected</span>
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => fitCameraToShapes(selectedShapes)}
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 hover:text-white"
+                    title="Zoom Fit to Selected Shapes (F / Shift+F)"
+                  >
+                    <Focus className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDuplicateSelectedShapes}
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                    title="Duplicate all selected shapes"
+                  >
+                    <Copy className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDeleteSelectedShapes}
+                    className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 text-[10px]"
+                    title="Delete all selected shapes"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedShapeIds([])}
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white"
+                    title="Clear selection"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="px-2 py-1.5 rounded-lg bg-slate-900/80 border border-slate-800 text-[10px] font-mono text-slate-400 space-y-0.5">
+                <div>
+                  Group span:{' '}
+                  <span className="text-sky-300">
+                    {(multiSelectBounds.width / 1000).toFixed(2)} ×{' '}
+                    {(multiSelectBounds.height / 1000).toFixed(2)} µm
+                  </span>
+                </div>
+                <div className="text-[9.5px] text-slate-500">
+                  Drag any selected shape or use arrows / inputs below to move all together
+                </div>
+              </div>
+
+              {/* Group Origin X1 / Y1 */}
+              <div className="grid grid-cols-2 gap-1.5">
+                <label className="space-y-0.5">
+                  <span className="text-[10px] text-slate-400 block">Group Min X (nm)</span>
+                  <NmNumberInput
+                    value={multiSelectBounds.minX}
+                    onChange={(nx) => handleMoveSelectedShapes(nx - multiSelectBounds.minX, 0)}
+                    className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
+                  />
+                </label>
+                <label className="space-y-0.5">
+                  <span className="text-[10px] text-slate-400 block">Group Min Y (nm)</span>
+                  <NmNumberInput
+                    value={multiSelectBounds.minY}
+                    onChange={(ny) => handleMoveSelectedShapes(0, ny - multiSelectBounds.minY)}
+                    className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
+                  />
+                </label>
+              </div>
+
+              {/* Relative Offset Move All (ΔX, ΔY) */}
+              <div className="p-2 rounded-lg bg-slate-900/80 border border-slate-800 space-y-1.5">
+                <span className="text-[10px] font-semibold text-slate-300 block">
+                  Shift All Shapes (ΔX, ΔY nm)
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <label className="space-y-0.5">
+                    <span className="text-[9.5px] text-slate-400 block">ΔX (nm)</span>
+                    <NmNumberInput
+                      value={multiShiftDx}
+                      min={-1000000}
+                      max={1000000}
+                      onChange={setMultiShiftDx}
+                      className="w-full px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 font-mono text-[10.5px] text-sky-300"
+                    />
+                  </label>
+                  <label className="space-y-0.5">
+                    <span className="text-[9.5px] text-slate-400 block">ΔY (nm)</span>
+                    <NmNumberInput
+                      value={multiShiftDy}
+                      min={-1000000}
+                      max={1000000}
+                      onChange={setMultiShiftDy}
+                      className="w-full px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 font-mono text-[10.5px] text-sky-300"
+                    />
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleMoveSelectedShapes(multiShiftDx, multiShiftDy)}
+                  className="w-full py-1 px-2 rounded bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-semibold transition-colors"
+                >
+                  Apply Move ({multiShiftDx >= 0 ? `+${multiShiftDx}` : multiShiftDx},{' '}
+                  {multiShiftDy >= 0 ? `+${multiShiftDy}` : multiShiftDy} nm)
+                </button>
+              </div>
+
+              {/* Batch Layer Reassignment */}
+              <div className="grid grid-cols-3 gap-1.5 items-center">
+                <span className="text-[10px] text-slate-400">Move to Layer</span>
+                <select
+                  value=""
+                  onChange={(e) => {
+                    if (!e.target.value) return;
+                    const [lStr, dtStr] = e.target.value.split(':');
+                    const nextL = parseInt(lStr, 10);
+                    const nextDt = parseInt(dtStr, 10);
+                    if (!Number.isFinite(nextL)) return;
+                    updateLayout({
+                      ...layout,
+                      shapes: layout.shapes.map((s) =>
+                        selectedShapeIdSet.has(s.id)
+                          ? { ...s, layer: nextL, datatype: Number.isFinite(nextDt) ? nextDt : 0 }
+                          : s
+                      ),
+                    });
+                  }}
+                  className="col-span-2 px-1.5 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-200 focus:outline-none focus:border-sky-500"
+                >
+                  <option value="">Keep individual layers...</option>
+                  {layout.layers.map((l) => {
+                    const dt = l.datatype ?? 0;
+                    const key = gdsLayerKey(l.layer, dt);
+                    return (
+                      <option key={key} value={key}>
+                        L{l.layer}/{dt} · {l.name}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+            </div>
+          ) : selectedShape ? (
             <div className="p-2.5 border-t border-slate-800 bg-slate-950/90 space-y-2 text-[11px] max-h-[46%] overflow-y-auto shrink-0">
               <div className="flex items-center justify-between gap-1">
                 <span className="font-semibold text-white capitalize flex items-center gap-1.5">
@@ -3471,6 +5095,14 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   </button>
                   <button
                     type="button"
+                    onClick={() => fitCameraToShapes([selectedShape])}
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 hover:text-white"
+                    title="Zoom Fit to Selected Shape (F / Shift+F)"
+                  >
+                    <Focus className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleDuplicateSelectedShape}
                     className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
                     title="Duplicate selected object"
@@ -3484,7 +5116,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                         ...layout,
                         shapes: layout.shapes.filter((s) => s.id !== selectedShape.id),
                       });
-                      setSelectedShapeId(null);
+                      setSelectedShapeIds([]);
                       setShowArrayTool(false);
                     }}
                     className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 text-[10px]"
@@ -3774,115 +5406,444 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               </div>
 
               {/* RECTANGLE PROPERTIES */}
-              {selectedShape.type === 'rect' && (
-                <div className="space-y-1.5">
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">Width (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.width ?? 100}
-                        min={10}
-                        onChange={(w) => handleUpdateShape({ ...selectedShape, width: w })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-sky-300 focus:outline-none focus:border-sky-500"
+              {selectedShape.type === 'rect' && (() => {
+                const bMap = selectedShape.paramBindings || {};
+                const variables = flow.variables || [];
+                const setShapeBinding = (field: string, expr: string | undefined) => {
+                  const nextB = { ...bMap };
+                  if (expr && expr.trim()) nextB[field] = expr.trim();
+                  else delete nextB[field];
+                  handleUpdateShape({
+                    ...selectedShape,
+                    paramBindings: Object.keys(nextB).length > 0 ? nextB : undefined,
+                  });
+                };
+                const createAndBindShapeVar = (
+                  field: string,
+                  name: string,
+                  value: number,
+                  unit: 'nm' | 'um' | 'deg' | 'sec' | 'none',
+                  description?: string
+                ) => {
+                  const newVar = {
+                    id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                    name,
+                    value,
+                    unit,
+                    description,
+                  };
+                  const nextB = { ...bMap, [field]: name };
+                  const nextShape = { ...selectedShape, paramBindings: nextB };
+                  const nextGdsLayout: GdsLayoutData = {
+                    ...layout,
+                    shapes: layout.shapes.map((s) =>
+                      s.id === selectedShape.id ? nextShape : s
+                    ),
+                  };
+                  pushLayoutHistorySnapshot(latestLayoutRef.current, nextGdsLayout);
+                  onUpdateFlow(
+                    resolveFlowParameters({
+                      ...flow,
+                      variables: [...variables, newVar],
+                      gdsLayout: nextGdsLayout,
+                    })
+                  );
+                };
+                return (
+                  <div className="space-y-1.5">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">Width (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.width}
+                            isOpen={openGdsBindField === 'width'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'width' ? null : 'width')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.width ?? 100}
+                          min={10}
+                          onChange={(w) => {
+                            if (!bMap.width) handleUpdateShape({ ...selectedShape, width: w });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.width
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-sky-300 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">Height (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.height}
+                            isOpen={openGdsBindField === 'height'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'height' ? null : 'height')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.height ?? 100}
+                          min={10}
+                          onChange={(h) => {
+                            if (!bMap.height) handleUpdateShape({ ...selectedShape, height: h });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.height
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-sky-300 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">X (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.x}
+                            isOpen={openGdsBindField === 'x'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'x' ? null : 'x')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.x ?? 0}
+                          onChange={(x) => {
+                            if (!bMap.x) handleUpdateShape({ ...selectedShape, x });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.x
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-slate-200 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">Y (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.y}
+                            isOpen={openGdsBindField === 'y'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'y' ? null : 'y')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.y ?? 0}
+                          onChange={(y) => {
+                            if (!bMap.y) handleUpdateShape({ ...selectedShape, y });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.y
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-slate-200 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
+                    </div>
+                    {openGdsBindField && ['width', 'height', 'x', 'y'].includes(openGdsBindField) && (
+                      <ParamBindingPanel
+                        expression={bMap[openGdsBindField]}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        currentValue={
+                          openGdsBindField === 'width'
+                            ? selectedShape.width ?? 100
+                            : openGdsBindField === 'height'
+                            ? selectedShape.height ?? 100
+                            : openGdsBindField === 'x'
+                            ? selectedShape.x ?? 0
+                            : selectedShape.y ?? 0
+                        }
+                        unit="nm"
+                        suggestedVarName={`gds_${openGdsBindField}`}
+                        targetLabel={`GDS Rect · ${openGdsBindField}`}
+                        onChangeExpression={(expr) => setShapeBinding(openGdsBindField, expr)}
+                        onCreateAndBind={(name, val, unit, desc) =>
+                          createAndBindShapeVar(openGdsBindField, name, val, unit, desc)
+                        }
+                        onOpenVariablesModal={onOpenVariablesModal}
+                        onClose={() => setOpenGdsBindField(null)}
                       />
-                    </label>
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">Height (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.height ?? 100}
-                        min={10}
-                        onChange={(h) => handleUpdateShape({ ...selectedShape, height: h })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-sky-300 focus:outline-none focus:border-sky-500"
-                      />
-                    </label>
+                    )}
+                    <div className="text-[10px] font-mono text-slate-500">
+                      {((selectedShape.width ?? 0) / 1000).toFixed(2)} ×{' '}
+                      {((selectedShape.height ?? 0) / 1000).toFixed(2)} µm
+                    </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">X (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.x ?? 0}
-                        onChange={(x) => handleUpdateShape({ ...selectedShape, x })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
-                      />
-                    </label>
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">Y (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.y ?? 0}
-                        onChange={(y) => handleUpdateShape({ ...selectedShape, y })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
-                      />
-                    </label>
-                  </div>
-                  <div className="text-[10px] font-mono text-slate-500">
-                    {((selectedShape.width ?? 0) / 1000).toFixed(2)} ×{' '}
-                    {((selectedShape.height ?? 0) / 1000).toFixed(2)} µm
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* CIRCLE PROPERTIES */}
-              {selectedShape.type === 'circle' && (
-                <div className="space-y-1.5">
-                  <label className="space-y-0.5 block">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-slate-400">Diameter (nm)</span>
-                      <span className="font-mono text-slate-500">
-                        R: {Math.round(selectedShape.radius ?? 0)} nm
-                      </span>
+              {selectedShape.type === 'circle' && (() => {
+                const bMap = selectedShape.paramBindings || {};
+                const variables = flow.variables || [];
+                const setShapeBinding = (field: string, expr: string | undefined) => {
+                  const nextB = { ...bMap };
+                  if (expr && expr.trim()) nextB[field] = expr.trim();
+                  else delete nextB[field];
+                  handleUpdateShape({
+                    ...selectedShape,
+                    paramBindings: Object.keys(nextB).length > 0 ? nextB : undefined,
+                  });
+                };
+                const createAndBindShapeVar = (
+                  field: string,
+                  name: string,
+                  value: number,
+                  unit: 'nm' | 'um' | 'deg' | 'sec' | 'none',
+                  description?: string
+                ) => {
+                  const newVar = {
+                    id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                    name,
+                    value,
+                    unit,
+                    description,
+                  };
+                  const nextB = { ...bMap, [field]: name };
+                  const nextShape = { ...selectedShape, paramBindings: nextB };
+                  const nextGdsLayout: GdsLayoutData = {
+                    ...layout,
+                    shapes: layout.shapes.map((s) =>
+                      s.id === selectedShape.id ? nextShape : s
+                    ),
+                  };
+                  pushLayoutHistorySnapshot(latestLayoutRef.current, nextGdsLayout);
+                  onUpdateFlow(
+                    resolveFlowParameters({
+                      ...flow,
+                      variables: [...variables, newVar],
+                      gdsLayout: nextGdsLayout,
+                    })
+                  );
+                };
+                return (
+                  <div className="space-y-1.5">
+                    <label className="space-y-0.5 block">
+                      <div className="flex items-center justify-between text-[10px] gap-1">
+                        <span className="text-slate-400">Diameter (nm)</span>
+                        <div className="flex items-center gap-1">
+                          <span className="font-mono text-slate-500">
+                            R: {Math.round(selectedShape.radius ?? 0)} nm
+                          </span>
+                          <ParamBindingBadge
+                            expression={bMap.diameter}
+                            isOpen={openGdsBindField === 'diameter'}
+                            onToggle={() =>
+                              setOpenGdsBindField(
+                                openGdsBindField === 'diameter' ? null : 'diameter'
+                              )
+                            }
+                            compact
+                          />
+                        </div>
+                      </div>
+                      <NmNumberInput
+                        value={(selectedShape.radius ?? 100) * 2}
+                        min={20}
+                        onChange={(diam) => {
+                          if (!bMap.diameter) {
+                            handleUpdateShape({
+                              ...selectedShape,
+                              radius: Math.max(10, Math.round(diam / 2)),
+                            });
+                          }
+                        }}
+                        className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                          bMap.diameter
+                            ? 'border-violet-500/50 text-violet-300'
+                            : 'border-slate-700 text-sky-300 focus:border-sky-500'
+                        }`}
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">Center X (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.cx}
+                            isOpen={openGdsBindField === 'cx'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'cx' ? null : 'cx')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.cx ?? 0}
+                          onChange={(cx) => {
+                            if (!bMap.cx) handleUpdateShape({ ...selectedShape, cx });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.cx
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-slate-200 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
+                      <label className="space-y-0.5">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-400">Center Y (nm)</span>
+                          <ParamBindingBadge
+                            expression={bMap.cy}
+                            isOpen={openGdsBindField === 'cy'}
+                            onToggle={() =>
+                              setOpenGdsBindField(openGdsBindField === 'cy' ? null : 'cy')
+                            }
+                            compact
+                          />
+                        </div>
+                        <NmNumberInput
+                          value={selectedShape.cy ?? 0}
+                          onChange={(cy) => {
+                            if (!bMap.cy) handleUpdateShape({ ...selectedShape, cy });
+                          }}
+                          className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                            bMap.cy
+                              ? 'border-violet-500/50 text-violet-300'
+                              : 'border-slate-700 text-slate-200 focus:border-sky-500'
+                          }`}
+                        />
+                      </label>
                     </div>
-                    <NmNumberInput
-                      value={(selectedShape.radius ?? 100) * 2}
-                      min={20}
-                      onChange={(diam) =>
-                        handleUpdateShape({
-                          ...selectedShape,
-                          radius: Math.max(10, Math.round(diam / 2)),
-                        })
-                      }
-                      className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-sky-300 focus:outline-none focus:border-sky-500"
-                    />
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">Center X (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.cx ?? 0}
-                        onChange={(cx) => handleUpdateShape({ ...selectedShape, cx })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
+                    {openGdsBindField && ['diameter', 'cx', 'cy'].includes(openGdsBindField) && (
+                      <ParamBindingPanel
+                        expression={bMap[openGdsBindField]}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        currentValue={
+                          openGdsBindField === 'diameter'
+                            ? (selectedShape.radius ?? 100) * 2
+                            : openGdsBindField === 'cx'
+                            ? selectedShape.cx ?? 0
+                            : selectedShape.cy ?? 0
+                        }
+                        unit="nm"
+                        suggestedVarName={`gds_${openGdsBindField}`}
+                        targetLabel={`GDS Circle · ${openGdsBindField}`}
+                        onChangeExpression={(expr) => setShapeBinding(openGdsBindField, expr)}
+                        onCreateAndBind={(name, val, unit, desc) =>
+                          createAndBindShapeVar(openGdsBindField, name, val, unit, desc)
+                        }
+                        onOpenVariablesModal={onOpenVariablesModal}
+                        onClose={() => setOpenGdsBindField(null)}
                       />
-                    </label>
-                    <label className="space-y-0.5">
-                      <span className="text-[10px] text-slate-400 block">Center Y (nm)</span>
-                      <NmNumberInput
-                        value={selectedShape.cy ?? 0}
-                        onChange={(cy) => handleUpdateShape({ ...selectedShape, cy })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-slate-200 focus:outline-none focus:border-sky-500"
-                      />
-                    </label>
+                    )}
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* PATH PROPERTIES */}
               {selectedShape.type === 'path' && (() => {
                 const b = getGdsShapeBounds(selectedShape);
+                const bMap = selectedShape.paramBindings || {};
+                const variables = flow.variables || [];
+                const setShapeBinding = (field: string, expr: string | undefined) => {
+                  const nextB = { ...bMap };
+                  if (expr && expr.trim()) nextB[field] = expr.trim();
+                  else delete nextB[field];
+                  handleUpdateShape({
+                    ...selectedShape,
+                    paramBindings: Object.keys(nextB).length > 0 ? nextB : undefined,
+                  });
+                };
+                const createAndBindShapeVar = (
+                  field: string,
+                  name: string,
+                  value: number,
+                  unit: 'nm' | 'um' | 'deg' | 'sec' | 'none',
+                  description?: string
+                ) => {
+                  const newVar = {
+                    id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                    name,
+                    value,
+                    unit,
+                    description,
+                  };
+                  const nextB = { ...bMap, [field]: name };
+                  const nextShape = { ...selectedShape, paramBindings: nextB };
+                  const nextGdsLayout: GdsLayoutData = {
+                    ...layout,
+                    shapes: layout.shapes.map((s) =>
+                      s.id === selectedShape.id ? nextShape : s
+                    ),
+                  };
+                  pushLayoutHistorySnapshot(latestLayoutRef.current, nextGdsLayout);
+                  onUpdateFlow(
+                    resolveFlowParameters({
+                      ...flow,
+                      variables: [...variables, newVar],
+                      gdsLayout: nextGdsLayout,
+                    })
+                  );
+                };
                 return (
                   <div className="space-y-1.5">
                     <label className="space-y-0.5 block">
-                      <div className="flex items-center justify-between text-[10px]">
+                      <div className="flex items-center justify-between text-[10px] gap-1">
                         <span className="text-slate-400">Path Width (nm)</span>
-                        <span className="font-mono text-slate-500">
-                          {selectedShape.points?.length || 0} pts
-                        </span>
+                        <div className="flex items-center gap-1">
+                          <span className="font-mono text-slate-500">
+                            {selectedShape.points?.length || 0} pts
+                          </span>
+                          <ParamBindingBadge
+                            expression={bMap.pathWidth}
+                            isOpen={openGdsBindField === 'pathWidth'}
+                            onToggle={() =>
+                              setOpenGdsBindField(
+                                openGdsBindField === 'pathWidth' ? null : 'pathWidth'
+                              )
+                            }
+                            compact
+                          />
+                        </div>
                       </div>
                       <NmNumberInput
                         value={selectedShape.pathWidth ?? 200}
                         min={10}
-                        onChange={(pw) => handleUpdateShape({ ...selectedShape, pathWidth: pw })}
-                        className="w-full px-1.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px] text-sky-300 focus:outline-none focus:border-sky-500"
+                        onChange={(pw) => {
+                          if (!bMap.pathWidth) {
+                            handleUpdateShape({ ...selectedShape, pathWidth: pw });
+                          }
+                        }}
+                        className={`w-full px-1.5 py-1 rounded bg-slate-900 border font-mono text-[11px] focus:outline-none ${
+                          bMap.pathWidth
+                            ? 'border-violet-500/50 text-violet-300'
+                            : 'border-slate-700 text-sky-300 focus:border-sky-500'
+                        }`}
                       />
                     </label>
+                    {openGdsBindField === 'pathWidth' && (
+                      <ParamBindingPanel
+                        expression={bMap.pathWidth}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        currentValue={selectedShape.pathWidth ?? 200}
+                        unit="nm"
+                        suggestedVarName="path_w"
+                        targetLabel="GDS Path · pathWidth"
+                        onChangeExpression={(expr) => setShapeBinding('pathWidth', expr)}
+                        onCreateAndBind={(name, val, unit, desc) =>
+                          createAndBindShapeVar('pathWidth', name, val, unit, desc)
+                        }
+                        onOpenVariablesModal={onOpenVariablesModal}
+                        onClose={() => setOpenGdsBindField(null)}
+                      />
+                    )}
                     <div className="grid grid-cols-2 gap-1.5">
                       <label className="space-y-0.5">
                         <span className="text-[10px] text-slate-400 block">Origin X (nm)</span>
@@ -4024,7 +5985,7 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
             </div>
           ) : (
             <div className="px-3 py-2 border-t border-slate-800 bg-slate-950/60 text-[10px] text-slate-500 shrink-0">
-              Select a shape with the <span className="text-slate-300 font-medium">Select</span> tool to edit dimensions or drag cut lines.
+              Click or drag a box with the <span className="text-slate-300 font-medium">Select</span> tool to select &amp; move one or multiple shapes (<span className="font-mono text-slate-400">Shift/Ctrl+Click</span> toggles).
             </div>
           )}
         </div>

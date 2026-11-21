@@ -3,10 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useRef, useState, useEffect } from 'react';
-import { MaskWindow, ProcessStep } from '../types/microfab';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
+import { DesignVariable, LithographyConfig, MaskWindow, ProcessStep, VariableUnit } from '../types/microfab';
 import { resolveResistMaterialId } from '../lib/materials';
-import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown } from 'lucide-react';
+import {
+  MaskWindowArrayOptions,
+  createMaskWindowArray,
+  duplicateMaskWindow,
+} from '../lib/maskUtils';
+import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
+import { MaskWindowArrayPanel } from './MaskWindowArrayPanel';
+import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown, Copy, LayoutGrid, Undo2, Redo2 } from 'lucide-react';
 
 interface MaskEditorProps {
   step: ProcessStep;
@@ -15,6 +22,9 @@ interface MaskEditorProps {
   onOpenMaskLevels?: () => void;
   isMinimized?: boolean;
   onToggleMinimize?: () => void;
+  variables?: DesignVariable[];
+  onCreateVariable?: (name: string, value: number, unit: VariableUnit, description?: string) => void;
+  onOpenVariablesModal?: () => void;
 }
 
 interface DragState {
@@ -23,6 +33,14 @@ interface DragState {
   startClientX: number;
   initialXStart: number;
   initialXEnd: number;
+  initialWindows?: Array<{ id: string; xStart: number; xEnd: number }>;
+}
+
+interface TrackMarquee {
+  startClientX: number;
+  startNm: number;
+  currentNm: number;
+  additive: boolean;
 }
 
 interface UmInputProps {
@@ -113,35 +131,125 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   onOpenMaskLevels,
   isMinimized: isMinimizedProp,
   onToggleMinimize,
+  variables = [],
+  onCreateVariable,
+  onOpenVariablesModal,
 }) => {
   const litho = step.lithography;
   if (!litho) return null;
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const [activeWindowId, setActiveWindowId] = useState<string | null>(null);
+  const [selectedWindowIds, setSelectedWindowIds] = useState<string[]>([]);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [trackMarquee, setTrackMarquee] = useState<TrackMarquee | null>(null);
   const [isEditingMaskName, setIsEditingMaskName] = useState<boolean>(false);
   const [editingMaskName, setEditingMaskName] = useState<string>(litho.maskName || '');
   const [internalMinimized, setInternalMinimized] = useState<boolean>(false);
+  const [openWinBind, setOpenWinBind] = useState<{
+    winId: string;
+    field: 'width' | 'xStart' | 'xEnd';
+  } | null>(null);
+  const [arraySourceWinId, setArraySourceWinId] = useState<string | null>(null);
 
   const isMinimized = isMinimizedProp ?? internalMinimized;
   const handleToggleMinimize =
     onToggleMinimize ?? (() => setInternalMinimized((prev) => !prev));
+
+  const MAX_HISTORY = 60;
+  const undoStackRef = useRef<LithographyConfig[]>([]);
+  const redoStackRef = useRef<LithographyConfig[]>([]);
+  const dragStartLithoRef = useRef<LithographyConfig | null>(null);
+  const latestStepRef = useRef(step);
+  latestStepRef.current = step;
+  const latestLithoRef = useRef(litho);
+  latestLithoRef.current = litho;
+  const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+
+  const syncHistoryState = useCallback(() => {
+    setHistoryState({
+      canUndo: undoStackRef.current.length > 0,
+      canRedo: redoStackRef.current.length > 0,
+    });
+  }, []);
+
+  const commitLitho = useCallback(
+    (nextLitho: LithographyConfig, options?: { skipHistory?: boolean }) => {
+      if (!options?.skipHistory) {
+        const prevLitho = latestLithoRef.current;
+        if (JSON.stringify(prevLitho) !== JSON.stringify(nextLitho)) {
+          undoStackRef.current = [
+            ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+            prevLitho,
+          ];
+          redoStackRef.current = [];
+          syncHistoryState();
+        }
+      }
+      onUpdateStep({
+        ...latestStepRef.current,
+        lithography: nextLitho,
+      });
+    },
+    [onUpdateStep, syncHistoryState]
+  );
+
+  const handleUndo = useCallback(() => {
+    if (undoStackRef.current.length === 0) return;
+    const prevLitho = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [
+      ...redoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      latestLithoRef.current,
+    ];
+    dragStartLithoRef.current = null;
+    setDragState(null);
+    setTrackMarquee(null);
+    syncHistoryState();
+    onUpdateStep({
+      ...latestStepRef.current,
+      lithography: prevLitho,
+    });
+  }, [onUpdateStep, syncHistoryState]);
+
+  const handleRedo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    const nextLitho = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = [
+      ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+      latestLithoRef.current,
+    ];
+    dragStartLithoRef.current = null;
+    setDragState(null);
+    setTrackMarquee(null);
+    syncHistoryState();
+    onUpdateStep({
+      ...latestStepRef.current,
+      lithography: nextLitho,
+    });
+  }, [onUpdateStep, syncHistoryState]);
 
   useEffect(() => {
     setIsEditingMaskName(false);
     setEditingMaskName(step.lithography?.maskName || '');
   }, [step.id, step.lithography?.maskName]);
 
+  useEffect(() => {
+    setSelectedWindowIds([]);
+    setArraySourceWinId(null);
+    setOpenWinBind(null);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    dragStartLithoRef.current = null;
+    setHistoryState({ canUndo: false, canRedo: false });
+  }, [step.id]);
+
   const handleSaveMaskName = () => {
     const trimmed = editingMaskName.trim();
     if (trimmed && trimmed !== litho.maskName) {
-      onUpdateStep({
-        ...step,
-        lithography: {
-          ...litho,
-          maskName: trimmed,
-        },
+      commitLitho({
+        ...litho,
+        maskName: trimmed,
       });
     } else {
       setEditingMaskName(litho.maskName || '');
@@ -150,6 +258,99 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   };
 
   const windows = litho.windows || [];
+
+  useEffect(() => {
+    const validIds = new Set(windows.map((w) => w.id));
+    setSelectedWindowIds((prev) => {
+      const next = prev.filter((id) => validIds.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [windows]);
+
+  // Keyboard shortcuts: Undo/Redo (Ctrl+Z / Ctrl+Y / Cmd+Shift+Z), Escape, Left/Right arrow nudging
+  useEffect(() => {
+    if (isMinimized) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      // Do not intercept while a modal dialog is open above the track
+      if (document.querySelector('.fixed.inset-0')) return;
+
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const keyLower = e.key.toLowerCase();
+        if (keyLower === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            handleRedo();
+          } else {
+            handleUndo();
+          }
+          return;
+        }
+        if (keyLower === 'y' && !e.shiftKey) {
+          e.preventDefault();
+          handleRedo();
+          return;
+        }
+      }
+
+      if (e.key === 'Escape' && selectedWindowIds.length > 0) {
+        setSelectedWindowIds([]);
+        return;
+      }
+
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const targetIds =
+        selectedWindowIds.length > 0
+          ? selectedWindowIds
+          : windows.length === 1
+          ? [windows[0].id]
+          : [];
+      if (targetIds.length === 0) return;
+
+      const selectedTargets = windows.filter((w) => targetIds.includes(w.id));
+      if (selectedTargets.length === 0) return;
+
+      e.preventDefault();
+      const nudgeNm = e.shiftKey ? 250 : 50;
+      const deltaNm = e.key === 'ArrowLeft' ? -nudgeNm : nudgeNm;
+      const minDelta = -Math.min(...selectedTargets.map((w) => w.xStart));
+      const maxDelta = Math.min(...selectedTargets.map((w) => waferWidth - w.xEnd));
+      const clampedDelta = Math.round(Math.max(minDelta, Math.min(maxDelta, deltaNm)));
+      if (clampedDelta === 0) return;
+
+      const selSet = new Set(selectedTargets.map((w) => w.id));
+      commitLitho({
+        ...litho,
+        windows: windows.map((w) =>
+          selSet.has(w.id)
+            ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
+            : w
+        ),
+      });
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isMinimized, selectedWindowIds, windows, waferWidth, litho, commitLitho, handleUndo, handleRedo]);
+
+  const toggleWindowSelection = (id: string, additive: boolean) => {
+    if (additive) {
+      setSelectedWindowIds((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+      );
+    } else {
+      setSelectedWindowIds([id]);
+    }
+  };
 
   const handleAddWindow = () => {
     // Add default window in the center 1/3 of the wafer
@@ -160,27 +361,108 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       xStart: start,
       xEnd: end,
     };
-    const updatedLitho = {
+    commitLitho({
       ...litho,
       windows: [...windows, newWin],
-    };
-    onUpdateStep({
-      ...step,
-      lithography: updatedLitho,
     });
-    setActiveWindowId(newWin.id);
+    setSelectedWindowIds([newWin.id]);
   };
 
   const handleRemoveWindow = (id: string) => {
-    const updatedLitho = {
+    commitLitho({
       ...litho,
       windows: windows.filter((w) => w.id !== id),
-    };
-    onUpdateStep({
-      ...step,
-      lithography: updatedLitho,
     });
-    if (activeWindowId === id) setActiveWindowId(null);
+    setSelectedWindowIds((prev) => prev.filter((x) => x !== id));
+    if (arraySourceWinId === id) setArraySourceWinId(null);
+  };
+
+  const handleRemoveSelectedWindows = (ids: string[]) => {
+    if (ids.length === 0) return;
+    const delSet = new Set(ids);
+    commitLitho({
+      ...litho,
+      windows: windows.filter((w) => !delSet.has(w.id)),
+    });
+    setSelectedWindowIds([]);
+    if (arraySourceWinId && delSet.has(arraySourceWinId)) {
+      setArraySourceWinId(null);
+    }
+  };
+
+  const handleDuplicateWindow = (id: string) => {
+    const idx = windows.findIndex((w) => w.id === id);
+    if (idx < 0) return;
+    const dup = duplicateMaskWindow(windows[idx], waferWidth);
+    const nextWindows = [
+      ...windows.slice(0, idx + 1),
+      dup,
+      ...windows.slice(idx + 1),
+    ];
+    commitLitho({
+      ...litho,
+      windows: nextWindows,
+    });
+    setSelectedWindowIds([dup.id]);
+    setArraySourceWinId(null);
+  };
+
+  const handleDuplicateSelectedWindows = (ids: string[]) => {
+    if (ids.length === 0) return;
+    if (ids.length === 1) {
+      handleDuplicateWindow(ids[0]);
+      return;
+    }
+    const selSet = new Set(ids);
+    const newIds: string[] = [];
+    const clones: MaskWindow[] = [];
+    const baseTs = Date.now();
+    windows.forEach((w, idx) => {
+      if (!selSet.has(w.id)) return;
+      const dup = {
+        ...duplicateMaskWindow(w, waferWidth),
+        id: `w_dup_${baseTs}_${idx}`,
+      };
+      clones.push(dup);
+      newIds.push(dup.id);
+    });
+    commitLitho({
+      ...litho,
+      windows: [...windows, ...clones],
+    });
+    setSelectedWindowIds(newIds);
+    setArraySourceWinId(null);
+  };
+
+  const handleShiftWindows = (ids: string[], deltaNm: number) => {
+    if (ids.length === 0 || deltaNm === 0) return;
+    const targets = windows.filter((w) => ids.includes(w.id));
+    if (targets.length === 0) return;
+    const minDelta = -Math.min(...targets.map((w) => w.xStart));
+    const maxDelta = Math.min(...targets.map((w) => waferWidth - w.xEnd));
+    const clampedDelta = Math.round(Math.max(minDelta, Math.min(maxDelta, deltaNm)));
+    if (clampedDelta === 0) return;
+    const selSet = new Set(targets.map((w) => w.id));
+    commitLitho({
+      ...litho,
+      windows: windows.map((w) =>
+        selSet.has(w.id)
+          ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
+          : w
+      ),
+    });
+  };
+
+  const handleCreateWindowArray = (sourceId: string, options: MaskWindowArrayOptions) => {
+    const res = createMaskWindowArray(windows, sourceId, options, waferWidth);
+    commitLitho({
+      ...litho,
+      windows: res.windows,
+    });
+    setSelectedWindowIds(
+      res.addedIds.length > 0 ? [res.addedIds[res.addedIds.length - 1]] : [sourceId]
+    );
+    setArraySourceWinId(null);
   };
 
   const handleUpdateWindowCoord = (
@@ -189,7 +471,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     val: number
   ) => {
     const roundedVal = Math.round(val);
-    const updatedLitho = {
+    commitLitho({
       ...litho,
       windows: windows.map((w) => {
         if (w.id !== id) return w;
@@ -222,29 +504,21 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         }
         return updated;
       }),
-    };
-    onUpdateStep({
-      ...step,
-      lithography: updatedLitho,
     });
   };
 
   const handleToggleFixedWidth = (id: string) => {
-    const updatedLitho = {
+    commitLitho({
       ...litho,
       windows: windows.map((w) =>
         w.id === id ? { ...w, fixedWidth: !w.fixedWidth } : w
       ),
-    };
-    onUpdateStep({
-      ...step,
-      lithography: updatedLitho,
     });
   };
 
   const handleUpdateWindowWidth = (id: string, targetWidthNm: number) => {
     const clampedWidth = Math.max(10, Math.min(waferWidth, Math.round(targetWidthNm)));
-    const updatedLitho = {
+    commitLitho({
       ...litho,
       windows: windows.map((w) => {
         if (w.id !== id || w.fixedWidth) return w;
@@ -268,10 +542,29 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           xEnd: Math.round(nextEnd),
         };
       }),
-    };
-    onUpdateStep({
-      ...step,
-      lithography: updatedLitho,
+    });
+  };
+
+  const handleUpdateWindowBinding = (
+    id: string,
+    field: 'width' | 'xStart' | 'xEnd',
+    expr: string | undefined
+  ) => {
+    commitLitho({
+      ...litho,
+      windows: windows.map((w) => {
+        if (w.id !== id) return w;
+        const nextB = { ...(w.paramBindings || {}) };
+        if (expr && expr.trim()) {
+          nextB[field] = expr.trim();
+        } else {
+          delete nextB[field];
+        }
+        return {
+          ...w,
+          paramBindings: Object.keys(nextB).length > 0 ? nextB : undefined,
+        };
+      }),
     });
   };
 
@@ -282,24 +575,38 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
 
   const togglePolarity = () => {
     const newPol = litho.polarity === 'positive' ? 'negative' : 'positive';
-    onUpdateStep({
-      ...step,
-      lithography: {
-        ...litho,
-        polarity: newPol,
-        resistMaterialId: resolveResistMaterialId(newPol, litho.resistMaterialId),
-      },
+    commitLitho({
+      ...litho,
+      polarity: newPol,
+      resistMaterialId: resolveResistMaterialId(newPol, litho.resistMaterialId),
     });
   };
 
   const toggleMaskField = () => {
     const nextField = isLightField ? 'dark-field' : 'light-field';
-    onUpdateStep({
-      ...step,
-      lithography: {
-        ...litho,
-        maskField: nextField,
-      },
+    commitLitho({
+      ...litho,
+      maskField: nextField,
+    });
+  };
+
+  // Track background marquee drag start
+  const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !containerRef.current) return;
+    containerRef.current.focus({ preventScroll: true });
+    const rect = containerRef.current.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const nm = Math.max(0, Math.min(waferWidth, ((e.clientX - rect.left) / rect.width) * waferWidth));
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+    setTrackMarquee({
+      startClientX: e.clientX,
+      startNm: nm,
+      currentNm: nm,
+      additive: e.shiftKey || e.ctrlKey || e.metaKey,
     });
   };
 
@@ -311,20 +618,79 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   ) => {
     e.preventDefault();
     e.stopPropagation();
+    containerRef.current?.focus({ preventScroll: true });
 
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    setActiveWindowId(win.id);
+    const isAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
+    if (type === 'move' && isAdditive) {
+      if (selectedWindowIds.includes(win.id)) {
+        setSelectedWindowIds((prev) => prev.filter((id) => id !== win.id));
+        return;
+      }
+      const nextIds = [...selectedWindowIds, win.id];
+      setSelectedWindowIds(nextIds);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      const nextSet = new Set(nextIds);
+      const targets = windows
+        .filter((w) => nextSet.has(w.id))
+        .map((w) => ({ id: w.id, xStart: w.xStart, xEnd: w.xEnd }));
+      dragStartLithoRef.current = latestLithoRef.current;
+      setDragState({
+        winId: win.id,
+        type,
+        startClientX: e.clientX,
+        initialXStart: win.xStart,
+        initialXEnd: win.xEnd,
+        initialWindows: targets,
+      });
+      return;
+    }
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+
+    let moveTargets: Array<{ id: string; xStart: number; xEnd: number }>;
+    if (type === 'move' && selectedWindowIds.includes(win.id)) {
+      const selSet = new Set(selectedWindowIds);
+      moveTargets = windows
+        .filter((w) => selSet.has(w.id))
+        .map((w) => ({ id: w.id, xStart: w.xStart, xEnd: w.xEnd }));
+    } else {
+      setSelectedWindowIds([win.id]);
+      moveTargets = [{ id: win.id, xStart: win.xStart, xEnd: win.xEnd }];
+    }
+
+    dragStartLithoRef.current = latestLithoRef.current;
     setDragState({
       winId: win.id,
       type,
       startClientX: e.clientX,
       initialXStart: win.xStart,
       initialXEnd: win.xEnd,
+      initialWindows: moveTargets,
     });
   };
 
   // Pointer move handler
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (trackMarquee && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      if (rect.width > 0) {
+        const nm = Math.max(
+          0,
+          Math.min(waferWidth, ((e.clientX - rect.left) / rect.width) * waferWidth)
+        );
+        setTrackMarquee((prev) => (prev ? { ...prev, currentNm: nm } : null));
+      }
+      return;
+    }
+
     if (!dragState || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
     if (rect.width <= 0) return;
@@ -354,33 +720,75 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         w.id === dragState.winId ? { ...w, xEnd: clampedEnd } : w
       );
     } else if (dragState.type === 'move') {
-      const width = dragState.initialXEnd - dragState.initialXStart;
-      const rawStart = dragState.initialXStart + deltaNm;
-      const snappedStart = Math.round(rawStart / snap) * snap;
-      const clampedStart = Math.max(0, Math.min(waferWidth - width, snappedStart));
-      const clampedEnd = clampedStart + width;
-
-      updatedWindows = windows.map((w) =>
-        w.id === dragState.winId
-          ? { ...w, xStart: clampedStart, xEnd: clampedEnd }
-          : w
+      const targets =
+        dragState.initialWindows && dragState.initialWindows.length > 0
+          ? dragState.initialWindows
+          : [{ id: dragState.winId, xStart: dragState.initialXStart, xEnd: dragState.initialXEnd }];
+      const snappedDelta = Math.round(deltaNm / snap) * snap;
+      const minDelta = -Math.min(...targets.map((t) => t.xStart));
+      const maxDelta = Math.min(...targets.map((t) => waferWidth - t.xEnd));
+      const clampedDelta = Math.max(minDelta, Math.min(maxDelta, snappedDelta));
+      const byId = new Map(
+        targets.map((t) => [t.id, { xStart: t.xStart + clampedDelta, xEnd: t.xEnd + clampedDelta }])
       );
+
+      updatedWindows = windows.map((w) => {
+        const next = byId.get(w.id);
+        return next ? { ...w, xStart: next.xStart, xEnd: next.xEnd } : w;
+      });
     }
 
-    onUpdateStep({
-      ...step,
-      lithography: {
+    commitLitho(
+      {
         ...litho,
         windows: updatedWindows,
       },
-    });
+      { skipHistory: true }
+    );
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (dragState) {
+    if (trackMarquee) {
+      const distPx = Math.abs(e.clientX - trackMarquee.startClientX);
+      if (distPx >= 4) {
+        const minNm = Math.min(trackMarquee.startNm, trackMarquee.currentNm);
+        const maxNm = Math.max(trackMarquee.startNm, trackMarquee.currentNm);
+        const hitIds = windows
+          .filter((w) => w.xEnd >= minNm && w.xStart <= maxNm)
+          .map((w) => w.id);
+        if (trackMarquee.additive) {
+          setSelectedWindowIds((prev) => Array.from(new Set([...prev, ...hitIds])));
+        } else {
+          setSelectedWindowIds(hitIds);
+        }
+      } else if (!trackMarquee.additive) {
+        setSelectedWindowIds([]);
+      }
       try {
-        (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-      } catch (err) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      setTrackMarquee(null);
+      return;
+    }
+
+    if (dragState) {
+      if (dragStartLithoRef.current) {
+        const startSnap = dragStartLithoRef.current;
+        dragStartLithoRef.current = null;
+        if (JSON.stringify(startSnap) !== JSON.stringify(latestLithoRef.current)) {
+          undoStackRef.current = [
+            ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+            startSnap,
+          ];
+          redoStackRef.current = [];
+          syncHistoryState();
+        }
+      }
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
         // ignore
       }
       setDragState(null);
@@ -518,11 +926,31 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           )}
           <span className="hidden md:inline text-xs text-slate-500">·</span>
           <span className="hidden md:inline text-[11px] text-slate-400">
-            Drag center to move · Drag left/right borders to resize
+            Drag or ←/→ arrows to move (Shift/Ctrl+Click or drag track for multi) · Borders resize
           </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={!historyState.canUndo}
+              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              title="Undo aperture track edit (Ctrl+Z)"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={handleRedo}
+              disabled={!historyState.canRedo}
+              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              title="Redo aperture track edit (Ctrl+Y)"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
           <button
             type="button"
             onClick={toggleMaskField}
@@ -613,8 +1041,14 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
             {dragState ? (
               <span className="text-amber-300 font-semibold animate-pulse">
                 {dragState.type === 'move'
-                  ? `Sliding ${featureNounCap}...`
+                  ? (dragState.initialWindows?.length || 1) > 1
+                    ? `Sliding ${dragState.initialWindows?.length} ${featureNounCap}s together...`
+                    : `Sliding ${featureNounCap}...`
                   : `Resizing ${featureNounCap} Boundary...`}
+              </span>
+            ) : trackMarquee ? (
+              <span className="text-sky-300 font-semibold">
+                Selecting {featureNoun}s across track...
               </span>
             ) : (
               <span className={isLightField ? 'text-sky-300/90' : 'text-slate-400'}>
@@ -628,10 +1062,12 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         {/* Chrome base (Dark-Field) OR Clear Quartz Glass (Light-Field) */}
         <div
           ref={containerRef}
+          tabIndex={0}
+          onPointerDown={handleTrackPointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className={`relative h-11 w-full rounded-lg overflow-hidden shadow-inner select-none touch-none border ${
+          className={`relative h-11 w-full rounded-lg overflow-hidden shadow-inner select-none touch-none border focus:outline-none focus-visible:ring-1 focus-visible:ring-sky-500/60 ${
             isLightField
               ? 'bg-gradient-to-b from-sky-200/35 via-cyan-100/25 to-amber-100/30 border-sky-400/50'
               : 'bg-slate-950 border-slate-700'
@@ -663,12 +1099,26 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
             </div>
           )}
 
+          {/* Track Marquee Selection Box */}
+          {trackMarquee && (() => {
+            const minPct = (Math.min(trackMarquee.startNm, trackMarquee.currentNm) / waferWidth) * 100;
+            const maxPct = (Math.max(trackMarquee.startNm, trackMarquee.currentNm) / waferWidth) * 100;
+            return (
+              <div
+                className="absolute top-0 bottom-0 bg-sky-400/20 border-x-2 border-sky-400 pointer-events-none z-30"
+                style={{ left: `${minPct}%`, width: `${Math.max(0.5, maxPct - minPct)}%` }}
+              />
+            );
+          })()}
+
           {/* Movable Mask Blocks: Chrome Blockers (Light-Field) OR Clear Apertures (Dark-Field) */}
           {windows.map((win) => {
             const leftPct = (win.xStart / waferWidth) * 100;
             const widthPct = Math.max(1.5, ((win.xEnd - win.xStart) / waferWidth) * 100);
-            const isActive = activeWindowId === win.id;
-            const isDraggingThis = dragState?.winId === win.id;
+            const isActive = selectedWindowIds.includes(win.id);
+            const isDraggingThis =
+              dragState?.winId === win.id ||
+              Boolean(dragState?.initialWindows?.some((t) => t.id === win.id));
 
             const blockClasses = isLightField
               ? isActive || isDraggingThis
@@ -689,7 +1139,6 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 key={win.id}
                 onClick={(e) => {
                   e.stopPropagation();
-                  setActiveWindowId(win.id);
                 }}
                 className={`absolute top-0 bottom-0 transition-shadow select-none group/box ${blockClasses}`}
                 style={{
@@ -755,132 +1204,420 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       </div>
 
       {/* Numerical Apertures List & Controls */}
-      {windows.length > 0 && (
-        <div className="mt-3 space-y-1.5 max-h-36 overflow-y-auto pr-1">
-          {windows.map((win, idx) => {
-            const isSelected = activeWindowId === win.id;
-            const winWidth = Math.max(10, win.xEnd - win.xStart);
-            const isFixed = Boolean(win.fixedWidth);
+      {windows.length > 0 && (() => {
+        const effectiveSelectedIds =
+          selectedWindowIds.length > 0
+            ? selectedWindowIds
+            : windows.length === 1
+            ? [windows[0].id]
+            : [];
+        const singleSelectedWin =
+          effectiveSelectedIds.length === 1
+            ? windows.find((w) => w.id === effectiveSelectedIds[0]) || null
+            : null;
+        const singleSelectedIdx = singleSelectedWin
+          ? windows.findIndex((w) => w.id === singleSelectedWin.id)
+          : -1;
+        const allSelected = windows.length > 0 && selectedWindowIds.length === windows.length;
 
-            return (
-              <div
-                key={win.id}
-                onClick={() => setActiveWindowId(win.id)}
-                className={`flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg text-xs transition-colors ${
-                  isSelected
-                    ? 'bg-slate-800/90 border border-sky-500/50'
-                    : 'bg-slate-950/60 border border-slate-800/80 hover:bg-slate-800/40'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="w-5 h-5 rounded-md bg-slate-800 flex items-center justify-center font-mono text-[11px] text-slate-300">
-                    {idx + 1}
-                  </span>
-                  <span className="font-medium text-slate-300">
-                    {featureNounCap} #{idx + 1}
-                  </span>
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[9.5px] font-mono border ${
-                      isLightField
-                        ? 'bg-slate-900 border-slate-600 text-slate-300'
-                        : 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
-                    }`}
-                  >
-                    {isLightField ? 'Chrome Blocker' : 'Clear Aperture'}
-                  </span>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <div
-                    className="flex items-center gap-1 font-mono text-[11px]"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <span className="text-sky-400">W:</span>
-                    <UmNumberInput
-                      valueNm={winWidth}
-                      minNm={10}
-                      maxNm={waferWidth}
-                      disabled={isFixed}
-                      onCommitNm={(valNm) => handleUpdateWindowWidth(win.id, valNm)}
-                      title={
-                        isFixed
-                          ? 'Width is fixed (click Fix Width toggle to unlock)'
-                          : `Edit ${featureNoun} width (keeps block centered)`
-                      }
-                    />
-                    <span className="text-slate-500">µm</span>
+        return (
+          <div className="mt-3 space-y-2">
+            {/* Selected Aperture List Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-2 px-0.5 text-[11px]">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-slate-400 font-medium">
+                  {featureNounCap} List ({windows.length})
+                  {effectiveSelectedIds.length === 1 && singleSelectedIdx >= 0 && (
+                    <span className="ml-2 text-sky-300 font-mono">
+                      · Selected: #{singleSelectedIdx + 1}
+                    </span>
+                  )}
+                  {effectiveSelectedIds.length > 1 && (
+                    <span className="ml-2 text-amber-300 font-mono font-semibold">
+                      · {effectiveSelectedIds.length} selected
+                    </span>
+                  )}
+                </span>
+                {windows.length > 1 && (
+                  <div className="flex items-center gap-1">
                     <button
                       type="button"
-                      onClick={() => handleToggleFixedWidth(win.id)}
-                      className={`ml-1 flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-sans font-medium transition-colors ${
-                        isFixed
-                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 hover:bg-amber-500/30'
-                          : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-slate-200 hover:border-slate-600'
-                      }`}
-                      title={
-                        isFixed
-                          ? `Width Fixed: editing X start or X end slides the ${featureNoun} without changing width`
-                          : `Fix Width: lock width so editing X start or X end moves the ${featureNoun} cleanly`
+                      onClick={() =>
+                        setSelectedWindowIds(allSelected ? [] : windows.map((w) => w.id))
                       }
+                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[10px]"
                     >
-                      {isFixed ? (
-                        <Lock className="w-3 h-3 shrink-0" />
-                      ) : (
-                        <Unlock className="w-3 h-3 shrink-0" />
-                      )}
-                      <span>{isFixed ? 'Width Fixed' : 'Fix Width'}</span>
+                      {allSelected ? 'Clear' : 'All'}
                     </button>
                   </div>
-
-                  <div
-                    className="flex items-center gap-1 font-mono text-[11px]"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <span className="text-slate-400">X:</span>
-                    <UmNumberInput
-                      valueNm={win.xStart}
-                      minNm={0}
-                      maxNm={isFixed ? Math.max(0, waferWidth - winWidth) : waferWidth}
-                      onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xStart', valNm)}
-                      title={
-                        isFixed
-                          ? `Edit start X (slides ${featureNoun} with fixed width)`
-                          : `Edit ${featureNoun} start X`
-                      }
-                      className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500"
-                    />
-                    <span className="text-slate-500">→</span>
-                    <UmNumberInput
-                      valueNm={win.xEnd}
-                      minNm={isFixed ? winWidth : 0}
-                      maxNm={waferWidth}
-                      onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xEnd', valNm)}
-                      title={
-                        isFixed
-                          ? `Edit end X (slides ${featureNoun} with fixed width)`
-                          : `Edit ${featureNoun} end X`
-                      }
-                      className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500"
-                    />
-                    <span className="text-slate-500">µm</span>
-                  </div>
-
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleRemoveWindow(win.id);
-                    }}
-                    className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-                    title={`Delete ${featureNoun}`}
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
+                )}
               </div>
-            );
-          })}
-        </div>
-      )}
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {effectiveSelectedIds.length > 0 && (
+                  <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded px-1 py-0.5">
+                    <span className="text-[10px] text-slate-400 px-0.5">Move:</span>
+                    <button
+                      type="button"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, -100)}
+                      className="px-1.5 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
+                      title="Shift selected -0.10 µm (-100 nm)"
+                    >
+                      -0.1µm
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, 100)}
+                      className="px-1.5 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
+                      title="Shift selected +0.10 µm (+100 nm)"
+                    >
+                      +0.1µm
+                    </button>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  disabled={effectiveSelectedIds.length === 0}
+                  onClick={() => handleDuplicateSelectedWindows(effectiveSelectedIds)}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none text-slate-200 border border-slate-700 text-[10.5px] font-medium transition-colors"
+                  title={
+                    effectiveSelectedIds.length > 1
+                      ? `Duplicate ${effectiveSelectedIds.length} selected ${featureNoun}s`
+                      : singleSelectedWin
+                      ? `Duplicate selected ${featureNoun} #${singleSelectedIdx + 1}`
+                      : `Select a ${featureNoun} first to duplicate`
+                  }
+                >
+                  <Copy className="w-3 h-3 text-sky-400" />
+                  <span>
+                    {effectiveSelectedIds.length > 1
+                      ? `Duplicate (${effectiveSelectedIds.length})`
+                      : 'Duplicate'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  disabled={!singleSelectedWin}
+                  onClick={() => {
+                    if (!singleSelectedWin) return;
+                    setSelectedWindowIds([singleSelectedWin.id]);
+                    setOpenWinBind(null);
+                    setArraySourceWinId((prev) =>
+                      prev === singleSelectedWin.id ? null : singleSelectedWin.id
+                    );
+                  }}
+                  className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[10.5px] font-medium transition-colors disabled:opacity-40 disabled:pointer-events-none ${
+                    singleSelectedWin && arraySourceWinId === singleSelectedWin.id
+                      ? 'bg-sky-600/25 border-sky-500/60 text-sky-200'
+                      : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                  }`}
+                  title={
+                    singleSelectedWin
+                      ? `Make 1D array from selected ${featureNoun} #${singleSelectedIdx + 1}`
+                      : `Select a single ${featureNoun} to make an array`
+                  }
+                >
+                  <LayoutGrid className="w-3 h-3 text-sky-400" />
+                  <span>Make Array</span>
+                </button>
+                {selectedWindowIds.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveSelectedWindows(selectedWindowIds)}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-[10.5px] font-medium transition-colors"
+                    title={`Delete ${selectedWindowIds.length} selected ${featureNoun}s`}
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Delete ({selectedWindowIds.length})</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+              {windows.map((win, idx) => {
+                const isSelected = selectedWindowIds.includes(win.id);
+                const winWidth = Math.max(10, win.xEnd - win.xStart);
+                const isFixed = Boolean(win.fixedWidth);
+                const wExpr = win.paramBindings?.width;
+                const xStartExpr = win.paramBindings?.xStart;
+                const xEndExpr = win.paramBindings?.xEnd;
+                const activeBindField =
+                  openWinBind?.winId === win.id ? openWinBind.field : null;
+                const isArrayOpen = arraySourceWinId === win.id;
+
+                return (
+                  <div
+                    key={win.id}
+                    onClick={(e) =>
+                      toggleWindowSelection(win.id, e.shiftKey || e.ctrlKey || e.metaKey)
+                    }
+                    className={`p-2 rounded-lg text-xs transition-colors space-y-1.5 cursor-pointer ${
+                      isSelected
+                        ? 'bg-slate-800/90 border border-sky-500/50'
+                        : 'bg-slate-950/60 border border-slate-800/80 hover:bg-slate-800/40'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleWindowSelection(win.id, true);
+                          }}
+                          className={`w-4 h-4 rounded border flex items-center justify-center transition-colors shrink-0 ${
+                            isSelected
+                              ? 'bg-sky-600 border-sky-400 text-white'
+                              : 'bg-slate-900 border-slate-600 hover:border-slate-400'
+                          }`}
+                          title={isSelected ? 'Deselect' : 'Add to selection'}
+                        >
+                          {isSelected && <Check className="w-2.5 h-2.5" />}
+                        </button>
+                        <span className="w-5 h-5 rounded-md bg-slate-800 flex items-center justify-center font-mono text-[11px] text-slate-300">
+                          {idx + 1}
+                        </span>
+                        <span className="font-medium text-slate-300">
+                          {featureNounCap} #{idx + 1}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[9.5px] font-mono border ${
+                            isLightField
+                              ? 'bg-slate-900 border-slate-600 text-slate-300'
+                              : 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
+                          }`}
+                        >
+                          {isLightField ? 'Chrome Blocker' : 'Clear Aperture'}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <div
+                          className="flex items-center gap-1 font-mono text-[11px]"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="text-sky-400">W:</span>
+                          <UmNumberInput
+                            valueNm={winWidth}
+                            minNm={10}
+                            maxNm={waferWidth}
+                            disabled={isFixed || Boolean(wExpr)}
+                            onCommitNm={(valNm) => handleUpdateWindowWidth(win.id, valNm)}
+                            title={
+                              wExpr
+                                ? `Bound to: ${wExpr}`
+                                : isFixed
+                                ? 'Width is fixed (click Fix Width toggle to unlock)'
+                                : `Edit ${featureNoun} width (keeps block centered)`
+                            }
+                          />
+                          <span className="text-slate-500">µm</span>
+                          <ParamBindingBadge
+                            expression={wExpr}
+                            isOpen={activeBindField === 'width'}
+                            onToggle={() => {
+                              setArraySourceWinId(null);
+                              setOpenWinBind(
+                                activeBindField === 'width'
+                                  ? null
+                                  : { winId: win.id, field: 'width' }
+                              );
+                            }}
+                            compact
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleToggleFixedWidth(win.id)}
+                            className={`ml-0.5 flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-sans font-medium transition-colors ${
+                              isFixed
+                                ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 hover:bg-amber-500/30'
+                                : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-slate-200 hover:border-slate-600'
+                            }`}
+                            title={
+                              isFixed
+                                ? `Width Fixed: editing X start or X end slides the ${featureNoun} without changing width`
+                                : `Fix Width: lock width so editing X start or X end moves the ${featureNoun} cleanly`
+                            }
+                          >
+                            {isFixed ? (
+                              <Lock className="w-3 h-3 shrink-0" />
+                            ) : (
+                              <Unlock className="w-3 h-3 shrink-0" />
+                            )}
+                            <span>{isFixed ? 'Width Fixed' : 'Fix Width'}</span>
+                          </button>
+                        </div>
+
+                        <div
+                          className="flex items-center gap-1 font-mono text-[11px]"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="text-slate-400">X₁:</span>
+                          <UmNumberInput
+                            valueNm={win.xStart}
+                            minNm={0}
+                            maxNm={isFixed ? Math.max(0, waferWidth - winWidth) : waferWidth}
+                            disabled={Boolean(xStartExpr)}
+                            onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xStart', valNm)}
+                            title={
+                              xStartExpr
+                                ? `Bound to: ${xStartExpr}`
+                                : isFixed
+                                ? `Edit start X (slides ${featureNoun} with fixed width)`
+                                : `Edit ${featureNoun} start X`
+                            }
+                            className={`w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
+                              xStartExpr ? 'opacity-65 cursor-not-allowed text-violet-300 border-violet-500/50' : ''
+                            }`}
+                          />
+                          <ParamBindingBadge
+                            expression={xStartExpr}
+                            isOpen={activeBindField === 'xStart'}
+                            onToggle={() => {
+                              setArraySourceWinId(null);
+                              setOpenWinBind(
+                                activeBindField === 'xStart'
+                                  ? null
+                                  : { winId: win.id, field: 'xStart' }
+                              );
+                            }}
+                            compact
+                          />
+                          <span className="text-slate-500">→</span>
+                          <UmNumberInput
+                            valueNm={win.xEnd}
+                            minNm={isFixed ? winWidth : 0}
+                            maxNm={waferWidth}
+                            disabled={Boolean(xEndExpr)}
+                            onCommitNm={(valNm) => handleUpdateWindowCoord(win.id, 'xEnd', valNm)}
+                            title={
+                              xEndExpr
+                                ? `Bound to: ${xEndExpr}`
+                                : isFixed
+                                ? `Edit end X (slides ${featureNoun} with fixed width)`
+                                : `Edit ${featureNoun} end X`
+                            }
+                            className={`w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
+                              xEndExpr ? 'opacity-65 cursor-not-allowed text-violet-300 border-violet-500/50' : ''
+                            }`}
+                          />
+                          <ParamBindingBadge
+                            expression={xEndExpr}
+                            isOpen={activeBindField === 'xEnd'}
+                            onToggle={() => {
+                              setArraySourceWinId(null);
+                              setOpenWinBind(
+                                activeBindField === 'xEnd'
+                                  ? null
+                                  : { winId: win.id, field: 'xEnd' }
+                              );
+                            }}
+                            compact
+                          />
+                          <span className="text-slate-500">µm</span>
+                        </div>
+
+                        <div className="flex items-center gap-0.5">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDuplicateWindow(win.id);
+                            }}
+                            className="p-1 rounded text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 transition-colors"
+                            title={`Duplicate ${featureNoun}`}
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedWindowIds([win.id]);
+                              setOpenWinBind(null);
+                              setArraySourceWinId((prev) =>
+                                prev === win.id ? null : win.id
+                              );
+                            }}
+                            className={`p-1 rounded transition-colors ${
+                              isArrayOpen
+                                ? 'text-sky-300 bg-sky-500/20'
+                                : 'text-slate-400 hover:text-sky-300 hover:bg-sky-500/10'
+                            }`}
+                            title={`Make 1D array from ${featureNoun}`}
+                          >
+                            <LayoutGrid className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleRemoveWindow(win.id);
+                            }}
+                            className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                            title={`Delete ${featureNoun}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {isArrayOpen && (
+                      <MaskWindowArrayPanel
+                        sourceWindow={win}
+                        sourceIndex={idx}
+                        waferWidth={waferWidth}
+                        featureNounCap={featureNounCap}
+                        unit="um"
+                        onApply={(opts) => handleCreateWindowArray(win.id, opts)}
+                        onClose={() => setArraySourceWinId(null)}
+                      />
+                    )}
+
+                    {activeBindField && (
+                      <ParamBindingPanel
+                        expression={win.paramBindings?.[activeBindField]}
+                        variables={variables}
+                        waferWidth={waferWidth}
+                        currentValue={
+                          activeBindField === 'width'
+                            ? winWidth
+                            : activeBindField === 'xStart'
+                            ? win.xStart
+                            : win.xEnd
+                        }
+                        unit="um"
+                        suggestedVarName={
+                          activeBindField === 'width'
+                            ? `win_${idx + 1}_w`
+                            : activeBindField === 'xStart'
+                            ? `win_${idx + 1}_x1`
+                            : `win_${idx + 1}_x2`
+                        }
+                        targetLabel={`${featureNounCap} #${idx + 1} · ${
+                          activeBindField === 'width'
+                            ? 'Width'
+                            : activeBindField === 'xStart'
+                            ? 'Start X₁'
+                            : 'End X₂'
+                        }`}
+                        onChangeExpression={(expr) =>
+                          handleUpdateWindowBinding(win.id, activeBindField, expr)
+                        }
+                        onCreateVariable={onCreateVariable}
+                        onOpenVariablesModal={onOpenVariablesModal}
+                        onClose={() => setOpenWinBind(null)}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

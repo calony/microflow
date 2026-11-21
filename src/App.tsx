@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ProcessFlow, ProcessStep, Material, EtchRecipe } from './types/microfab';
+import { ProcessFlow, ProcessStep, Material, EtchRecipe, VariableUnit } from './types/microfab';
 import { PRESET_PROCESS_FLOWS } from './lib/presets';
 import { simulateCrossSection, buildRenderPolygons } from './lib/simulationEngine';
 import { Header } from './components/Header';
@@ -18,8 +18,10 @@ import { EtchRateLibraryModal } from './components/EtchRateLibraryModal';
 import { RunSheetModal } from './components/RunSheetModal';
 import { PresetPickerModal } from './components/PresetPickerModal';
 import { MaskLevelsModal } from './components/MaskLevelsModal';
+import { VariablesModal } from './components/VariablesModal';
 import { AboutModal } from './components/AboutModal';
 import { SubstrateEditor } from './components/SubstrateEditor';
+import { resolveFlowParameters } from './lib/variableUtils';
 import {
   ensureFlowMasks,
   syncStepWindowsToMask,
@@ -70,7 +72,7 @@ export default function App() {
               // ignore
             }
           }
-          return ensureFlowBlocks(ensureFlowMasks(parsed));
+          return resolveFlowParameters(ensureFlowBlocks(ensureFlowMasks(parsed)));
         }
       }
     } catch (e) {
@@ -85,7 +87,7 @@ export default function App() {
     } catch {
       // ignore
     }
-    return ensureFlowBlocks(ensureFlowMasks(basePreset));
+    return resolveFlowParameters(ensureFlowBlocks(ensureFlowMasks(basePreset)));
   });
 
   const [activeStepIndex, setActiveStepIndex] = useState<number>(() =>
@@ -109,6 +111,7 @@ export default function App() {
   const [showEtchLibrary, setShowEtchLibrary] = useState<boolean>(false);
   const [showMaskLevels, setShowMaskLevels] = useState<boolean>(false);
   const [focusMaskId, setFocusMaskId] = useState<string | undefined>(undefined);
+  const [showVariables, setShowVariables] = useState<boolean>(false);
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
   const [showAbout, setShowAbout] = useState<boolean>(false);
@@ -128,6 +131,7 @@ export default function App() {
       return false;
     }
   });
+  const [selectedInsetStepIndex, setSelectedInsetStepIndex] = useState<number | null>(null);
 
   // Save to localStorage on changes
   useEffect(() => {
@@ -201,7 +205,7 @@ export default function App() {
     return buildRenderPolygons(activeMesh, flow.materials);
   }, [activeMesh, flow.materials]);
 
-  // Identify the last enabled process step for optional Final Step Inset preview
+  // Identify the last enabled process step and all enabled steps after the currently selected step
   const finalEnabledStepIndex = useMemo(() => {
     for (let i = flow.steps.length - 1; i >= 0; i--) {
       if (flow.steps[i].enabled !== false) return i;
@@ -209,13 +213,57 @@ export default function App() {
     return -1;
   }, [flow.steps]);
 
+  const laterInsetSteps = useMemo(() => {
+    const list: { stepIndex: number; stepNumber: number; title: string }[] = [];
+    for (let i = Math.max(0, activeStepIndex + 1); i < flow.steps.length; i++) {
+      const step = flow.steps[i];
+      if (step.enabled !== false) {
+        list.push({
+          stepIndex: i,
+          stepNumber: i + 1,
+          title: step.title,
+        });
+      }
+    }
+    return list;
+  }, [flow.steps, activeStepIndex]);
+
+  useEffect(() => {
+    if (
+      selectedInsetStepIndex !== null &&
+      !laterInsetSteps.some((s) => s.stepIndex === selectedInsetStepIndex)
+    ) {
+      setSelectedInsetStepIndex(null);
+    }
+  }, [selectedInsetStepIndex, laterInsetSteps]);
+
+  const resolvedInsetStepIndex = useMemo(() => {
+    if (laterInsetSteps.length === 0) return -1;
+    if (
+      selectedInsetStepIndex !== null &&
+      laterInsetSteps.some((s) => s.stepIndex === selectedInsetStepIndex)
+    ) {
+      return selectedInsetStepIndex;
+    }
+    return laterInsetSteps[laterInsetSteps.length - 1].stepIndex;
+  }, [laterInsetSteps, selectedInsetStepIndex]);
+
+  const insetEnabledSimIndex = useMemo(() => {
+    if (resolvedInsetStepIndex < 0) return -1;
+    let enabledCount = 0;
+    for (let i = 0; i <= resolvedInsetStepIndex && i < flow.steps.length; i++) {
+      if (flow.steps[i].enabled !== false) enabledCount++;
+    }
+    return enabledCount - 1;
+  }, [flow.steps, resolvedInsetStepIndex]);
+
   const isIntermediateStep =
-    finalEnabledStepIndex >= 0 && activeStepIndex < finalEnabledStepIndex;
+    resolvedInsetStepIndex >= 0 && activeStepIndex < resolvedInsetStepIndex;
 
   const finalMesh = useMemo(() => {
-    if (!showFinalInset || !isIntermediateStep) return null;
-    return simulateCrossSection(flow, finalEnabledStepIndex);
-  }, [showFinalInset, isIntermediateStep, flow, finalEnabledStepIndex]);
+    if (!showFinalInset || !isIntermediateStep || insetEnabledSimIndex < 0) return null;
+    return simulateCrossSection(flow, insetEnabledSimIndex);
+  }, [showFinalInset, isIntermediateStep, flow, insetEnabledSimIndex]);
 
   const finalPolygons = useMemo(() => {
     if (!finalMesh) return [];
@@ -226,17 +274,49 @@ export default function App() {
   const activeStep = !isSubstrateActive ? flow.steps[activeStepIndex] : undefined;
 
   // Handlers
-  const handleUpdateStep = (updatedStep: ProcessStep) => {
-    if (activeStepIndex < 0) return;
-    const prevStep = flow.steps[activeStepIndex];
-    const blockChanged = prevStep && updatedStep.blockId !== prevStep.blockId;
+  const handleUpdateFlow = (updatedFlow: ProcessFlow) => {
+    setFlow(resolveFlowParameters(updatedFlow));
+  };
 
-    // Preserve previous blockId temporarily if changed so assignStepToBlock can cleanly detect old vs new block
-    const patchedStep = blockChanged ? { ...updatedStep, blockId: prevStep.blockId } : updatedStep;
-    const updatedSteps = flow.steps.map((s, idx) =>
-      idx === activeStepIndex ? patchedStep : s
+  const handleCreateVariable = (
+    name: string,
+    value: number,
+    unit: VariableUnit,
+    description?: string
+  ) => {
+    setFlow((prev) =>
+      resolveFlowParameters({
+        ...prev,
+        variables: [
+          ...(prev.variables || []),
+          {
+            id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            name,
+            value,
+            unit,
+            description,
+          },
+        ],
+      })
     );
-    let updatedFlow = { ...flow, steps: updatedSteps };
+  };
+
+  const applyStepUpdateToFlow = (
+    baseFlow: ProcessFlow,
+    stepIdx: number,
+    updatedStep: ProcessStep,
+    preserveOldBlockIdForReassign: boolean
+  ): ProcessFlow => {
+    const prevStep = baseFlow.steps[stepIdx];
+    const blockChanged = prevStep && updatedStep.blockId !== prevStep.blockId;
+    const patchedStep =
+      preserveOldBlockIdForReassign && blockChanged
+        ? { ...updatedStep, blockId: prevStep.blockId }
+        : updatedStep;
+    const updatedSteps = baseFlow.steps.map((s, idx) =>
+      idx === stepIdx ? patchedStep : s
+    );
+    let updatedFlow: ProcessFlow = { ...baseFlow, steps: updatedSteps };
     if (updatedStep.type === 'lithography') {
       if (prevStep && prevStep.type !== 'lithography') {
         const validUnclaimedMask = updatedStep.lithography?.maskId
@@ -261,19 +341,38 @@ export default function App() {
       };
     }
 
-    if (blockChanged) {
+    if (preserveOldBlockIdForReassign && blockChanged) {
       updatedFlow = assignStepToBlock(updatedFlow, updatedStep.id, updatedStep.blockId || null);
+    }
+
+    return resolveFlowParameters(updatedFlow);
+  };
+
+  const handleUpdateStep = (updatedStep: ProcessStep) => {
+    if (activeStepIndex < 0) return;
+    const prevStep = flow.steps[activeStepIndex];
+    const blockChanged = prevStep && updatedStep.blockId !== prevStep.blockId;
+
+    if (blockChanged) {
+      const updatedFlow = applyStepUpdateToFlow(flow, activeStepIndex, updatedStep, true);
       const newIdx = updatedFlow.steps.findIndex((s) => s.id === updatedStep.id);
+      setFlow(updatedFlow);
       if (newIdx >= 0 && newIdx !== activeStepIndex) {
         setActiveStepIndex(newIdx);
       }
+      return;
     }
 
-    setFlow(updatedFlow);
+    setFlow((prev) => {
+      const idx = prev.steps.findIndex((s) => s.id === updatedStep.id);
+      const targetIdx = idx >= 0 ? idx : activeStepIndex;
+      if (targetIdx < 0 || targetIdx >= prev.steps.length) return prev;
+      return applyStepUpdateToFlow(prev, targetIdx, updatedStep, false);
+    });
   };
 
   const handleUpdateTitle = (title: string) => {
-    setFlow({ ...flow, title });
+    setFlow((prev) => ({ ...prev, title }));
   };
 
   const allEtchRecipes = useMemo(
@@ -285,8 +384,9 @@ export default function App() {
     const withEtchLib = flow.etchLibrary?.length
       ? { ...preset, etchLibrary: flow.etchLibrary }
       : preset;
-    setFlow(ensureFlowBlocks(ensureFlowMasks(withEtchLib)));
+    setFlow(resolveFlowParameters(ensureFlowBlocks(ensureFlowMasks(withEtchLib))));
     setActiveStepIndex(preset.steps.length > 0 ? 0 : -1);
+    setSelectedInsetStepIndex(null);
     setIsPlaying(false);
     setShowPresets(false);
   };
@@ -390,8 +490,9 @@ export default function App() {
         },
       ];
     }
-    setFlow(ensureFlowBlocks(ensureFlowMasks(newFlow)));
+    setFlow(resolveFlowParameters(ensureFlowBlocks(ensureFlowMasks(newFlow))));
     setActiveStepIndex(newFlow.steps.length > 0 ? 0 : -1);
+    setSelectedInsetStepIndex(null);
   };
 
   const isCompactViewport = () =>
@@ -428,6 +529,8 @@ export default function App() {
           setFocusMaskId(undefined);
           setShowMaskLevels(true);
         }}
+        onOpenVariables={() => setShowVariables(true)}
+        variableCount={flow.variables?.length || 0}
         onOpenRunSheet={() => setShowRunSheet(true)}
         onOpenMultiStepView={() => setShowMultiStep(true)}
         onOpenAbout={() => setShowAbout(true)}
@@ -482,7 +585,7 @@ export default function App() {
                   setActiveStepIndex(idx);
                   setIsPlaying(false);
                 }}
-                onUpdateFlow={setFlow}
+                onUpdateFlow={handleUpdateFlow}
                 onOpenPresets={() => setShowPresets(true)}
                 onOpenParameters={() => {
                   setRightSidebarOpen(true);
@@ -517,8 +620,10 @@ export default function App() {
                 <SubstrateEditor
                   flow={flow}
                   thicknessUnit={thicknessUnit}
-                  onUpdateFlow={setFlow}
+                  onUpdateFlow={handleUpdateFlow}
                   onOpenMaterialsModal={() => setShowMaterials(true)}
+                  onCreateVariable={handleCreateVariable}
+                  onOpenVariablesModal={() => setShowVariables(true)}
                 />
               ) : activeStep ? (
                 <StepEditor
@@ -544,6 +649,9 @@ export default function App() {
                   }}
                   blocks={flow.blocks}
                   masks={flow.masks}
+                  variables={flow.variables || []}
+                  onCreateVariable={handleCreateVariable}
+                  onOpenVariablesModal={() => setShowVariables(true)}
                   onOpenMaskLevelsModal={(maskId) => {
                     setFocusMaskId(maskId);
                     setShowMaskLevels(true);
@@ -583,6 +691,9 @@ export default function App() {
                 }}
                 isMinimized={isMaskTrackMinimized}
                 onToggleMinimize={() => setIsMaskTrackMinimized((prev) => !prev)}
+                variables={flow.variables || []}
+                onCreateVariable={handleCreateVariable}
+                onOpenVariablesModal={() => setShowVariables(true)}
               />
             </div>
           )}
@@ -608,18 +719,33 @@ export default function App() {
               finalMesh={finalMesh}
               finalPolygons={finalPolygons}
               finalStepNumber={
-                finalEnabledStepIndex >= 0 ? finalEnabledStepIndex + 1 : undefined
+                resolvedInsetStepIndex >= 0 ? resolvedInsetStepIndex + 1 : undefined
               }
               finalStepTitle={
-                finalEnabledStepIndex >= 0
-                  ? flow.steps[finalEnabledStepIndex]?.title
+                resolvedInsetStepIndex >= 0
+                  ? flow.steps[resolvedInsetStepIndex]?.title
                   : undefined
               }
+              canShowInsetButton={finalEnabledStepIndex >= 0}
+              insetStepOptions={laterInsetSteps}
+              selectedInsetStepIndex={
+                resolvedInsetStepIndex >= 0 ? resolvedInsetStepIndex : undefined
+              }
+              isInsetFinalStep={
+                resolvedInsetStepIndex >= 0 && resolvedInsetStepIndex === finalEnabledStepIndex
+              }
+              onChangeInsetStep={(stepIndex) => {
+                if (stepIndex === finalEnabledStepIndex) {
+                  setSelectedInsetStepIndex(null);
+                } else {
+                  setSelectedInsetStepIndex(stepIndex);
+                }
+              }}
               showFinalInset={showFinalInset}
               onToggleFinalInset={() => setShowFinalInset((prev) => !prev)}
               onSelectFinalStep={() => {
-                if (finalEnabledStepIndex >= 0) {
-                  setActiveStepIndex(finalEnabledStepIndex);
+                if (resolvedInsetStepIndex >= 0) {
+                  setActiveStepIndex(resolvedInsetStepIndex);
                   setIsPlaying(false);
                 }
               }}
@@ -704,12 +830,22 @@ export default function App() {
           flow={flow}
           isOpen={showMaskLevels}
           onClose={() => setShowMaskLevels(false)}
-          onUpdateFlow={setFlow}
+          onUpdateFlow={handleUpdateFlow}
           onSelectStepIndex={(idx) => {
             setActiveStepIndex(idx);
             setIsPlaying(false);
           }}
           initialMaskId={focusMaskId}
+          onOpenVariablesModal={() => setShowVariables(true)}
+        />
+      )}
+
+      {showVariables && (
+        <VariablesModal
+          flow={flow}
+          isOpen={showVariables}
+          onClose={() => setShowVariables(false)}
+          onUpdateFlow={handleUpdateFlow}
         />
       )}
 

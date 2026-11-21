@@ -3,22 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
-import { ProcessFlow, SubstrateLayer, Material } from '../types/microfab';
+import React, { useState } from 'react';
+import { ProcessFlow, SubstrateLayer, VariableUnit } from '../types/microfab';
 import { getMaterialById } from '../lib/materials';
 import { ThicknessUnit, formatThickness, getUnitLabel } from '../lib/units';
-import { ThicknessInput } from './ThicknessInput';
+import { resolveFlowParameters } from '../lib/variableUtils';
 import {
-  Layers,
+  ParamBindingBadge,
+  ParamBindingPanel,
+  ParametricThicknessInput,
+} from './ParamBindingControl';
+import {
   Plus,
   Trash2,
   ArrowUp,
   ArrowDown,
   Copy,
-  Sparkles,
-  Info,
-  Maximize2,
-  Box,
 } from 'lucide-react';
 
 interface SubstrateEditorProps {
@@ -26,6 +26,8 @@ interface SubstrateEditorProps {
   thicknessUnit?: ThicknessUnit;
   onUpdateFlow: (updated: ProcessFlow) => void;
   onOpenMaterialsModal: () => void;
+  onCreateVariable?: (name: string, value: number, unit: VariableUnit, description?: string) => void;
+  onOpenVariablesModal?: () => void;
 }
 
 export const SUBSTRATE_PRESETS: {
@@ -141,7 +143,12 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
   thicknessUnit = 'nm',
   onUpdateFlow,
   onOpenMaterialsModal,
+  onCreateVariable,
+  onOpenVariablesModal,
 }) => {
+  const [waferBindOpen, setWaferBindOpen] = useState(false);
+  const variables = flow.variables || [];
+
   const layers = flow.substrateLayers || [
     {
       id: 'sub_default',
@@ -154,12 +161,14 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
   const totalThickness = layers.reduce((acc, l) => acc + (l.thickness || 0), 0);
 
   const handleUpdateLayers = (updatedLayers: SubstrateLayer[]) => {
-    onUpdateFlow({
-      ...flow,
-      substrateLayers: updatedLayers,
-      substrateThickness: updatedLayers.reduce((acc, l) => acc + (l.thickness || 0), 0),
-      substrateMaterialId: updatedLayers[0]?.materialId || 'mat_si_sub',
-    });
+    onUpdateFlow(
+      resolveFlowParameters({
+        ...flow,
+        substrateLayers: updatedLayers,
+        substrateThickness: updatedLayers.reduce((acc, l) => acc + (l.thickness || 0), 0),
+        substrateMaterialId: updatedLayers[0]?.materialId || 'mat_si_sub',
+      })
+    );
   };
 
   const handleAddLayer = () => {
@@ -254,40 +263,110 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
         <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2">
           <div className="flex items-center justify-between text-xs">
             <span className="font-semibold text-slate-300">Wafer Slice Width</span>
-            <span className="font-mono text-sky-400 font-semibold">
-              {(flow.substrateWidth / 1000).toFixed(1)} µm
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <input
-              type="number"
-              min="1"
-              max="200"
-              step="1"
-              value={(flow.substrateWidth / 1000).toFixed(1)}
-              onChange={(e) => handleWidthChange(parseFloat(e.target.value || '10'))}
-              className="w-24 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
-            />
-            <span className="text-xs text-slate-400">µm</span>
-
-            {/* Quick presets */}
-            <div className="flex items-center gap-1 ml-auto">
-              {[5, 10, 20, 50].map((w) => (
-                <button
-                  key={w}
-                  onClick={() => handleWidthChange(w)}
-                  className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
-                    flow.substrateWidth === w * 1000
-                      ? 'bg-sky-600 text-white'
-                      : 'bg-slate-800 text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  {w}µm
-                </button>
-              ))}
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-sky-400 font-semibold">
+                {(flow.substrateWidth / 1000).toFixed(1)} µm
+              </span>
+              <ParamBindingBadge
+                expression={flow.paramBindings?.substrateWidth}
+                isOpen={waferBindOpen}
+                onToggle={() => setWaferBindOpen((v) => !v)}
+                compact
+              />
             </div>
           </div>
+
+          {flow.paramBindings?.substrateWidth ? (
+            <button
+              type="button"
+              onClick={() => setWaferBindOpen((v) => !v)}
+              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-violet-950/35 border border-violet-500/50 text-xs font-mono text-violet-200 hover:border-violet-400"
+            >
+              <span>{(flow.substrateWidth / 1000).toFixed(2)} µm</span>
+              <span className="text-[10px] text-violet-300 truncate">
+                = {flow.paramBindings.substrateWidth}
+              </span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="1"
+                max="200"
+                step="1"
+                value={(flow.substrateWidth / 1000).toFixed(1)}
+                onChange={(e) => handleWidthChange(parseFloat(e.target.value || '10'))}
+                className="w-24 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+              />
+              <span className="text-xs text-slate-400">µm</span>
+
+              {/* Quick presets */}
+              <div className="flex items-center gap-1 ml-auto">
+                {[5, 10, 20, 50].map((w) => (
+                  <button
+                    key={w}
+                    onClick={() => handleWidthChange(w)}
+                    className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                      flow.substrateWidth === w * 1000
+                        ? 'bg-sky-600 text-white'
+                        : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {w}µm
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {waferBindOpen && (
+            <ParamBindingPanel
+              expression={flow.paramBindings?.substrateWidth}
+              variables={variables}
+              waferWidth={flow.substrateWidth}
+              currentValue={flow.substrateWidth}
+              unit="um"
+              suggestedVarName="wafer_w"
+              targetLabel="Wafer Slice Width"
+              onChangeExpression={(expr) => {
+                const nextBindings = { ...(flow.paramBindings || {}) };
+                if (expr) {
+                  nextBindings.substrateWidth = expr;
+                } else {
+                  delete nextBindings.substrateWidth;
+                }
+                onUpdateFlow(
+                  resolveFlowParameters({
+                    ...flow,
+                    paramBindings:
+                      Object.keys(nextBindings).length > 0 ? nextBindings : undefined,
+                  })
+                );
+              }}
+              onCreateVariable={onCreateVariable}
+              onCreateAndBind={(name, value, unit, description) => {
+                const newVar = {
+                  id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                  name,
+                  value,
+                  unit,
+                  description,
+                };
+                onUpdateFlow(
+                  resolveFlowParameters({
+                    ...flow,
+                    variables: [...variables, newVar],
+                    paramBindings: {
+                      ...(flow.paramBindings || {}),
+                      substrateWidth: name,
+                    },
+                  })
+                );
+              }}
+              onOpenVariablesModal={onOpenVariablesModal}
+              onClose={() => setWaferBindOpen(false)}
+            />
+          )}
         </div>
 
         {/* Visual Layer Stack Bar Preview */}
@@ -453,7 +532,7 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
                         {formatThickness(layer.thickness, thicknessUnit === 'nm' ? 'um' : 'nm')}
                       </span>
                     </div>
-                    <ThicknessInput
+                    <ParametricThicknessInput
                       valueNm={layer.thickness}
                       onChangeNm={(valNm) =>
                         handleUpdateLayer(actualIdx, {
@@ -464,6 +543,46 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
                       minNm={5}
                       stepNm={50}
                       className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                      expression={layer.paramBindings?.thickness}
+                      variables={variables}
+                      waferWidth={flow.substrateWidth}
+                      suggestedVarName={`sub_t_${actualIdx + 1}`}
+                      targetLabel={layer.name || `Substrate Layer #${actualIdx + 1}`}
+                      onChangeExpression={(expr) => {
+                        const nextBindings = { ...(layer.paramBindings || {}) };
+                        if (expr) nextBindings.thickness = expr;
+                        else delete nextBindings.thickness;
+                        handleUpdateLayer(actualIdx, {
+                          paramBindings:
+                            Object.keys(nextBindings).length > 0 ? nextBindings : undefined,
+                        });
+                      }}
+                      onCreateVariable={onCreateVariable}
+                      onCreateAndBind={(name, value, unit, description) => {
+                        const newVar = {
+                          id: `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                          name,
+                          value,
+                          unit,
+                          description,
+                        };
+                        const nextLayers = layers.map((l, i) =>
+                          i === actualIdx
+                            ? {
+                                ...l,
+                                paramBindings: { ...(l.paramBindings || {}), thickness: name },
+                              }
+                            : l
+                        );
+                        onUpdateFlow(
+                          resolveFlowParameters({
+                            ...flow,
+                            variables: [...variables, newVar],
+                            substrateLayers: nextLayers,
+                          })
+                        );
+                      }}
+                      onOpenVariablesModal={onOpenVariablesModal}
                     />
                   </div>
                 </div>
