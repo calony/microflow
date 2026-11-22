@@ -6,11 +6,88 @@
 import {
   ProcessFlow,
   ProcessStep,
+  ProcessStepVariant,
   PhotomaskLevel,
   MaskWindow,
   MaskFieldPolarity,
+  LithographyConfig,
 } from '../types/microfab';
 import { resolveResistMaterialId } from './materials';
+import { syncActiveVariantSnapshot, getActiveStepVariant } from './variantUtils';
+
+export interface MaskVariantLink {
+  step: ProcessStep;
+  stepIndex: number;
+  variant: ProcessStepVariant | null;
+  isActiveVariant: boolean;
+}
+
+function buildDefaultLithoConfig(): LithographyConfig {
+  return {
+    resistMaterialId: 'mat_pr_pos',
+    resistThickness: 1000,
+    polarity: 'positive',
+    windows: [],
+    sidewallAngle: 90,
+    exposureMethod: 'UV Contact (365nm)',
+  };
+}
+
+/**
+ * Resolves all (step, variant) links in the process flow that reference a given photomask level.
+ */
+export function getMaskVariantLinks(
+  flow: ProcessFlow,
+  mask: PhotomaskLevel
+): MaskVariantLink[] {
+  const links: MaskVariantLink[] = [];
+  flow.steps.forEach((step, stepIndex) => {
+    if (step.type !== 'lithography') return;
+    if (step.variants && step.variants.length > 1) {
+      const activeVar = getActiveStepVariant(step);
+      step.variants.forEach((v) => {
+        if (v.type !== 'lithography') return;
+        const isActive = Boolean(activeVar && v.id === activeVar.id);
+        const explicitVarMatch =
+          mask.assignedStepId === step.id && mask.assignedVariantId === v.id;
+        const lithoIdMatch = v.lithography?.maskId === mask.id;
+        const fallbackActiveMatch =
+          mask.assignedStepId === step.id &&
+          !mask.assignedVariantId &&
+          !v.lithography?.maskId &&
+          isActive;
+        if (explicitVarMatch || lithoIdMatch || fallbackActiveMatch) {
+          links.push({
+            step,
+            stepIndex,
+            variant: v,
+            isActiveVariant: isActive,
+          });
+        }
+      });
+    } else {
+      if (mask.assignedStepId === step.id || step.lithography?.maskId === mask.id) {
+        links.push({
+          step,
+          stepIndex,
+          variant: null,
+          isActiveVariant: true,
+        });
+      }
+    }
+  });
+  return links;
+}
+
+/**
+ * Returns true if the mask is actively assigned to any lithography step or any of its variants.
+ */
+export function isMaskAssignedInFlow(
+  flow: ProcessFlow,
+  mask: PhotomaskLevel
+): boolean {
+  return getMaskVariantLinks(flow, mask).length > 0;
+}
 
 export const RETICLE_PALETTE = [
   '#38bdf8', // Sky
@@ -187,15 +264,26 @@ export function attachNewMaskToLithoStep(
     assignedStepId: targetStep.id,
   };
 
-  // Enforce 1-to-1 step assignment
-  const cleanedMasks = existingMasks.map((m) =>
-    m.assignedStepId === targetStep.id ? { ...m, assignedStepId: undefined } : m
-  );
+  // Enforce 1-to-1 slot assignment (preserving reticles bound to other variants of the same step)
+  const activeVar = targetStep.variants && targetStep.variants.length > 1
+    ? getActiveStepVariant(targetStep)
+    : null;
+  if (activeVar) {
+    newMask.assignedVariantId = activeVar.id;
+  }
+
+  const cleanedMasks = existingMasks.map((m) => {
+    if (m.assignedStepId !== targetStep.id) return m;
+    if (activeVar && m.assignedVariantId && m.assignedVariantId !== activeVar.id) {
+      return m;
+    }
+    return { ...m, assignedStepId: undefined, assignedVariantId: undefined };
+  });
   cleanedMasks.push(newMask);
 
   const updatedSteps = flow.steps.map((s) => {
     if (s.id !== targetStep.id) return s;
-    return {
+    return syncActiveVariantSnapshot({
       ...s,
       lithography: {
         ...litho,
@@ -207,7 +295,7 @@ export function attachNewMaskToLithoStep(
         resistMaterialId: resolveResistMaterialId(newMask.polarity, litho.resistMaterialId),
         windows: newMask.windows.map((w) => ({ ...w })),
       },
-    };
+    });
   });
 
   return {
@@ -217,8 +305,25 @@ export function attachNewMaskToLithoStep(
   };
 }
 
+function applyMaskFieldsToLitho(
+  litho: LithographyConfig,
+  mask: PhotomaskLevel
+): LithographyConfig {
+  return {
+    ...litho,
+    windows: mask.windows.map((w) => ({ ...w })),
+    polarity: mask.polarity,
+    maskField: mask.maskField || litho.maskField || 'dark-field',
+    resistMaterialId: resolveResistMaterialId(mask.polarity, litho.resistMaterialId),
+    maskName: mask.name,
+    maskId: mask.id,
+    maskColor: mask.color,
+  };
+}
+
 /**
- * Updates a mask level and propagates changes to any assigned photolithography step.
+ * Updates a mask level and propagates changes to any assigned photolithography step
+ * and matching step variants (active or inactive).
  */
 export function updateMaskAndSyncSteps(
   flow: ProcessFlow,
@@ -232,28 +337,62 @@ export function updateMaskAndSyncSteps(
     currentMasks.push(updatedMask);
   }
 
-  // Synchronize to assigned step if linked
-  let updatedSteps = flow.steps;
-  if (updatedMask.assignedStepId) {
-    updatedSteps = flow.steps.map((step) => {
-      if (step.id === updatedMask.assignedStepId && step.type === 'lithography' && step.lithography) {
+  const updatedSteps = flow.steps.map((step) => {
+    if (step.type !== 'lithography') return step;
+
+    if (step.variants && step.variants.length > 1) {
+      const activeVar = getActiveStepVariant(step);
+      let anyVariantMatched = false;
+      let activeMatched = false;
+
+      const nextVariants = step.variants.map((v) => {
+        if (v.type !== 'lithography') return v;
+        const explicitMatch =
+          updatedMask.assignedStepId === step.id && updatedMask.assignedVariantId === v.id;
+        const maskIdMatch = v.lithography?.maskId === updatedMask.id;
+        const fallbackActiveMatch =
+          updatedMask.assignedStepId === step.id &&
+          !updatedMask.assignedVariantId &&
+          !v.lithography?.maskId &&
+          activeVar?.id === v.id;
+
+        if (!explicitMatch && !maskIdMatch && !fallbackActiveMatch) {
+          return v;
+        }
+        anyVariantMatched = true;
+        if (activeVar && v.id === activeVar.id) {
+          activeMatched = true;
+        }
         return {
-          ...step,
-          lithography: {
-            ...step.lithography,
-            windows: updatedMask.windows.map((w) => ({ ...w })),
-            polarity: updatedMask.polarity,
-            maskField: updatedMask.maskField || step.lithography.maskField || 'dark-field',
-            resistMaterialId: resolveResistMaterialId(updatedMask.polarity, step.lithography.resistMaterialId),
-            maskName: updatedMask.name,
-            maskId: updatedMask.id,
-            maskColor: updatedMask.color,
-          },
+          ...v,
+          lithography: applyMaskFieldsToLitho(v.lithography || buildDefaultLithoConfig(), updatedMask),
         };
-      }
-      return step;
-    });
-  }
+      });
+
+      if (!anyVariantMatched) return step;
+      return {
+        ...step,
+        variants: nextVariants,
+        ...(activeMatched
+          ? {
+              lithography: applyMaskFieldsToLitho(
+                step.lithography || buildDefaultLithoConfig(),
+                updatedMask
+              ),
+            }
+          : {}),
+      };
+    }
+
+    const isDirectMatch =
+      updatedMask.assignedStepId === step.id || step.lithography?.maskId === updatedMask.id;
+    if (!isDirectMatch || !step.lithography) return step;
+
+    return {
+      ...step,
+      lithography: applyMaskFieldsToLitho(step.lithography, updatedMask),
+    };
+  });
 
   return {
     ...flow,
@@ -263,69 +402,129 @@ export function updateMaskAndSyncSteps(
 }
 
 /**
- * Assigns or unassigns a mask level to/from a photolithography step.
+ * Assigns or unassigns a mask level to/from a photolithography step (and optionally a specific variant).
  */
 export function assignMaskToStep(
   flow: ProcessFlow,
   maskId: string,
-  targetStepId: string | null
+  targetStepId: string | null,
+  targetVariantId?: string | null
 ): ProcessFlow {
   const currentMasks = flow.masks ? flow.masks.map((m) => ({ ...m })) : [];
   const mask = currentMasks.find((m) => m.id === maskId);
   if (!mask) return flow;
 
-  const prevAssignedStepId = mask.assignedStepId;
-  mask.assignedStepId = targetStepId || undefined;
+  const targetStep = targetStepId
+    ? flow.steps.find((s) => s.id === targetStepId && s.type === 'lithography')
+    : undefined;
+  const resolvedTargetVariantId =
+    targetStep && targetStep.variants && targetStep.variants.length > 1
+      ? targetVariantId || getActiveStepVariant(targetStep)?.id || undefined
+      : undefined;
 
-  // Enforce strict 1-to-1 rule: If targetStepId is assigned, remove it from any other reticle
+  const prevAssignedStepId = mask.assignedStepId;
+  const prevAssignedVariantId = mask.assignedVariantId;
+  mask.assignedStepId = targetStepId || undefined;
+  mask.assignedVariantId = resolvedTargetVariantId;
+
+  // Enforce strict 1-to-1 rule per (stepId, variantId) slot
   if (targetStepId) {
     currentMasks.forEach((other) => {
-      if (other.id !== maskId && other.assignedStepId === targetStepId) {
+      if (other.id === maskId || other.assignedStepId !== targetStepId) return;
+      if (resolvedTargetVariantId) {
+        if (!other.assignedVariantId || other.assignedVariantId === resolvedTargetVariantId) {
+          other.assignedStepId = undefined;
+          other.assignedVariantId = undefined;
+        }
+      } else {
         other.assignedStepId = undefined;
+        other.assignedVariantId = undefined;
       }
     });
   }
 
-  let updatedSteps = flow.steps.map((step) => {
-    // If this step previously had this mask but is now unassigned
-    if (prevAssignedStepId && step.id === prevAssignedStepId && step.id !== targetStepId) {
-      if (step.type === 'lithography' && step.lithography?.maskId === maskId) {
-        return {
-          ...step,
-          lithography: {
-            ...step.lithography,
-            maskId: undefined,
-          },
-        };
+  const updatedSteps = flow.steps.map((step) => {
+    if (step.type !== 'lithography') return step;
+
+    let nextStep = step;
+
+    // Detach maskId from previous step/variant if moved away
+    if (prevAssignedStepId && nextStep.id === prevAssignedStepId) {
+      const sameSlot =
+        targetStepId === prevAssignedStepId &&
+        (!resolvedTargetVariantId || resolvedTargetVariantId === prevAssignedVariantId);
+      if (!sameSlot) {
+        if (nextStep.variants && nextStep.variants.length > 1) {
+          const activeVar = getActiveStepVariant(nextStep);
+          let activeCleared = false;
+          const nextVariants = nextStep.variants.map((v) => {
+            if (v.type !== 'lithography' || !v.lithography) return v;
+            const matchPrev = prevAssignedVariantId
+              ? v.id === prevAssignedVariantId
+              : v.lithography.maskId === maskId;
+            if (!matchPrev) return v;
+            if (activeVar && v.id === activeVar.id) activeCleared = true;
+            return {
+              ...v,
+              lithography: { ...v.lithography, maskId: undefined },
+            };
+          });
+          nextStep = {
+            ...nextStep,
+            variants: nextVariants,
+            ...(activeCleared && nextStep.lithography
+              ? { lithography: { ...nextStep.lithography, maskId: undefined } }
+              : {}),
+          };
+        } else if (nextStep.lithography?.maskId === maskId) {
+          nextStep = {
+            ...nextStep,
+            lithography: {
+              ...nextStep.lithography,
+              maskId: undefined,
+            },
+          };
+        }
       }
     }
 
-    // If this is the newly assigned step
-    if (targetStepId && step.id === targetStepId && step.type === 'lithography') {
-      const litho = step.lithography || {
-        resistMaterialId: 'mat_pr_pos',
-        resistThickness: 1000,
-        polarity: 'positive',
-        windows: [],
-        sidewallAngle: 90,
-        exposureMethod: 'UV Contact (365nm)',
-      };
-      return {
-        ...step,
-        lithography: {
-          ...litho,
-          maskId: mask.id,
-          maskName: mask.name,
-          polarity: mask.polarity,
-          maskField: mask.maskField || litho.maskField || 'dark-field',
-          resistMaterialId: resolveResistMaterialId(mask.polarity, litho.resistMaterialId),
-          maskColor: mask.color,
-          windows: mask.windows.map((w) => ({ ...w })),
-        },
-      };
+    // Apply mask onto newly assigned step/variant
+    if (targetStepId && nextStep.id === targetStepId) {
+      if (nextStep.variants && nextStep.variants.length > 1 && resolvedTargetVariantId) {
+        const activeVar = getActiveStepVariant(nextStep);
+        let activeUpdated = false;
+        const nextVariants = nextStep.variants.map((v) => {
+          if (v.id !== resolvedTargetVariantId) return v;
+          if (activeVar && v.id === activeVar.id) activeUpdated = true;
+          const baseLitho = v.lithography || nextStep.lithography || buildDefaultLithoConfig();
+          return {
+            ...v,
+            type: 'lithography' as const,
+            lithography: applyMaskFieldsToLitho(baseLitho, mask),
+          };
+        });
+        nextStep = {
+          ...nextStep,
+          variants: nextVariants,
+          ...(activeUpdated
+            ? {
+                lithography: applyMaskFieldsToLitho(
+                  nextStep.lithography || buildDefaultLithoConfig(),
+                  mask
+                ),
+              }
+            : {}),
+        };
+      } else {
+        const litho = nextStep.lithography || buildDefaultLithoConfig();
+        nextStep = syncActiveVariantSnapshot({
+          ...nextStep,
+          lithography: applyMaskFieldsToLitho(litho, mask),
+        });
+      }
     }
 
-    return step;
+    return nextStep;
   });
 
   return {
@@ -336,86 +535,92 @@ export function assignMaskToStep(
 }
 
 /**
- * Swaps photomask assignments when a mask is assigned to a step that already has a mask.
- * - maskA is assigned to targetStepId (where maskB was assigned).
- * - If maskA previously had an assigned step (prevStepAId), maskB takes that step.
- * - If maskA was unassigned, maskB becomes unassigned.
- * - All affected steps have their lithography properties (maskId, maskName, polarity, windows) synchronized.
+ * Swaps photomask assignments when a mask is assigned to a step (or variant slot) that already has a mask.
  */
 export function swapMaskAssignments(
   flow: ProcessFlow,
   maskAId: string,
-  targetStepId: string
+  targetStepId: string,
+  targetVariantId?: string | null
 ): ProcessFlow {
   const currentMasks = flow.masks ? flow.masks.map((m) => ({ ...m })) : [];
   const maskA = currentMasks.find((m) => m.id === maskAId);
-  const maskB = currentMasks.find((m) => m.assignedStepId === targetStepId && m.id !== maskAId);
-
   if (!maskA) return flow;
+
+  const targetStep = flow.steps.find((s) => s.id === targetStepId && s.type === 'lithography');
+  const resolvedTargetVariantId =
+    targetStep && targetStep.variants && targetStep.variants.length > 1
+      ? targetVariantId || getActiveStepVariant(targetStep)?.id || undefined
+      : undefined;
+
+  const maskB = currentMasks.find((m) => {
+    if (m.id === maskAId || m.assignedStepId !== targetStepId) return false;
+    if (!resolvedTargetVariantId) return true;
+    return !m.assignedVariantId || m.assignedVariantId === resolvedTargetVariantId;
+  });
+
   if (!maskB) {
-    return assignMaskToStep(flow, maskAId, targetStepId);
+    return assignMaskToStep(flow, maskAId, targetStepId, resolvedTargetVariantId);
   }
 
   const prevStepAId = maskA.assignedStepId;
-  const targetStepBId = targetStepId;
+  const prevVariantAId = maskA.assignedVariantId;
 
-  // Swap assignedStepId references
-  maskA.assignedStepId = targetStepBId;
+  maskA.assignedStepId = targetStepId;
+  maskA.assignedVariantId = resolvedTargetVariantId;
   maskB.assignedStepId = prevStepAId || undefined;
+  maskB.assignedVariantId = prevStepAId ? prevVariantAId : undefined;
 
-  // Update steps
+  const applyMaskToStepSlot = (
+    step: ProcessStep,
+    m: PhotomaskLevel,
+    variantId?: string
+  ): ProcessStep => {
+    if (step.variants && step.variants.length > 1 && variantId) {
+      const activeVar = getActiveStepVariant(step);
+      let activeMatched = false;
+      const nextVariants = step.variants.map((v) => {
+        if (v.id !== variantId) return v;
+        if (activeVar && v.id === activeVar.id) activeMatched = true;
+        return {
+          ...v,
+          type: 'lithography' as const,
+          lithography: applyMaskFieldsToLitho(
+            v.lithography || step.lithography || buildDefaultLithoConfig(),
+            m
+          ),
+        };
+      });
+      return {
+        ...step,
+        variants: nextVariants,
+        ...(activeMatched
+          ? {
+              lithography: applyMaskFieldsToLitho(
+                step.lithography || buildDefaultLithoConfig(),
+                m
+              ),
+            }
+          : {}),
+      };
+    }
+
+    return syncActiveVariantSnapshot({
+      ...step,
+      lithography: applyMaskFieldsToLitho(step.lithography || buildDefaultLithoConfig(), m),
+    });
+  };
+
   const updatedSteps = flow.steps.map((step) => {
-    // Step B receives Mask A
-    if (step.id === targetStepBId && step.type === 'lithography') {
-      const litho = step.lithography || {
-        resistMaterialId: 'mat_pr_pos',
-        resistThickness: 1000,
-        polarity: 'positive',
-        windows: [],
-        sidewallAngle: 90,
-        exposureMethod: 'UV Contact (365nm)',
-      };
-      return {
-        ...step,
-        lithography: {
-          ...litho,
-          maskId: maskA.id,
-          maskName: maskA.name,
-          polarity: maskA.polarity,
-          maskField: maskA.maskField || litho.maskField || 'dark-field',
-          resistMaterialId: resolveResistMaterialId(maskA.polarity, litho.resistMaterialId),
-          maskColor: maskA.color,
-          windows: maskA.windows.map((w) => ({ ...w })),
-        },
-      };
+    if (step.type !== 'lithography') return step;
+    let nextStep = step;
+    if (nextStep.id === targetStepId) {
+      nextStep = applyMaskToStepSlot(nextStep, maskA, resolvedTargetVariantId);
     }
-
-    // If Mask A had a prior step, that step now receives Mask B
-    if (prevStepAId && step.id === prevStepAId && step.type === 'lithography') {
-      const litho = step.lithography || {
-        resistMaterialId: 'mat_pr_pos',
-        resistThickness: 1000,
-        polarity: 'positive',
-        windows: [],
-        sidewallAngle: 90,
-        exposureMethod: 'UV Contact (365nm)',
-      };
-      return {
-        ...step,
-        lithography: {
-          ...litho,
-          maskId: maskB.id,
-          maskName: maskB.name,
-          polarity: maskB.polarity,
-          maskField: maskB.maskField || litho.maskField || 'dark-field',
-          resistMaterialId: resolveResistMaterialId(maskB.polarity, litho.resistMaterialId),
-          maskColor: maskB.color,
-          windows: maskB.windows.map((w) => ({ ...w })),
-        },
-      };
+    if (prevStepAId && nextStep.id === prevStepAId) {
+      nextStep = applyMaskToStepSlot(nextStep, maskB, prevVariantAId);
     }
-
-    return step;
+    return nextStep;
   });
 
   return {
@@ -425,9 +630,128 @@ export function swapMaskAssignments(
   };
 }
 
+function buildVariantMaskName(
+  sourceMaskName: string,
+  variantName: string,
+  variants?: ProcessStepVariant[]
+): string {
+  let baseName = sourceMaskName.trim();
+  if (variants && variants.length > 0) {
+    for (const v of variants) {
+      const suffix = ` (${v.name})`;
+      if (baseName.endsWith(suffix)) {
+        baseName = baseName.slice(0, -suffix.length).trim();
+        break;
+      }
+    }
+  }
+  return `${baseName || sourceMaskName} (${variantName})`;
+}
+
+function areMaskWindowsEqual(
+  a: MaskWindow[] = [],
+  b: MaskWindow[] = []
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const wa = a[i];
+    const wb = b[i];
+    if (Math.round(wa.xStart) !== Math.round(wb.xStart)) return false;
+    if (Math.round(wa.xEnd) !== Math.round(wb.xEnd)) return false;
+    const bindA = wa.paramBindings ? JSON.stringify(wa.paramBindings) : '';
+    const bindB = wb.paramBindings ? JSON.stringify(wb.paramBindings) : '';
+    if (bindA !== bindB) return false;
+  }
+  return true;
+}
+
+function doesLithoMaskPatternDiffer(
+  litho: LithographyConfig,
+  mask: PhotomaskLevel
+): boolean {
+  if (!areMaskWindowsEqual(litho.windows || [], mask.windows || [])) {
+    return true;
+  }
+  const lithoField = litho.maskField || 'dark-field';
+  const maskField = mask.maskField || 'dark-field';
+  if (lithoField !== maskField) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Forks a dedicated copy of a shared reticle for a specific variant of a branched lithography step,
+ * keeping existing variants attached to their original reticle.
+ */
+export function forkMaskForStepVariant(
+  flow: ProcessFlow,
+  sourceMaskId: string,
+  stepId: string,
+  variantId: string
+): { flow: ProcessFlow; newMask: PhotomaskLevel | null } {
+  const step = flow.steps.find((s) => s.id === stepId && s.type === 'lithography');
+  const sourceMask = (flow.masks || []).find((m) => m.id === sourceMaskId);
+  const variant = step?.variants?.find((v) => v.id === variantId);
+  if (!step || !sourceMask || !variant || !step.variants || step.variants.length <= 1) {
+    return { flow, newMask: null };
+  }
+
+  const currentMasks = (flow.masks || []).map((m) => ({ ...m }));
+  const levelNum = getNextMaskLevelNumber(currentMasks);
+  const tag = formatMaskLevelTag(levelNum);
+  const newMaskId = `mask_${Date.now()}_${levelNum}`;
+
+  const newMask: PhotomaskLevel = {
+    ...sourceMask,
+    id: newMaskId,
+    levelNumber: levelNum,
+    name: buildVariantMaskName(sourceMask.name, variant.name, step.variants),
+    layerCode: sourceMask.layerCode ? `${sourceMask.layerCode}-V${levelNum}` : `LVL-${tag}`,
+    description: `Dedicated reticle for ${step.title} — ${variant.name}`,
+    color: RETICLE_PALETTE[(levelNum - 1) % RETICLE_PALETTE.length],
+    windows: (variant.lithography?.windows || sourceMask.windows).map((w, idx) => ({
+      ...w,
+      id: `w_fork_${Date.now()}_${idx}`,
+    })),
+    polarity: variant.lithography?.polarity || sourceMask.polarity,
+    maskField: variant.lithography?.maskField || sourceMask.maskField || 'dark-field',
+    assignedStepId: step.id,
+    assignedVariantId: variant.id,
+  };
+
+  // Pin sourceMask to another variant still referencing it if it wasn't pinned yet
+  const otherVariantsUsingSource = step.variants.filter(
+    (v) =>
+      v.id !== variant.id &&
+      v.type === 'lithography' &&
+      (v.lithography?.maskId === sourceMask.id || !v.lithography?.maskId)
+  );
+  const updatedMasks = currentMasks.map((m) => {
+    if (m.id === sourceMask.id && otherVariantsUsingSource.length === 1) {
+      return {
+        ...m,
+        assignedStepId: step.id,
+        assignedVariantId: otherVariantsUsingSource[0].id,
+      };
+    }
+    return m;
+  });
+  updatedMasks.push(newMask);
+
+  const flowWithMask: ProcessFlow = {
+    ...flow,
+    masks: updatedMasks,
+  };
+  const assignedFlow = assignMaskToStep(flowWithMask, newMask.id, step.id, variant.id);
+  return { flow: assignedFlow, newMask };
+}
+
 /**
  * When a lithography step's apertures or properties are edited directly in the step editor
- * or MaskEditor track, sync back to the linked PhotomaskLevel.
+ * or MaskEditor track, sync back to the linked PhotomaskLevel while preserving reticles owned by other variants.
+ * If the step is branched and the active variant modifies a reticle currently shared with another variant,
+ * automatically fork a new mask branch in flow.masks and re-bind the active variant to it.
  */
 export function syncStepWindowsToMask(
   flow: ProcessFlow,
@@ -437,22 +761,196 @@ export function syncStepWindowsToMask(
 
   const litho = step.lithography;
   const currentMasks = flow.masks ? flow.masks.map((m) => ({ ...m })) : [];
+  const hasVariants = Boolean(step.variants && step.variants.length > 1);
+  const activeVar = hasVariants ? getActiveStepVariant(step) : null;
+
+  const referencedMaskIds = new Set<string>();
+  if (litho.maskId) referencedMaskIds.add(litho.maskId);
+  if (hasVariants && step.variants) {
+    step.variants.forEach((v) => {
+      if (v.type === 'lithography' && v.lithography?.maskId) {
+        referencedMaskIds.add(v.lithography.maskId);
+      }
+    });
+  }
 
   if (litho.maskId) {
     const mask = currentMasks.find((m) => m.id === litho.maskId);
     if (mask) {
+      const otherVariantsOnSameMask =
+        hasVariants && step.variants && activeVar
+          ? step.variants.filter(
+              (v) =>
+                v.id !== activeVar.id &&
+                v.type === 'lithography' &&
+                v.lithography?.maskId === mask.id
+            )
+          : [];
+
+      const isSharedEditMode = step.variantMaskEditMode === 'shared';
+
+      // Auto-detect a new mask branch when in 'branch' mode (default) and a variant
+      // modifies the aperture track / mask field on a reticle shared with sibling variants.
+      if (
+        !isSharedEditMode &&
+        activeVar &&
+        otherVariantsOnSameMask.length > 0 &&
+        doesLithoMaskPatternDiffer(litho, mask)
+      ) {
+        const levelNum = getNextMaskLevelNumber(currentMasks);
+        const tag = formatMaskLevelTag(levelNum);
+        const newMaskId = `mask_${Date.now()}_${levelNum}`;
+        const branchedMaskName = buildVariantMaskName(
+          mask.name,
+          activeVar.name,
+          step.variants
+        );
+        const newMaskColor = RETICLE_PALETTE[(levelNum - 1) % RETICLE_PALETTE.length];
+        const newMaskField = litho.maskField || mask.maskField || 'dark-field';
+
+        // Preserve existing window IDs on the active variant so live drags/selections stay intact
+        const newMask: PhotomaskLevel = {
+          ...mask,
+          id: newMaskId,
+          levelNumber: levelNum,
+          name: branchedMaskName,
+          layerCode: mask.layerCode ? `${mask.layerCode}-V${levelNum}` : `LVL-${tag}`,
+          description: `Branched reticle for ${step.title} — ${activeVar.name}`,
+          polarity: litho.polarity,
+          maskField: newMaskField,
+          color: newMaskColor,
+          windows: litho.windows.map((w) => ({ ...w })),
+          assignedStepId: step.id,
+          assignedVariantId: activeVar.id,
+        };
+
+        // Keep the original shared mask untouched for the sibling variant(s)
+        mask.assignedStepId = step.id;
+        mask.assignedVariantId =
+          otherVariantsOnSameMask.length === 1
+            ? otherVariantsOnSameMask[0].id
+            : undefined;
+
+        currentMasks.push(newMask);
+        referencedMaskIds.add(newMask.id);
+
+        // Preserve any other variant masks on the same step; unassign obsolete ones
+        currentMasks.forEach((other) => {
+          if (other.id === newMask.id || other.id === mask.id || other.assignedStepId !== step.id) {
+            return;
+          }
+          if (step.variants && referencedMaskIds.has(other.id)) {
+            if (!other.assignedVariantId) {
+              const ownerVar = step.variants.find(
+                (v) =>
+                  v.id !== activeVar.id &&
+                  v.type === 'lithography' &&
+                  v.lithography?.maskId === other.id
+              );
+              if (ownerVar) other.assignedVariantId = ownerVar.id;
+            }
+            return;
+          }
+          other.assignedStepId = undefined;
+          other.assignedVariantId = undefined;
+        });
+
+        const nextLitho: LithographyConfig = {
+          ...litho,
+          maskId: newMask.id,
+          maskName: newMask.name,
+          maskColor: newMask.color,
+          maskField: newMask.maskField,
+        };
+
+        const updatedSteps = flow.steps.map((s) => {
+          if (s.id !== step.id) return s;
+          const nextVariants = (s.variants || []).map((v) =>
+            v.id === activeVar.id
+              ? {
+                  ...v,
+                  lithography: {
+                    ...nextLitho,
+                    windows: nextLitho.windows.map((w) => ({ ...w })),
+                  },
+                }
+              : v
+          );
+          return {
+            ...s,
+            lithography: nextLitho,
+            variants: nextVariants,
+          };
+        });
+
+        return {
+          ...flow,
+          masks: currentMasks,
+          steps: updatedSteps,
+        };
+      }
+
       mask.windows = litho.windows.map((w) => ({ ...w }));
       mask.polarity = litho.polarity;
       mask.maskField = litho.maskField || mask.maskField || 'dark-field';
       if (litho.maskName) mask.name = litho.maskName;
       mask.assignedStepId = step.id;
 
-      // Remove assignment from any other mask currently claiming this step
+      if (hasVariants && step.variants && activeVar) {
+        const sharedByAnotherVariant = otherVariantsOnSameMask.length > 0;
+        mask.assignedVariantId = sharedByAnotherVariant ? undefined : activeVar.id;
+      } else {
+        mask.assignedVariantId = undefined;
+      }
+
+      // Preserve other masks still referenced by inactive variants on the same step; unassign obsolete ones
       currentMasks.forEach((other) => {
-        if (other.id !== mask.id && other.assignedStepId === step.id) {
-          other.assignedStepId = undefined;
+        if (other.id === mask.id || other.assignedStepId !== step.id) return;
+        if (hasVariants && step.variants && referencedMaskIds.has(other.id)) {
+          if (!other.assignedVariantId) {
+            const ownerVar = step.variants.find(
+              (v) => v.id !== activeVar?.id && v.type === 'lithography' && v.lithography?.maskId === other.id
+            );
+            if (ownerVar) other.assignedVariantId = ownerVar.id;
+          }
+          return;
         }
+        other.assignedStepId = undefined;
+        other.assignedVariantId = undefined;
       });
+
+      // In 'shared' edit mode, carry aperture/maskField/maskName edits over to all sibling variants sharing this reticle
+      if (isSharedEditMode && hasVariants && step.variants && otherVariantsOnSameMask.length > 0) {
+        const updatedSteps = flow.steps.map((s) => {
+          if (s.id !== step.id || !s.variants) return s;
+          const nextVariants = s.variants.map((v) => {
+            if (v.id === activeVar?.id || v.type !== 'lithography' || v.lithography?.maskId !== mask.id) {
+              return v;
+            }
+            return {
+              ...v,
+              lithography: {
+                ...v.lithography,
+                maskId: mask.id,
+                maskName: mask.name,
+                maskColor: mask.color,
+                maskField: mask.maskField || 'dark-field',
+                windows: mask.windows.map((w) => ({ ...w })),
+              },
+            };
+          });
+          return {
+            ...s,
+            variants: nextVariants,
+          };
+        });
+
+        return {
+          ...flow,
+          masks: currentMasks,
+          steps: updatedSteps,
+        };
+      }
 
       return {
         ...flow,
@@ -493,6 +991,7 @@ export function createNewMaskInFlow(
       ? partial.windows.map((w) => ({ ...w }))
       : [{ id: `w_${Date.now()}`, xStart: wStart, xEnd: wEnd }],
     assignedStepId: partial?.assignedStepId,
+    assignedVariantId: partial?.assignedVariantId,
   };
 
   const updatedFlow = {
@@ -501,26 +1000,22 @@ export function createNewMaskInFlow(
   };
 
   return {
-    flow: newMask.assignedStepId ? assignMaskToStep(updatedFlow, newMask.id, newMask.assignedStepId) : updatedFlow,
+    flow: newMask.assignedStepId
+      ? assignMaskToStep(updatedFlow, newMask.id, newMask.assignedStepId, newMask.assignedVariantId)
+      : updatedFlow,
     newMask,
   };
 }
 
 /**
- * Deletes an unassigned mask level. Assigned mask levels are preserved.
+ * Deletes an unassigned mask level. Assigned mask levels (including inactive variant reticles) are preserved.
  */
 export function deleteMaskFromFlow(
   flow: ProcessFlow,
   maskId: string
 ): ProcessFlow {
   const targetMask = (flow.masks || []).find((m) => m.id === maskId);
-  const isAssigned =
-    Boolean(
-      targetMask?.assignedStepId &&
-        flow.steps.some((s) => s.id === targetMask.assignedStepId && s.type === 'lithography')
-    ) || flow.steps.some((s) => s.type === 'lithography' && s.lithography?.maskId === maskId);
-
-  if (isAssigned) {
+  if (targetMask && isMaskAssignedInFlow(flow, targetMask)) {
     return flow;
   }
 

@@ -11,9 +11,11 @@ import {
   MaskWindow,
   ProcessFlow,
   ProcessStep,
+  ProcessStepVariant,
   SubstrateLayer,
   VariableUnit,
 } from '../types/microfab';
+import { syncActiveVariantSnapshot } from './variantUtils';
 
 export interface EvalResult {
   ok: true;
@@ -684,7 +686,15 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
         (s) =>
           (s.paramBindings && Object.keys(s.paramBindings).length > 0) ||
           s.lithography?.windows?.some((w) => w.paramBindings && Object.keys(w.paramBindings).length > 0) ||
-          s.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0)
+          s.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0) ||
+          Boolean(
+            s.variants?.some(
+              (v) =>
+                (v.paramBindings && Object.keys(v.paramBindings).length > 0) ||
+                v.lithography?.windows?.some((w) => w.paramBindings && Object.keys(w.paramBindings).length > 0) ||
+                v.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0)
+            )
+          )
       ) ||
       Boolean(flow.masks?.some((m) => m.windows.some((w) => w.paramBindings && Object.keys(w.paramBindings).length > 0))) ||
       Boolean(flow.gdsLayout?.shapes.some((sh) => sh.paramBindings && Object.keys(sh.paramBindings).length > 0));
@@ -732,6 +742,8 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
     } else if (step.type === 'lithography' && step.lithography) {
       const rt = evalBoundValue(b, 'lithography.resistThickness', scope);
       const sw = evalBoundValue(b, 'lithography.sidewallAngle', scope);
+      const lt = evalBoundValue(b, 'lithography.lorThickness', scope);
+      const lu = evalBoundValue(b, 'lithography.lorUndercut', scope);
       const nextWindows = (step.lithography.windows || []).map((w) =>
         resolveMaskWindow(w, scope, nextSubstrateWidth)
       );
@@ -741,6 +753,8 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
           ...step.lithography,
           ...(rt !== null ? { resistThickness: Math.max(100, Math.round(rt)) } : {}),
           ...(sw !== null ? { sidewallAngle: Math.max(75, Math.min(105, Math.round(sw))) } : {}),
+          ...(lt !== null ? { lorThickness: Math.max(50, Math.round(lt)) } : {}),
+          ...(lu !== null ? { lorUndercut: Math.max(0, Math.round(lu)) } : {}),
           windows: nextWindows,
         },
       };
@@ -820,6 +834,125 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
           },
         };
       }
+    }
+
+    if (updated.variants && updated.variants.length > 0) {
+      const resolveVariant = (v: ProcessStepVariant): ProcessStepVariant => {
+        const vb = v.paramBindings;
+        let nextV = v;
+        if (v.type === 'deposition' && v.deposition) {
+          const t = evalBoundValue(vb, 'deposition.thickness', scope);
+          if (t !== null) {
+            const clamped = Math.max(5, Math.round(t));
+            nextV = {
+              ...nextV,
+              thickness: clamped,
+              deposition: { ...v.deposition, thickness: clamped },
+            };
+          }
+        } else if (v.type === 'lithography' && v.lithography) {
+          const rt = evalBoundValue(vb, 'lithography.resistThickness', scope);
+          const sw = evalBoundValue(vb, 'lithography.sidewallAngle', scope);
+          const lt = evalBoundValue(vb, 'lithography.lorThickness', scope);
+          const lu = evalBoundValue(vb, 'lithography.lorUndercut', scope);
+          const nextWindows = (v.lithography.windows || []).map((w) =>
+            resolveMaskWindow(w, scope, nextSubstrateWidth)
+          );
+          nextV = {
+            ...nextV,
+            lithography: {
+              ...v.lithography,
+              ...(rt !== null ? { resistThickness: Math.max(100, Math.round(rt)) } : {}),
+              ...(sw !== null ? { sidewallAngle: Math.max(75, Math.min(105, Math.round(sw))) } : {}),
+              ...(lt !== null ? { lorThickness: Math.max(50, Math.round(lt)) } : {}),
+              ...(lu !== null ? { lorUndercut: Math.max(0, Math.round(lu)) } : {}),
+              windows: nextWindows,
+            },
+          };
+        } else if (v.type === 'etch' && v.etch) {
+          const d = evalBoundValue(vb, 'etch.depth', scope);
+          const sw = evalBoundValue(vb, 'etch.sidewallAngle', scope);
+          const et = evalBoundValue(vb, 'etch.etchTimeSec', scope);
+          const sd = evalBoundValue(vb, 'etch.scallopDepth', scope);
+          const sp = evalBoundValue(vb, 'etch.scallopPitch', scope);
+          const clampedD = d !== null ? Math.max(10, Math.round(d)) : undefined;
+          nextV = {
+            ...nextV,
+            ...(clampedD !== undefined ? { thickness: clampedD } : {}),
+            etch: {
+              ...v.etch,
+              ...(clampedD !== undefined ? { depth: clampedD } : {}),
+              ...(sw !== null ? { sidewallAngle: Math.max(45, Math.min(110, Math.round(sw * 100) / 100)) } : {}),
+              ...(et !== null ? { etchTimeSec: Math.max(1, Math.round(et)) } : {}),
+              ...(sd !== null ? { scallopDepth: Math.max(5, Math.round(sd)) } : {}),
+              ...(sp !== null ? { scallopPitch: Math.max(20, Math.round(sp)) } : {}),
+            },
+          };
+        } else if (v.type === 'cmp' && v.cmp) {
+          const d = evalBoundValue(vb, 'cmp.depth', scope);
+          const th = evalBoundValue(vb, 'cmp.targetHeight', scope);
+          nextV = {
+            ...nextV,
+            cmp: {
+              ...v.cmp,
+              ...(d !== null ? { depth: Math.max(10, Math.round(d)) } : {}),
+              ...(th !== null ? { targetHeight: Math.max(-10000, Math.round(th)) } : {}),
+            },
+          };
+        } else if (v.type === 'dicing' && v.dicing) {
+          const kw = evalBoundValue(vb, 'dicing.kerfWidth', scope);
+          const cd = evalBoundValue(vb, 'dicing.cutDepth', scope);
+          const to = evalBoundValue(vb, 'dicing.tapeOvercut', scope);
+          const sw = evalBoundValue(vb, 'dicing.sidewallAngle', scope);
+          const nextStreets: DicingStreet[] = (v.dicing.streets || []).map((st) => {
+            const xc = evalBoundValue(st.paramBindings, 'xCenter', scope);
+            if (xc === null) return st;
+            return {
+              ...st,
+              xCenter: Math.max(0, Math.min(nextSubstrateWidth, Math.round(xc))),
+            };
+          });
+          nextV = {
+            ...nextV,
+            dicing: {
+              ...v.dicing,
+              ...(kw !== null ? { kerfWidth: Math.max(20, Math.round(kw)) } : {}),
+              ...(cd !== null ? { cutDepth: Math.max(20, Math.round(cd)) } : {}),
+              ...(to !== null ? { tapeOvercut: Math.max(0, Math.round(to)) } : {}),
+              ...(sw !== null ? { sidewallAngle: Math.max(65, Math.min(90, Math.round(sw))) } : {}),
+              streets: nextStreets,
+            },
+          };
+        } else if (v.type === 'tape-frame' && v.tapeFrame) {
+          const t = evalBoundValue(vb, 'tapeFrame.thickness', scope);
+          if (t !== null) {
+            nextV = {
+              ...nextV,
+              tapeFrame: { ...v.tapeFrame, thickness: Math.max(25, Math.round(t)) },
+            };
+          }
+        } else if (v.type === 'bonding' && v.bonding?.interfaceLayer) {
+          const t = evalBoundValue(vb, 'bonding.interfaceLayer.thickness', scope);
+          if (t !== null) {
+            nextV = {
+              ...nextV,
+              bonding: {
+                ...v.bonding,
+                interfaceLayer: {
+                  ...v.bonding.interfaceLayer,
+                  thickness: Math.max(5, Math.round(t)),
+                },
+              },
+            };
+          }
+        }
+        return nextV;
+      };
+
+      updated = syncActiveVariantSnapshot({
+        ...updated,
+        variants: updated.variants.map(resolveVariant),
+      });
     }
 
     return updated;
@@ -905,6 +1038,17 @@ export function countVariableUsages(flow: ProcessFlow): Record<string, VariableU
     step.dicing?.streets?.forEach((st, stIdx) => {
       scanBindings(st.paramBindings, `${label} · Street #${stIdx + 1}`);
     });
+    step.variants?.forEach((variant) => {
+      if (variant.id === step.activeVariantId) return;
+      const vLabel = `${label} [${variant.name}]`;
+      scanBindings(variant.paramBindings, vLabel);
+      variant.lithography?.windows?.forEach((w, wIdx) => {
+        scanBindings(w.paramBindings, `${vLabel} · Window #${wIdx + 1}`);
+      });
+      variant.dicing?.streets?.forEach((st, stIdx) => {
+        scanBindings(st.paramBindings, `${vLabel} · Street #${stIdx + 1}`);
+      });
+    });
   });
 
   flow.masks?.forEach((mask) => {
@@ -981,6 +1125,28 @@ export function renameVariableInFlow(
             })),
           }
         : undefined,
+      variants: s.variants?.map((v) => ({
+        ...v,
+        paramBindings: rewriteMap(v.paramBindings),
+        lithography: v.lithography
+          ? {
+              ...v.lithography,
+              windows: v.lithography.windows.map((w) => ({
+                ...w,
+                paramBindings: rewriteMap(w.paramBindings),
+              })),
+            }
+          : undefined,
+        dicing: v.dicing
+          ? {
+              ...v.dicing,
+              streets: v.dicing.streets.map((st) => ({
+                ...st,
+                paramBindings: rewriteMap(st.paramBindings),
+              })),
+            }
+          : undefined,
+      })),
     })),
     masks: flow.masks?.map((m) => ({
       ...m,
@@ -1056,6 +1222,28 @@ export function removeVariableFromFlow(flow: ProcessFlow, varName: string): Proc
             })),
           }
         : undefined,
+      variants: s.variants?.map((v) => ({
+        ...v,
+        paramBindings: cleanMap(v.paramBindings),
+        lithography: v.lithography
+          ? {
+              ...v.lithography,
+              windows: v.lithography.windows.map((w) => ({
+                ...w,
+                paramBindings: cleanMap(w.paramBindings),
+              })),
+            }
+          : undefined,
+        dicing: v.dicing
+          ? {
+              ...v.dicing,
+              streets: v.dicing.streets.map((st) => ({
+                ...st,
+                paramBindings: cleanMap(st.paramBindings),
+              })),
+            }
+          : undefined,
+      })),
     })),
     masks: flow.masks?.map((m) => ({
       ...m,

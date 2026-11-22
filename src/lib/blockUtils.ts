@@ -804,7 +804,7 @@ export function deleteStepsFromTimeline(
   const updatedMasks = rebuilt.masks
     ? rebuilt.masks.map((m) =>
         m.assignedStepId && delSet.has(m.assignedStepId)
-          ? { ...m, assignedStepId: undefined }
+          ? { ...m, assignedStepId: undefined, assignedVariantId: undefined }
           : m
       )
     : rebuilt.masks;
@@ -1142,7 +1142,9 @@ export function deleteStepFromTimeline(
   const updatedSteps = flow.steps.filter((_, i) => i !== stepIdx);
   const updatedMasks = flow.masks
     ? flow.masks.map((m) =>
-        m.assignedStepId === targetStep.id ? { ...m, assignedStepId: undefined } : m
+        m.assignedStepId === targetStep.id
+          ? { ...m, assignedStepId: undefined, assignedVariantId: undefined }
+          : m
       )
     : flow.masks;
   return {

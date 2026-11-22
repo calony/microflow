@@ -14,9 +14,17 @@ import {
   deleteMaskFromFlow,
   duplicateMaskWindow,
   createMaskWindowArray,
+  getMaskVariantLinks,
+  isMaskAssignedInFlow,
+  forkMaskForStepVariant,
   MaskWindowArrayOptions,
   RETICLE_PALETTE,
 } from '../lib/maskUtils';
+import {
+  getActiveStepVariant,
+  switchStepVariant,
+  createStepVariant,
+} from '../lib/variantUtils';
 import { resolveFlowParameters } from '../lib/variableUtils';
 import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
 import { MaskWindowArrayPanel } from './MaskWindowArrayPanel';
@@ -34,21 +42,29 @@ import {
   Search,
   Scan,
   Maximize2,
+  Minimize2,
   Sliders,
   Split,
   FlipHorizontal,
   Eye,
   AlertTriangle,
   ArrowRight,
+  ArrowUpRight,
   LayoutGrid,
   ChevronDown,
   PanelLeft,
+  PanelRight,
   Eraser,
   Variable as VariableIcon,
   Undo2,
   Redo2,
+  GitBranch,
 } from 'lucide-react';
 import { GdsLayoutEditor } from './GdsLayoutEditor';
+import { simulateCrossSection, buildRenderPolygons } from '../lib/simulationEngine';
+import { getMaterialById } from '../lib/materials';
+import { SvgPatterns } from './SvgPatterns';
+import { ThicknessUnit } from '../lib/units';
 
 interface MaskLevelsModalProps {
   flow: ProcessFlow;
@@ -58,6 +74,8 @@ interface MaskLevelsModalProps {
   onSelectStepIndex?: (index: number) => void;
   initialMaskId?: string;
   onOpenVariablesModal?: () => void;
+  activeStepIndex?: number;
+  thicknessUnit?: ThicknessUnit;
 }
 
 interface DragState {
@@ -84,6 +102,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   onSelectStepIndex,
   initialMaskId,
   onOpenVariablesModal,
+  activeStepIndex: _activeStepIndex,
+  thicknessUnit = 'nm',
 }) => {
   const masks = useMemo(() => flow.masks || [], [flow.masks]);
   const variables = useMemo(() => flow.variables || [], [flow.variables]);
@@ -114,6 +134,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   // Reassignment conflict prompt modal state
   interface ConflictPromptData {
     targetStepId: string;
+    targetVariantId?: string;
+    targetVariantName?: string;
     targetStepTitle: string;
     targetStepIndex: number;
     conflictingMask: PhotomaskLevel;
@@ -122,6 +144,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       id: string;
       title: string;
       index: number;
+      variantName?: string;
     };
   }
   const [conflictPrompt, setConflictPrompt] = useState<ConflictPromptData | null>(null);
@@ -129,7 +152,29 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   const [editorTab, setEditorTab] = useState<'apertures' | 'gds'>('apertures');
   const [mobileReticleDrawerOpen, setMobileReticleDrawerOpen] = useState<boolean>(false);
   const [desktopMasksSidebarOpen, setDesktopMasksSidebarOpen] = useState<boolean>(true);
+  const [showSelectedMaskInset, setShowSelectedMaskInset] = useState<boolean>(true);
+  const [showFinalStepInset, setShowFinalStepInset] = useState<boolean>(true);
+  const [insetExpanded, setInsetExpanded] = useState<boolean>(false);
   const notifyTimerRef = useRef<number | null>(null);
+
+  const getEnabledSimIndexForRawStep = useCallback(
+    (rawStepIdx: number): number => {
+      if (rawStepIdx < 0) return -1;
+      let enabledCount = 0;
+      for (let i = 0; i <= rawStepIdx && i < flow.steps.length; i++) {
+        if (flow.steps[i].enabled !== false) enabledCount++;
+      }
+      return enabledCount - 1;
+    },
+    [flow.steps]
+  );
+
+  const finalEnabledStepIndex = useMemo(() => {
+    for (let i = flow.steps.length - 1; i >= 0; i--) {
+      if (flow.steps[i].enabled !== false) return i;
+    }
+    return -1;
+  }, [flow.steps]);
 
   const handleEditorNotify = (message: string, type: 'success' | 'warn') => {
     setFeedbackNotice({ message, type });
@@ -395,15 +440,143 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     );
   }, [masks, searchQuery]);
 
+  const selectedMaskLinks = useMemo(
+    () => (selectedMask ? getMaskVariantLinks(flow, selectedMask) : []),
+    [flow, selectedMask]
+  );
+
+  // Assigned step for current mask (supports active and inactive step variants)
+  const assignedStepInfo = useMemo(() => {
+    if (!selectedMask) return null;
+    if (selectedMaskLinks.length > 0) {
+      const activeOrFirst =
+        selectedMaskLinks.find((l) => l.isActiveVariant) || selectedMaskLinks[0];
+      return { step: activeOrFirst.step, index: activeOrFirst.stepIndex };
+    }
+    return selectedMask.assignedStepId
+      ? lithoSteps.find(({ step }) => step.id === selectedMask.assignedStepId) || null
+      : null;
+  }, [selectedMask, selectedMaskLinks, lithoSteps]);
+
+  const selectedMaskInsetData = useMemo(() => {
+    if (!showSelectedMaskInset) return null;
+    if (!selectedMask) {
+      return {
+        isUnassigned: true as const,
+        mesh: null,
+        polygons: [],
+        rawStepIndex: -1,
+        stepNumber: 0,
+        title: 'No Reticle Selected',
+        isSubstrate: false,
+        isDisabled: false,
+        variantName: undefined as string | undefined,
+        isInactiveVariant: false,
+        maskName: 'No reticle selected',
+        maskCode: '',
+        maskColor: '#38bdf8',
+      };
+    }
+
+    const activeOrFirstLink =
+      selectedMaskLinks.find((l) => l.isActiveVariant) || selectedMaskLinks[0] || null;
+    const rawStepIndex = activeOrFirstLink
+      ? activeOrFirstLink.stepIndex
+      : assignedStepInfo
+        ? assignedStepInfo.index
+        : -1;
+    const targetStep = rawStepIndex >= 0 ? flow.steps[rawStepIndex] : null;
+
+    if (!targetStep) {
+      return {
+        isUnassigned: true as const,
+        mesh: null,
+        polygons: [],
+        rawStepIndex: -1,
+        stepNumber: 0,
+        title: 'Unassigned Reticle',
+        isSubstrate: false,
+        isDisabled: false,
+        variantName: undefined as string | undefined,
+        isInactiveVariant: false,
+        maskName: selectedMask.name,
+        maskCode: selectedMask.layerCode || '',
+        maskColor: selectedMask.color || '#38bdf8',
+      };
+    }
+
+    const needsVariantSwitch = Boolean(
+      activeOrFirstLink &&
+        !activeOrFirstLink.isActiveVariant &&
+        activeOrFirstLink.variant
+    );
+    const simFlow =
+      needsVariantSwitch && activeOrFirstLink?.variant
+        ? {
+            ...flow,
+            steps: flow.steps.map((s) =>
+              s.id === targetStep.id
+                ? switchStepVariant(s, activeOrFirstLink.variant!.id)
+                : s
+            ),
+          }
+        : flow;
+
+    const simIdx = getEnabledSimIndexForRawStep(rawStepIndex);
+    const mesh = simulateCrossSection(simFlow, simIdx);
+    const polygons = buildRenderPolygons(mesh, simFlow.materials);
+
+    return {
+      isUnassigned: false as const,
+      mesh,
+      polygons,
+      rawStepIndex,
+      stepNumber: rawStepIndex + 1,
+      title: targetStep.title,
+      isSubstrate: false,
+      isDisabled: targetStep.enabled === false,
+      variantName: activeOrFirstLink?.variant?.name,
+      isInactiveVariant: needsVariantSwitch,
+      maskName: selectedMask.name,
+      maskCode: selectedMask.layerCode || '',
+      maskColor: selectedMask.color || '#38bdf8',
+    };
+  }, [
+    showSelectedMaskInset,
+    selectedMask,
+    selectedMaskLinks,
+    assignedStepInfo,
+    flow,
+    getEnabledSimIndexForRawStep,
+  ]);
+
+  const finalInsetData = useMemo(() => {
+    if (!showFinalStepInset) return null;
+    const simIdx = getEnabledSimIndexForRawStep(finalEnabledStepIndex);
+    const mesh = simulateCrossSection(flow, simIdx);
+    const polygons = buildRenderPolygons(mesh, flow.materials);
+    const step = finalEnabledStepIndex >= 0 ? flow.steps[finalEnabledStepIndex] : null;
+    return {
+      isUnassigned: false as const,
+      mesh,
+      polygons,
+      rawStepIndex: finalEnabledStepIndex,
+      stepNumber: finalEnabledStepIndex >= 0 ? finalEnabledStepIndex + 1 : 0,
+      title: step ? step.title : 'Starting Substrate',
+      isSubstrate: finalEnabledStepIndex < 0,
+      isDisabled: false,
+      variantName: undefined as string | undefined,
+      isInactiveVariant: false,
+      maskName: '',
+      maskCode: '',
+      maskColor: '#10b981',
+    };
+  }, [showFinalStepInset, getEnabledSimIndexForRawStep, finalEnabledStepIndex, flow]);
+
   if (!isOpen) return null;
 
   // Active mask metrics
   const metrics = selectedMask ? calculateMaskMetrics(selectedMask, waferWidth) : null;
-
-  // Assigned step for current mask
-  const assignedStepInfo = selectedMask?.assignedStepId
-    ? lithoSteps.find(({ step }) => step.id === selectedMask.assignedStepId)
-    : null;
 
   // Handler: Update current mask
   const handleUpdateMask = (updated: PhotomaskLevel, skipHistory?: boolean) => {
@@ -428,6 +601,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       layerCode: `${maskToDup.layerCode || 'LVL'}-CPY`,
       maskField: maskToDup.maskField || 'dark-field',
       assignedStepId: undefined, // Fresh copy is unassigned
+      assignedVariantId: undefined,
       windows: maskToDup.windows.map((w) => ({ ...w, id: `w_${Date.now()}_${Math.random().toString(36).substring(2, 6)}` })),
     };
     const { flow: newFlow } = createNewMaskInFlow(latestFlowRef.current, newMask);
@@ -436,10 +610,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   };
 
   const isMaskAssigned = (mask: PhotomaskLevel): boolean =>
-    Boolean(
-      (mask.assignedStepId && lithoSteps.some(({ step }) => step.id === mask.assignedStepId)) ||
-        lithoSteps.some(({ step }) => step.lithography?.maskId === mask.id)
-    );
+    isMaskAssignedInFlow(flow, mask);
 
   // Handler: Delete unassigned mask level
   const handleDeleteMask = (maskId: string, e?: React.MouseEvent) => {
@@ -447,9 +618,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     const targetMask = masks.find((m) => m.id === maskId);
     if (!targetMask) return;
 
-    if (isMaskAssigned(targetMask)) {
+    if (isMaskAssignedInFlow(latestFlowRef.current, targetMask)) {
       handleEditorNotify(
-        'Assigned mask levels cannot be deleted. Clear its aperture track or unassign it from the step first.',
+        'Assigned mask levels cannot be deleted. Clear its aperture track or unassign it from the step/variant first.',
         'warn'
       );
       return;
@@ -479,10 +650,10 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     handleEditorNotify(`Cleared aperture track on "${targetMask.name}".`, 'success');
   };
 
-  // Handler: Assign to Step with Conflict Detection & Confirmation
-  const handleAssignStep = (targetStepId: string) => {
+  // Handler: Assign to Step (or specific Step Variant encoded as "stepId::variantId")
+  const handleAssignStep = (rawTargetValue: string) => {
     if (!selectedMask) return;
-    if (targetStepId === 'none') {
+    if (rawTargetValue === 'none') {
       const newFlow = assignMaskToStep(latestFlowRef.current, selectedMask.id, null);
       commitTrackFlow(newFlow);
       setFeedbackNotice({
@@ -493,23 +664,49 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       return;
     }
 
-    if (selectedMask.assignedStepId === targetStepId) {
+    const [targetStepId, rawVariantId] = rawTargetValue.split('::');
+    const targetVariantId = rawVariantId || undefined;
+    const stepItem = lithoSteps.find(({ step }) => step.id === targetStepId);
+    const targetVariant = targetVariantId
+      ? stepItem?.step.variants?.find((v) => v.id === targetVariantId)
+      : undefined;
+
+    if (
+      selectedMask.assignedStepId === targetStepId &&
+      (!targetVariantId || selectedMask.assignedVariantId === targetVariantId)
+    ) {
       return;
     }
 
-    // Check if another reticle in the library is already assigned to this step
-    const conflictingMask = masks.find(
-      (m) => m.id !== selectedMask.id && m.assignedStepId === targetStepId
-    );
+    // Check if another reticle in the library is already assigned to this exact (step, variant) slot
+    const conflictingMask = masks.find((m) => {
+      if (m.id === selectedMask.id) return false;
+      if (targetVariantId && stepItem?.step.variants && stepItem.step.variants.length > 1) {
+        const variantUsesOther = targetVariant?.lithography?.maskId === m.id;
+        const explicitSlotMatch =
+          m.assignedStepId === targetStepId &&
+          (!m.assignedVariantId || m.assignedVariantId === targetVariantId);
+        return variantUsesOther || explicitSlotMatch;
+      }
+      return m.assignedStepId === targetStepId;
+    });
 
     if (conflictingMask) {
-      const stepItem = lithoSteps.find(({ step }) => step.id === targetStepId);
-      const priorStepItem = selectedMask.assignedStepId
-        ? lithoSteps.find(({ step }) => step.id === selectedMask.assignedStepId)
+      const priorLinks = getMaskVariantLinks(latestFlowRef.current, selectedMask);
+      const priorLink = priorLinks[0];
+      const priorStepItem = priorLink
+        ? { step: priorLink.step, index: priorLink.stepIndex, variantName: priorLink.variant?.name }
+        : selectedMask.assignedStepId
+        ? (() => {
+            const found = lithoSteps.find(({ step }) => step.id === selectedMask.assignedStepId);
+            return found ? { ...found, variantName: undefined } : undefined;
+          })()
         : undefined;
 
       setConflictPrompt({
         targetStepId,
+        targetVariantId,
+        targetVariantName: targetVariant?.name,
         targetStepTitle: stepItem?.step.title || 'Photolithography Step',
         targetStepIndex: stepItem ? stepItem.index + 1 : 1,
         conflictingMask,
@@ -519,6 +716,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               id: priorStepItem.step.id,
               title: priorStepItem.step.title,
               index: priorStepItem.index + 1,
+              variantName: priorStepItem.variantName,
             }
           : undefined,
       });
@@ -526,11 +724,17 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     }
 
     // No conflict: perform direct assignment
-    const newFlow = assignMaskToStep(latestFlowRef.current, selectedMask.id, targetStepId);
+    const newFlow = assignMaskToStep(
+      latestFlowRef.current,
+      selectedMask.id,
+      targetStepId,
+      targetVariantId
+    );
     commitTrackFlow(newFlow);
-    const stepItem = lithoSteps.find(({ step }) => step.id === targetStepId);
     setFeedbackNotice({
-      message: `Assigned ${selectedMask.name} to Step ${stepItem ? stepItem.index + 1 : ''}: ${stepItem?.step.title || ''}.`,
+      message: `Assigned ${selectedMask.name} to Step ${stepItem ? stepItem.index + 1 : ''}: ${
+        stepItem?.step.title || ''
+      }${targetVariant ? ` (${targetVariant.name})` : ''}.`,
       type: 'success',
     });
     setTimeout(() => setFeedbackNotice(null), 3000);
@@ -538,20 +742,40 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
   const handleConfirmConflictSwap = () => {
     if (!conflictPrompt || !selectedMask) return;
-    const { targetStepId, targetStepTitle, targetStepIndex, conflictingMask, currentMaskPriorStep } = conflictPrompt;
-    
+    const {
+      targetStepId,
+      targetVariantId,
+      targetVariantName,
+      targetStepTitle,
+      targetStepIndex,
+      conflictingMask,
+      currentMaskPriorStep,
+    } = conflictPrompt;
+
     // Execute photomask swap
-    const newFlow = swapMaskAssignments(latestFlowRef.current, selectedMask.id, targetStepId);
+    const newFlow = swapMaskAssignments(
+      latestFlowRef.current,
+      selectedMask.id,
+      targetStepId,
+      targetVariantId
+    );
     commitTrackFlow(newFlow);
 
+    const targetLabel = `Step ${targetStepIndex}${
+      targetVariantName ? ` · ${targetVariantName}` : ''
+    } ("${targetStepTitle}")`;
+
     if (currentMaskPriorStep) {
+      const priorLabel = `Step ${currentMaskPriorStep.index}${
+        currentMaskPriorStep.variantName ? ` · ${currentMaskPriorStep.variantName}` : ''
+      } ("${currentMaskPriorStep.title}")`;
       setFeedbackNotice({
-        message: `Swapped masks: Step ${targetStepIndex} ("${targetStepTitle}") now uses "${selectedMask.name}", and Step ${currentMaskPriorStep.index} ("${currentMaskPriorStep.title}") now uses "${conflictingMask.name}".`,
+        message: `Swapped masks: ${targetLabel} now uses "${selectedMask.name}", and ${priorLabel} now uses "${conflictingMask.name}".`,
         type: 'success',
       });
     } else {
       setFeedbackNotice({
-        message: `Swapped mask on Step ${targetStepIndex} ("${targetStepTitle}"): now configured with "${selectedMask.name}". "${conflictingMask.name}" is now unassigned.`,
+        message: `Swapped mask on ${targetLabel}: now configured with "${selectedMask.name}". "${conflictingMask.name}" is now unassigned.`,
         type: 'success',
       });
     }
@@ -561,6 +785,98 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
   const handleCancelConflictSwap = () => {
     setConflictPrompt(null);
+  };
+
+  const handleSwitchStepVariantInManager = (
+    stepId: string,
+    variantId: string,
+    followMask: boolean = true
+  ) => {
+    const baseFlow = latestFlowRef.current;
+    const targetStep = baseFlow.steps.find((s) => s.id === stepId);
+    if (!targetStep) return;
+    const switched = switchStepVariant(targetStep, variantId);
+    let nextFlow: ProcessFlow = {
+      ...baseFlow,
+      steps: baseFlow.steps.map((s) => (s.id === stepId ? switched : s)),
+    };
+    if (switched.type === 'lithography') {
+      nextFlow = {
+        ...nextFlow,
+        masks: (nextFlow.masks || []).map((m) => ({ ...m })),
+      };
+      // Sync only when active variant switched so its mask stays linked
+      const activeMaskId = switched.lithography?.maskId;
+      if (activeMaskId) {
+        const existingMask = nextFlow.masks?.find((m) => m.id === activeMaskId);
+        if (existingMask) {
+          nextFlow = updateMaskAndSyncSteps(nextFlow, existingMask);
+        }
+      }
+    }
+    nextFlow = resolveFlowParameters(nextFlow);
+    const targetMaskId = followMask ? switched.lithography?.maskId : undefined;
+    commitTrackFlow(nextFlow, {
+      nextSelectedMaskId: targetMaskId || selectedMaskId,
+    });
+    if (targetMaskId && (nextFlow.masks || []).some((m) => m.id === targetMaskId)) {
+      setSelectedMaskId(targetMaskId);
+    }
+    const vName = switched.variants?.find((v) => v.id === variantId)?.name;
+    if (vName) {
+      handleEditorNotify(`Activated "${vName}" on ${targetStep.title}.`, 'success');
+    }
+  };
+
+  const handleForkMaskForVariant = (stepId: string, variantId: string) => {
+    if (!selectedMask) return;
+    const { flow: forkedFlow, newMask } = forkMaskForStepVariant(
+      latestFlowRef.current,
+      selectedMask.id,
+      stepId,
+      variantId
+    );
+    if (!newMask) return;
+    const resolved = resolveFlowParameters(forkedFlow);
+    commitTrackFlow(resolved, { nextSelectedMaskId: newMask.id });
+    setSelectedMaskId(newMask.id);
+    handleEditorNotify(`Created dedicated reticle "${newMask.name}".`, 'success');
+  };
+
+  const handleBranchLithoStepInManager = (stepId: string) => {
+    const baseFlow = latestFlowRef.current;
+    const targetStep = baseFlow.steps.find((s) => s.id === stepId && s.type === 'lithography');
+    if (!targetStep) return;
+    const branched = createStepVariant(targetStep);
+    const newActiveVar = getActiveStepVariant(branched);
+    let nextFlow: ProcessFlow = {
+      ...baseFlow,
+      steps: baseFlow.steps.map((s) => (s.id === stepId ? branched : s)),
+    };
+    const sourceMaskId = branched.lithography?.maskId || selectedMask?.id;
+    if (sourceMaskId && newActiveVar) {
+      const { flow: forkedFlow, newMask } = forkMaskForStepVariant(
+        nextFlow,
+        sourceMaskId,
+        stepId,
+        newActiveVar.id
+      );
+      if (newMask) {
+        const resolved = resolveFlowParameters(forkedFlow);
+        commitTrackFlow(resolved, { nextSelectedMaskId: newMask.id });
+        setSelectedMaskId(newMask.id);
+        handleEditorNotify(
+          `Branched "${newActiveVar.name}" with dedicated reticle "${newMask.name}".`,
+          'success'
+        );
+        return;
+      }
+    }
+    nextFlow = resolveFlowParameters(nextFlow);
+    commitTrackFlow(nextFlow);
+    if (newActiveVar) {
+      handleEditorNotify(`Created variant "${newActiveVar.name}" on ${targetStep.title}.`, 'success');
+    }
   };
 
   // Handler: Jump to assigned step
@@ -1073,10 +1389,21 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   };
 
   const renderReticleSidebarContent = () => {
-    const getMaskAssignedStep = (mask: PhotomaskLevel) =>
-      mask.assignedStepId
+    const getMaskAssignedStep = (mask: PhotomaskLevel) => {
+      const links = getMaskVariantLinks(flow, mask);
+      if (links.length > 0) {
+        const primary = links.find((l) => l.isActiveVariant) || links[0];
+        return {
+          step: primary.step,
+          index: primary.stepIndex,
+          links,
+        };
+      }
+      const fallback = mask.assignedStepId
         ? lithoSteps.find(({ step }) => step.id === mask.assignedStepId) || null
         : lithoSteps.find(({ step }) => step.lithography?.maskId === mask.id) || null;
+      return fallback ? { ...fallback, links: [] } : null;
+    };
 
     const assignedFilteredMasks = filteredMasks
       .filter((mask) => isMaskAssigned(mask))
@@ -1092,6 +1419,10 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
       const assigned = getMaskAssignedStep(mask);
       const mMetrics = calculateMaskMetrics(mask, waferWidth);
       const isAssigned = isMaskAssigned(mask);
+      const links = assigned?.links || [];
+      const hasAnyActiveLink = links.some((l) => l.isActiveVariant);
+      const isSharedAcrossVariants = links.length > 1;
+      const singleVariantLink = links.length === 1 ? links[0].variant : null;
 
       return (
         <div
@@ -1217,15 +1548,43 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
             </div>
           </div>
 
-          {/* Assigned Step Status */}
-          <div className="mt-2 pt-1.5 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
+          {/* Assigned Step & Variant Status */}
+          <div className="mt-2 pt-1.5 border-t border-slate-800/80 flex items-center justify-between gap-1.5 text-[11px]">
             {assigned ? (
-              <div className="flex items-center gap-1 text-sky-400 truncate">
-                <Check className="w-3 h-3 shrink-0" />
-                <span className="truncate">
-                  Step {assigned.index + 1}: {assigned.step.title}
-                </span>
-              </div>
+              <>
+                <div
+                  className={`flex items-center gap-1 min-w-0 truncate ${
+                    hasAnyActiveLink ? 'text-sky-400' : 'text-slate-400'
+                  }`}
+                >
+                  <Check className="w-3 h-3 shrink-0" />
+                  <span className="truncate">
+                    Step {assigned.index + 1}: {assigned.step.title}
+                  </span>
+                </div>
+                {isSharedAcrossVariants ? (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/35 text-[9px] font-mono font-semibold text-violet-300 shrink-0">
+                    <GitBranch className="w-2.5 h-2.5" />
+                    <span>{links.length} Var</span>
+                  </span>
+                ) : singleVariantLink ? (
+                  <span
+                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[9px] font-mono font-semibold shrink-0 max-w-[100px] truncate ${
+                      hasAnyActiveLink
+                        ? 'bg-violet-500/20 border-violet-400/50 text-violet-200'
+                        : 'bg-slate-900 border-slate-700 text-slate-400'
+                    }`}
+                    title={
+                      hasAnyActiveLink
+                        ? `Active variant: ${singleVariantLink.name}`
+                        : `Inactive variant: ${singleVariantLink.name}`
+                    }
+                  >
+                    <GitBranch className="w-2.5 h-2.5 shrink-0" />
+                    <span className="truncate">{singleVariantLink.name}</span>
+                  </span>
+                ) : null}
+              </>
             ) : (
               <span className="text-amber-400/80 italic text-[10px]">
                 Unassigned (Ready for assignment)
@@ -1320,7 +1679,11 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-md">
       <div
         className={`relative flex flex-col w-full bg-slate-950 border-0 sm:border sm:border-slate-800 rounded-none sm:rounded-2xl shadow-2xl overflow-hidden text-slate-100 animate-in fade-in zoom-in-95 duration-150 ${
-          editorTab === 'gds' ? 'max-w-7xl h-[100dvh] sm:h-[94vh] sm:max-h-[900px]' : 'max-w-6xl h-[100dvh] sm:h-[92vh] sm:max-h-[850px]'
+          showSelectedMaskInset || showFinalStepInset
+            ? 'max-w-[92rem] h-[100dvh] sm:h-[94vh] sm:max-h-[900px]'
+            : editorTab === 'gds'
+              ? 'max-w-7xl h-[100dvh] sm:h-[94vh] sm:max-h-[900px]'
+              : 'max-w-6xl h-[100dvh] sm:h-[92vh] sm:max-h-[850px]'
         }`}
       >
         {/* Top Header */}
@@ -1414,6 +1777,50 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               </button>
             </div>
 
+            {/* Right-Side Cross-Section Panel Toggles (Selected Mask & Final) */}
+            <div
+              className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px] shrink-0"
+              title="Toggle right-side cross-section previews for Selected Mask and Final wafer"
+            >
+              <span className="hidden xl:inline-flex items-center gap-1 pl-2 pr-1 text-[10px] font-medium text-slate-400">
+                <PanelRight className="w-3 h-3 text-slate-400" />
+                <span>X-Section:</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowSelectedMaskInset((v) => !v)}
+                className={`flex items-center gap-1 px-2 py-1 sm:py-1 rounded-md font-medium transition-colors ${
+                  showSelectedMaskInset
+                    ? 'bg-sky-600/90 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+                title={
+                  assignedStepInfo
+                    ? `Toggle Selected Mask Cross-Section (Step ${assignedStepInfo.index + 1}/${flow.steps.length} — ${selectedMask?.name || 'Reticle'})`
+                    : 'Toggle Selected Mask Cross-Section'
+                }
+              >
+                <PanelRight className="w-3 h-3 xl:hidden" />
+                <span>Selected Mask</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowFinalStepInset((v) => !v)}
+                className={`flex items-center gap-1 px-2 py-1 sm:py-1 rounded-md font-medium transition-colors ${
+                  showFinalStepInset
+                    ? 'bg-emerald-600/90 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+                title={
+                  finalEnabledStepIndex >= 0
+                    ? `Toggle Final Step Cross-Section (Step ${finalEnabledStepIndex + 1}/${flow.steps.length})`
+                    : 'Toggle Final Step Cross-Section (Substrate)'
+                }
+              >
+                <span>Final</span>
+              </button>
+            </div>
+
             {/* Desktop Masks List Toggle + Variables + New + Close */}
             <div className="hidden lg:flex items-center gap-2 shrink-0">
               {onOpenVariablesModal && (
@@ -1470,7 +1877,11 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
         <div className="relative flex-1 flex overflow-hidden min-h-0">
           {/* LEFT SIDEBAR: Desktop Docked Mask Set Hierarchy List */}
           {desktopMasksSidebarOpen && (
-            <div className="hidden lg:flex w-80 xl:w-96 flex-col border-r border-slate-800 bg-slate-900/60 shrink-0">
+            <div
+              className={`hidden lg:flex flex-col border-r border-slate-800 bg-slate-900/60 shrink-0 ${
+                showSelectedMaskInset || showFinalStepInset ? 'w-72 xl:w-80' : 'w-80 xl:w-96'
+              }`}
+            >
               {renderReticleSidebarContent()}
             </div>
           )}
@@ -1500,19 +1911,22 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
             </div>
           )}
 
-          {/* RIGHT MAIN PANEL: Active Mask CAD Inspector or 2D GDS Layout Editor */}
-          {editorTab === 'gds' ? (
-            <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-slate-950 overflow-hidden">
-              <GdsLayoutEditor
-                flow={flow}
-                selectedMask={selectedMask}
-                onUpdateFlow={onUpdateFlow}
-                onNotify={handleEditorNotify}
-                onOpenVariablesModal={onOpenVariablesModal}
-              />
-            </div>
-          ) : selectedMask ? (
-            <div className="flex-1 flex flex-col min-w-0 overflow-y-auto bg-slate-950 p-3 sm:p-6 space-y-3.5 sm:space-y-5">
+          {/* CENTER WORKSPACE + RIGHT CROSS-SECTION STACK */}
+          <div className="flex-1 flex flex-col md:flex-row min-w-0 min-h-0 overflow-hidden">
+            {/* CENTER MAIN PANEL: Active Mask CAD Inspector or 2D GDS Layout Editor */}
+            <div className="relative flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden bg-slate-950">
+            {editorTab === 'gds' ? (
+              <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-slate-950 overflow-hidden">
+                <GdsLayoutEditor
+                  flow={flow}
+                  selectedMask={selectedMask}
+                  onUpdateFlow={onUpdateFlow}
+                  onNotify={handleEditorNotify}
+                  onOpenVariablesModal={onOpenVariablesModal}
+                />
+              </div>
+            ) : selectedMask ? (
+              <div className="flex-1 flex flex-col min-w-0 overflow-y-auto bg-slate-950 p-3 sm:p-6 space-y-3.5 sm:space-y-5">
               {/* Mask General Configuration Card */}
               <div className="p-3 sm:p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3.5 sm:space-y-4">
                 <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3 pb-3 border-b border-slate-800/80">
@@ -1650,41 +2064,98 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   </div>
                 </div>
 
-                {/* Step Assignment Row */}
+                {/* Step & Variant Assignment Row */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
                   <div className="min-w-0">
                     <label className="block text-[11px] text-slate-400 mb-1 font-medium">
-                      Assigned Photolithography Step in Process Flow
+                      Assigned Photolithography Step / Variant in Process Flow
                     </label>
                     <div className="flex items-center gap-2 min-w-0">
-                      <select
-                        value={selectedMask.assignedStepId || 'none'}
-                        onChange={(e) => handleAssignStep(e.target.value)}
-                        className="min-w-0 flex-1 w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono truncate"
-                      >
-                        <option value="none">-- Unassigned (Stand-alone Reticle) --</option>
-                        {lithoSteps.map(({ step, index }) => {
-                          const isCurrent = selectedMask.assignedStepId === step.id;
-                          const conflicting = masks.find(
-                            (m) => m.id !== selectedMask.id && m.assignedStepId === step.id
-                          );
-                          return (
-                            <option key={step.id} value={step.id}>
-                              Step {index + 1}: {step.title}
-                              {step.side === 'back'
-                                ? ' (Backside)'
-                                : step.side === 'both'
-                                ? ' (Both Sides)'
-                                : ''}
-                              {isCurrent
-                                ? '  [Current Assigned Step]'
-                                : conflicting
-                                ? `  [Assigned to: ${conflicting.layerCode || 'Reticle'} ${conflicting.name}]`
-                                : '  (Available)'}
-                            </option>
-                          );
-                        })}
-                      </select>
+                      {(() => {
+                        const primaryLink =
+                          selectedMaskLinks.find((l) => l.isActiveVariant) ||
+                          selectedMaskLinks[0];
+                        const selectVal = primaryLink
+                          ? primaryLink.variant
+                            ? `${primaryLink.step.id}::${primaryLink.variant.id}`
+                            : primaryLink.step.id
+                          : selectedMask.assignedStepId
+                          ? selectedMask.assignedVariantId
+                            ? `${selectedMask.assignedStepId}::${selectedMask.assignedVariantId}`
+                            : selectedMask.assignedStepId
+                          : 'none';
+
+                        return (
+                          <select
+                            value={selectVal}
+                            onChange={(e) => handleAssignStep(e.target.value)}
+                            className="min-w-0 flex-1 w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono truncate"
+                          >
+                            <option value="none">-- Unassigned (Stand-alone Reticle) --</option>
+                            {lithoSteps.map(({ step, index }) => {
+                              const sideTag =
+                                step.side === 'back'
+                                  ? ' (Backside)'
+                                  : step.side === 'both'
+                                  ? ' (Both Sides)'
+                                  : '';
+
+                              if (step.variants && step.variants.length > 1) {
+                                const activeVar = getActiveStepVariant(step);
+                                return (
+                                  <optgroup
+                                    key={step.id}
+                                    label={`Step ${index + 1}: ${step.title}${sideTag} (${step.variants.length} variants)`}
+                                  >
+                                    {step.variants.map((v) => {
+                                      if (v.type !== 'lithography') return null;
+                                      const optVal = `${step.id}::${v.id}`;
+                                      const isActiveV = activeVar?.id === v.id;
+                                      const isCurrentSlot = selectedMaskLinks.some(
+                                        (l) => l.step.id === step.id && l.variant?.id === v.id
+                                      );
+                                      const conflicting = masks.find(
+                                        (m) =>
+                                          m.id !== selectedMask.id &&
+                                          (v.lithography?.maskId === m.id ||
+                                            (m.assignedStepId === step.id &&
+                                              m.assignedVariantId === v.id))
+                                      );
+                                      return (
+                                        <option key={optVal} value={optVal}>
+                                          Step {index + 1} · {v.name}
+                                          {isActiveV ? ' (Active)' : ''}
+                                          {isCurrentSlot
+                                            ? '  [Current Reticle]'
+                                            : conflicting
+                                            ? `  [Assigned to: ${conflicting.layerCode || 'Reticle'} ${conflicting.name}]`
+                                            : '  (Available)'}
+                                        </option>
+                                      );
+                                    })}
+                                  </optgroup>
+                                );
+                              }
+
+                              const isCurrent = selectedMask.assignedStepId === step.id;
+                              const conflicting = masks.find(
+                                (m) => m.id !== selectedMask.id && m.assignedStepId === step.id
+                              );
+                              return (
+                                <option key={step.id} value={step.id}>
+                                  Step {index + 1}: {step.title}
+                                  {sideTag}
+                                  {isCurrent
+                                    ? '  [Current Assigned Step]'
+                                    : conflicting
+                                    ? `  [Assigned to: ${conflicting.layerCode || 'Reticle'} ${conflicting.name}]`
+                                    : '  (Available)'}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        );
+                      })()}
 
                       {assignedStepInfo && (
                         <button
@@ -1717,6 +2188,201 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     />
                   </div>
                 </div>
+
+                {/* Photolithography Step Variants Integration Strip */}
+                {assignedStepInfo && (() => {
+                  const step = assignedStepInfo.step;
+                  const stepNum = assignedStepInfo.index + 1;
+                  const variants = step.variants && step.variants.length > 1 ? step.variants : null;
+
+                  if (!variants) {
+                    return (
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-950/70 border border-slate-800/90 text-[11px]">
+                        <div className="flex items-center gap-2 text-slate-400">
+                          <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                          <span>
+                            Step {stepNum} has a single reticle recipe. Branch a variant to test an alternative mask layout or polarity.
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleBranchLithoStepInManager(step.id)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-violet-600/25 hover:bg-violet-600/40 border border-violet-500/40 text-violet-200 font-semibold transition-colors shrink-0"
+                          title={`Create a new variant of Step ${stepNum} with its own dedicated reticle`}
+                        >
+                          <Plus className="w-3 h-3" />
+                          <span>Branch Variant + Reticle</span>
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  const activeVar = getActiveStepVariant(step);
+                  const isSharedMask = selectedMaskLinks.length > 1;
+                  const hasActiveMaskLink = selectedMaskLinks.some((l) => l.isActiveVariant);
+                  const inactiveOwnerLink = !hasActiveMaskLink ? selectedMaskLinks[0] : null;
+
+                  return (
+                    <div className="p-3 rounded-xl bg-slate-950/85 border border-violet-500/35 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                          <span className="text-[11px] font-semibold text-violet-200">
+                            Step {stepNum} Variants
+                          </span>
+                          <span className="px-1.5 py-0.2 rounded bg-violet-500/20 border border-violet-500/35 font-mono text-[10px] text-violet-200">
+                            {variants.length}
+                          </span>
+                          {isSharedMask && (
+                            <span className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-[10px] font-medium text-amber-200">
+                              Shared reticle ({selectedMaskLinks.length} variants)
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {isSharedMask && activeVar && activeVar.type === 'lithography' && (
+                            <button
+                              type="button"
+                              onClick={() => handleForkMaskForVariant(step.id, activeVar.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/45 text-[11px] font-semibold text-sky-200 transition-colors"
+                              title={`Create a separate dedicated reticle copy for "${activeVar.name}" so edits won't affect other variants`}
+                            >
+                              <Split className="w-3 h-3" />
+                              <span>Fork Reticle for {activeVar.name}</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleBranchLithoStepInManager(step.id)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-violet-600/80 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors"
+                            title={`Create a new variant on Step ${stepNum} with a dedicated forked reticle`}
+                          >
+                            <Plus className="w-3 h-3" />
+                            <span>New Variant + Reticle</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {inactiveOwnerLink?.variant && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200">
+                          <span>
+                            Editing reticle for inactive variant{' '}
+                            <strong className="text-white">{inactiveOwnerLink.variant.name}</strong>{' '}
+                            (currently active:{' '}
+                            <strong className="text-violet-200">{activeVar?.name}</strong>).
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleSwitchStepVariantInManager(
+                                step.id,
+                                inactiveOwnerLink.variant!.id,
+                                false
+                              )
+                            }
+                            className="px-2 py-0.5 rounded bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold transition-colors"
+                          >
+                            Activate {inactiveOwnerLink.variant.name}
+                          </button>
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap gap-1.5">
+                        {variants.map((v) => {
+                          const isActive = activeVar?.id === v.id;
+                          const vMaskId =
+                            v.type === 'lithography' ? v.lithography?.maskId : undefined;
+                          const vMask = vMaskId ? masks.find((m) => m.id === vMaskId) : null;
+                          const usesThisMask = vMaskId === selectedMask.id;
+
+                          return (
+                            <div
+                              key={v.id}
+                              className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-all ${
+                                isActive
+                                  ? 'bg-violet-600/20 border-violet-400/75 text-white shadow-sm'
+                                  : usesThisMask
+                                  ? 'bg-sky-500/10 border-sky-500/45 text-slate-200'
+                                  : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-600 hover:text-slate-200'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleSwitchStepVariantInManager(step.id, v.id, true)
+                                }
+                                className="flex items-center gap-1.5 font-semibold text-left"
+                                title={
+                                  isActive
+                                    ? `Active variant: ${v.name}`
+                                    : `Activate "${v.name}" on Step ${stepNum}${
+                                        vMask && vMask.id !== selectedMask.id
+                                          ? ` and switch to ${vMask.name}`
+                                          : ''
+                                      }`
+                                }
+                              >
+                                {isActive && (
+                                  <Check className="w-3 h-3 text-violet-300 shrink-0" />
+                                )}
+                                <span>{v.name}</span>
+                              </button>
+
+                              {v.type === 'lithography' ? (
+                                vMask ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (vMask.id !== selectedMask.id) {
+                                        setSelectedMaskId(vMask.id);
+                                      }
+                                    }}
+                                    className={`px-1.5 py-0.2 rounded font-mono text-[9.5px] border transition-colors ${
+                                      usesThisMask
+                                        ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                                        : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-sky-400 hover:text-sky-200'
+                                    }`}
+                                    title={
+                                      usesThisMask
+                                        ? `Uses currently selected reticle (${vMask.name})`
+                                        : `Inspect reticle "${vMask.name}" used by ${v.name}`
+                                    }
+                                  >
+                                    {usesThisMask
+                                      ? isSharedMask
+                                        ? 'Shared'
+                                        : 'This Reticle'
+                                      : vMask.layerCode || vMask.name}
+                                  </button>
+                                ) : (
+                                  <span className="px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 font-mono text-[9.5px] text-slate-500">
+                                    Unlinked
+                                  </span>
+                                )
+                              ) : (
+                                <span className="px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 font-mono text-[9.5px] text-slate-500 uppercase">
+                                  {v.type}
+                                </span>
+                              )}
+
+                              {isSharedMask && v.type === 'lithography' && !isActive && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleForkMaskForVariant(step.id, v.id)}
+                                  className="p-0.5 rounded text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                                  title={`Fork dedicated reticle for "${v.name}"`}
+                                >
+                                  <Split className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Reticle Color Swatches */}
                 <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -2737,6 +3403,367 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
               Select or create a photomask level on the left to configure apertures.
             </div>
           )}
+            </div>
+
+            {/* RIGHT SIDE PANEL: Stacked Cross-Section Previews (Selected Mask over Final) */}
+            {(showSelectedMaskInset || showFinalStepInset) && (
+              <aside
+                className={`flex flex-col border-t md:border-t-0 md:border-l border-slate-800 bg-slate-900/75 shrink-0 min-h-0 max-h-[42vh] md:max-h-none transition-all ${
+                  insetExpanded
+                    ? 'w-full md:w-80 lg:w-[22rem] xl:w-[26rem]'
+                    : 'w-full md:w-64 lg:w-72 xl:w-80'
+                }`}
+              >
+                {/* Right Panel Header */}
+                <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 bg-slate-950/70 shrink-0">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <PanelRight className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-200 truncate">
+                      Cross-Sections
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setInsetExpanded((v) => !v)}
+                      className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                      title={insetExpanded ? 'Narrow cross-section panel' : 'Widen cross-section panel'}
+                    >
+                      {insetExpanded ? (
+                        <Minimize2 className="w-3.5 h-3.5" />
+                      ) : (
+                        <Maximize2 className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowSelectedMaskInset(false);
+                        setShowFinalStepInset(false);
+                      }}
+                      className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors"
+                      title="Hide cross-section panel"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Stacked Cross-Section Cards (Selection on top, Final below) */}
+                <div className="flex-1 flex flex-col gap-2.5 p-2.5 overflow-y-auto min-h-0">
+                  {[
+                    selectedMaskInsetData
+                      ? {
+                          key: 'selected-mask' as const,
+                          label: 'SELECTED MASK',
+                          accentBorder: 'border-sky-500/40',
+                          dotClass: 'bg-sky-400',
+                          badgeClass: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+                          patternPrefix: 'reticle-sel-inset-',
+                          data: selectedMaskInsetData,
+                          onCloseInset: () => setShowSelectedMaskInset(false),
+                        }
+                      : null,
+                    finalInsetData
+                      ? {
+                          key: 'final' as const,
+                          label: 'FINAL',
+                          accentBorder: 'border-emerald-500/40',
+                          dotClass: 'bg-emerald-400',
+                          badgeClass: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+                          patternPrefix: 'reticle-fin-inset-',
+                          data: finalInsetData,
+                          onCloseInset: () => setShowFinalStepInset(false),
+                        }
+                      : null,
+                  ]
+                    .filter((item): item is NonNullable<typeof item> => item !== null)
+                    .map((item) => {
+                      const {
+                        isUnassigned,
+                        mesh,
+                        polygons,
+                        rawStepIndex,
+                        stepNumber,
+                        title,
+                        isSubstrate,
+                        isDisabled,
+                        variantName,
+                        isInactiveVariant,
+                        maskName,
+                        maskCode,
+                        maskColor,
+                      } = item.data;
+
+                      if (isUnassigned || !mesh) {
+                        return (
+                          <div
+                            key={item.key}
+                            className={`flex-1 min-h-[168px] flex flex-col bg-slate-950/90 border ${item.accentBorder} rounded-xl shadow-lg overflow-hidden`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 bg-slate-950 border-b border-slate-800 text-[11px] shrink-0">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className={`w-1.5 h-1.5 rounded-full ${item.dotClass} shrink-0`} />
+                                <span
+                                  className={`px-1 py-0.5 rounded font-mono text-[9px] font-semibold shrink-0 border ${item.badgeClass}`}
+                                >
+                                  {item.label}
+                                </span>
+                                <span className="text-slate-400 font-mono text-[10px] truncate">
+                                  Unassigned
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={item.onCloseInset}
+                                className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors shrink-0"
+                                title="Hide selected mask cross-section"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                            <div className="flex-1 flex flex-col items-center justify-center p-4 text-center bg-[#060a12] gap-2">
+                              <div className="flex items-center gap-1.5 text-[11px] text-slate-300 font-medium max-w-full">
+                                <span
+                                  className="w-2 h-2 rounded-full shrink-0"
+                                  style={{ backgroundColor: maskColor }}
+                                />
+                                <span className="truncate">
+                                  {maskCode ? `${maskCode} · ` : ''}
+                                  {maskName}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-500 leading-relaxed max-w-[220px]">
+                                Reticle not assigned to a lithography step. Assign it to a step to preview its cross-section.
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      const insetVbW = 320;
+                      const insetVbH = 186;
+                      const padX = 14;
+                      const padY = 14;
+                      const availW = insetVbW - padX * 2;
+                      const availH = insetVbH - padY * 2;
+
+                      let fMinX = 0;
+                      let fMaxX = waferWidth;
+                      let fMinY = mesh.minY ?? 0;
+                      let fMaxY = Math.max(mesh.maxY ?? 3000, 2500);
+                      for (const poly of polygons) {
+                        if (poly.xMin < fMinX) fMinX = poly.xMin;
+                        if (poly.xMax > fMaxX) fMaxX = poly.xMax;
+                        if (poly.yMin < fMinY) fMinY = poly.yMin;
+                        if (poly.yMax > fMaxY) fMaxY = poly.yMax;
+                        for (const p of poly.points) {
+                          if (p.x < fMinX) fMinX = p.x;
+                          if (p.x > fMaxX) fMaxX = p.x;
+                          if (p.y < fMinY) fMinY = p.y;
+                          if (p.y > fMaxY) fMaxY = p.y;
+                        }
+                      }
+
+                      const fSpanX = Math.max(100, fMaxX - fMinX);
+                      const fSpanY = Math.max(300, fMaxY - fMinY);
+                      const rawSx = availW / fSpanX;
+                      const rawSy = (availH * 0.65) / fSpanY;
+                      const rawWaferH = fSpanY * rawSy;
+                      const fitFactor = rawWaferH > availH ? availH / rawWaferH : 1;
+                      const insetSx = rawSx * fitFactor;
+                      const insetSy = rawSy * fitFactor;
+                      const insetOffsetX = (insetVbW - fSpanX * insetSx) / 2 - fMinX * insetSx;
+                      const insetCenterY = insetVbH / 2 + (fSpanY * insetSy) / 2;
+
+                      const toInset = (x: number, y: number) => ({
+                        x: insetOffsetX + x * insetSx,
+                        y: insetCenterY - (y - fMinY) * insetSy,
+                      });
+
+                      const buildInsetPath = (pts: { x: number; y: number }[]) => {
+                        if (pts.length < 3) return '';
+                        const first = toInset(pts[0].x, pts[0].y);
+                        let d = `M ${first.x.toFixed(1)} ${first.y.toFixed(1)}`;
+                        for (let i = 1; i < pts.length; i++) {
+                          const pt = toInset(pts[i].x, pts[i].y);
+                          d += ` L ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
+                        }
+                        return d + ' Z';
+                      };
+
+                      const datumLeft = toInset(fMinX, fMinY);
+                      const datumRight = toInset(fMaxX, fMinY);
+
+                      return (
+                        <div
+                          key={item.key}
+                          className={`flex-1 min-h-[168px] flex flex-col bg-slate-950/90 border ${item.accentBorder} rounded-xl shadow-lg overflow-hidden`}
+                        >
+                          <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 bg-slate-950 border-b border-slate-800 text-[11px] shrink-0">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className={`w-1.5 h-1.5 rounded-full ${item.dotClass} shrink-0`} />
+                              <span
+                                className={`px-1 py-0.5 rounded font-mono text-[9px] font-semibold shrink-0 border ${item.badgeClass}`}
+                              >
+                                {item.label}
+                              </span>
+                              <span className="text-slate-300 font-mono text-[10px] shrink-0">
+                                {isSubstrate ? 'Sub' : `${stepNumber}/${flow.steps.length}`}
+                              </span>
+                              <span
+                                className="text-slate-400 truncate text-[10px]"
+                                title={isDisabled ? `${title} (Skipped)` : title}
+                              >
+                                {title}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-0.5 shrink-0">
+                              {onSelectStepIndex && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onSelectStepIndex(rawStepIndex);
+                                    onClose();
+                                  }}
+                                  className="p-1 rounded text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                                  title={
+                                    isSubstrate
+                                      ? 'Jump to Substrate in main viewer'
+                                      : `Jump to Step ${stepNumber}/${flow.steps.length}`
+                                  }
+                                >
+                                  <ArrowUpRight className="w-3 h-3" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={item.onCloseInset}
+                                className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors"
+                                title={`Hide ${item.label.toLowerCase()} cross-section`}
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {item.key === 'selected-mask' && (
+                            <div className="flex items-center justify-between gap-1.5 px-2.5 py-1 bg-slate-900/90 border-b border-slate-800/80 text-[10px] shrink-0">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span
+                                  className="w-2 h-2 rounded-full shrink-0"
+                                  style={{ backgroundColor: maskColor }}
+                                />
+                                <span className="text-slate-200 font-medium truncate">
+                                  {maskCode ? `${maskCode} · ` : ''}
+                                  {maskName}
+                                </span>
+                              </div>
+                              {variantName && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded font-mono text-[9px] shrink-0 border ${
+                                    isInactiveVariant
+                                      ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                      : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
+                                  }`}
+                                  title={
+                                    isInactiveVariant
+                                      ? 'Previewing cross-section with this inactive variant active'
+                                      : 'Active step variant'
+                                  }
+                                >
+                                  {variantName}
+                                  {isInactiveVariant ? ' (preview)' : ''}
+                                </span>
+                              )}
+                            </div>
+                          )}
+
+                          <div className="relative flex-1 min-h-[120px] w-full bg-[#060a12]">
+                            <svg
+                              viewBox={`0 0 ${insetVbW} ${insetVbH}`}
+                              className="w-full h-full block pointer-events-none"
+                              preserveAspectRatio="xMidYMid meet"
+                            >
+                              <SvgPatterns materials={flow.materials} idPrefix={item.patternPrefix} />
+
+                              <g>
+                                {polygons.map((poly) => {
+                                  const mat = getMaterialById(flow.materials, poly.materialId);
+                                  const d = buildInsetPath(poly.points);
+                                  if (!d) return null;
+                                  return (
+                                    <path
+                                      key={poly.id}
+                                      d={d}
+                                      fill={`url(#${item.patternPrefix}mat-fill-${mat.id})`}
+                                      stroke={mat.strokeColor || '#1e293b'}
+                                      strokeWidth="0.9"
+                                    />
+                                  );
+                                })}
+                              </g>
+
+                              {mesh.mountedFrames &&
+                                mesh.mountedFrames.map((frame, fIdx) => {
+                                  const leftX = toInset(0, 0).x;
+                                  const rightX = toInset(waferWidth, 0).x;
+                                  const yTopPx = toInset(0, frame.yTop).y;
+                                  const yBotPx = toInset(0, frame.yBottom).y;
+                                  const yMinPx = Math.min(yTopPx, yBotPx);
+                                  const clampH = Math.max(3, Math.abs(yBotPx - yTopPx));
+                                  return (
+                                    <g key={`reticle_inset_frame_${fIdx}_${frame.side}`}>
+                                      <rect
+                                        x={leftX - 8}
+                                        y={yMinPx}
+                                        width={8}
+                                        height={clampH}
+                                        fill="#0284c7"
+                                        stroke="#38bdf8"
+                                        strokeWidth="0.7"
+                                      />
+                                      <rect
+                                        x={rightX}
+                                        y={yMinPx}
+                                        width={8}
+                                        height={clampH}
+                                        fill="#0284c7"
+                                        stroke="#38bdf8"
+                                        strokeWidth="0.7"
+                                      />
+                                    </g>
+                                  );
+                                })}
+
+                              <line
+                                x1={datumLeft.x}
+                                y1={datumLeft.y}
+                                x2={datumRight.x}
+                                y2={datumRight.y}
+                                stroke="#334155"
+                                strokeWidth="0.7"
+                                strokeDasharray="3 2"
+                              />
+                            </svg>
+
+                            <div className="pointer-events-none absolute bottom-1 right-1.5 text-[9px] font-mono text-slate-500">
+                              {isDisabled
+                                ? 'Step skipped'
+                                : `${((fMaxX - fMinX) / 1000).toFixed(1)} µm × ${
+                                    thicknessUnit === 'um'
+                                      ? `${((fMaxY - fMinY) / 1000).toFixed(2)} µm`
+                                      : `${Math.round(fMaxY - fMinY)} nm`
+                                  }`}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </aside>
+            )}
+          </div>
         </div>
 
         {/* Bottom Modal Footer (hidden on phones in 2D GDS tab to maximize canvas area) */}
@@ -2793,7 +3820,11 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   Swap Photomask Assignment?
                 </h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  <span className="font-semibold text-white">Step {conflictPrompt.targetStepIndex}: {conflictPrompt.targetStepTitle}</span>{' '}
+                  <span className="font-semibold text-white">
+                    Step {conflictPrompt.targetStepIndex}
+                    {conflictPrompt.targetVariantName ? ` · ${conflictPrompt.targetVariantName}` : ''}:{' '}
+                    {conflictPrompt.targetStepTitle}
+                  </span>{' '}
                   already has mask{' '}
                   <span className="font-semibold text-amber-300">
                     {conflictPrompt.conflictingMask.layerCode ? `${conflictPrompt.conflictingMask.layerCode} ` : ''}
@@ -2802,7 +3833,8 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   assigned.
                 </p>
                 <p className="text-xs text-slate-400">
-                  Do you want to assign <span className="font-medium text-sky-300">{conflictPrompt.currentMask.name}</span> to this step? If you accept, the mask will be swapped.
+                  Do you want to assign <span className="font-medium text-sky-300">{conflictPrompt.currentMask.name}</span> to this{' '}
+                  {conflictPrompt.targetVariantName ? 'variant' : 'step'}? If you accept, the mask will be swapped.
                 </p>
               </div>
             </div>
@@ -2818,7 +3850,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                     <div className="p-2.5 rounded-lg bg-sky-950/30 border border-sky-500/40">
                       <div className="text-[10px] text-sky-400 font-mono font-medium">
-                        Step {conflictPrompt.targetStepIndex}: {conflictPrompt.targetStepTitle}
+                        Step {conflictPrompt.targetStepIndex}
+                        {conflictPrompt.targetVariantName ? ` · ${conflictPrompt.targetVariantName}` : ''}:{' '}
+                        {conflictPrompt.targetStepTitle}
                       </div>
                       <div className="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
                         <span className="line-through text-slate-500 truncate">{conflictPrompt.conflictingMask.name}</span>
@@ -2829,7 +3863,11 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
 
                     <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/40">
                       <div className="text-[10px] text-amber-400 font-mono font-medium">
-                        Step {conflictPrompt.currentMaskPriorStep.index}: {conflictPrompt.currentMaskPriorStep.title}
+                        Step {conflictPrompt.currentMaskPriorStep.index}
+                        {conflictPrompt.currentMaskPriorStep.variantName
+                          ? ` · ${conflictPrompt.currentMaskPriorStep.variantName}`
+                          : ''}
+                        : {conflictPrompt.currentMaskPriorStep.title}
                       </div>
                       <div className="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
                         <span className="line-through text-slate-500 truncate">{conflictPrompt.currentMask.name}</span>
@@ -2839,7 +3877,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     </div>
                   </div>
                   <p className="text-[11px] text-slate-400 leading-normal">
-                    Both process steps will exchange their photomasks and update their aperture layouts and resist polarities automatically.
+                    Both process step slots will exchange their photomasks and update their aperture layouts and resist polarities automatically.
                   </p>
                 </div>
               ) : (
@@ -2848,7 +3886,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                     <div className="p-2.5 rounded-lg bg-sky-950/30 border border-sky-500/40">
                       <div className="text-[10px] text-sky-400 font-mono font-medium">
-                        Step {conflictPrompt.targetStepIndex}: {conflictPrompt.targetStepTitle}
+                        Step {conflictPrompt.targetStepIndex}
+                        {conflictPrompt.targetVariantName ? ` · ${conflictPrompt.targetVariantName}` : ''}:{' '}
+                        {conflictPrompt.targetStepTitle}
                       </div>
                       <div className="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
                         <span className="line-through text-slate-500 truncate">{conflictPrompt.conflictingMask.name}</span>
@@ -2870,7 +3910,9 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                     </div>
                   </div>
                   <p className="text-[11px] text-slate-400 leading-normal">
-                    <span className="text-sky-300 font-medium">{conflictPrompt.currentMask.name}</span> will take over Step {conflictPrompt.targetStepIndex}, while <span className="text-amber-200 font-medium">{conflictPrompt.conflictingMask.name}</span> will be swapped out to unassigned.
+                    <span className="text-sky-300 font-medium">{conflictPrompt.currentMask.name}</span> will take over Step {conflictPrompt.targetStepIndex}
+                    {conflictPrompt.targetVariantName ? ` (${conflictPrompt.targetVariantName})` : ''}, while{' '}
+                    <span className="text-amber-200 font-medium">{conflictPrompt.conflictingMask.name}</span> will be swapped out to unassigned.
                   </p>
                 </div>
               )}

@@ -196,10 +196,14 @@ export const PRESET_PROCESS_FLOWS: ProcessFlow[] = [
         notes: 'Spin LOR / positive resist creating retrograde undercut',
         lithography: {
           resistMaterialId: 'mat_pr_pos',
-          resistThickness: 1100,
+          resistThickness: 750,
           polarity: 'positive',
+          coatMethod: 'lor-bilayer',
+          lorMaterialId: 'mat_pr_lor',
+          lorThickness: 350,
+          lorUndercut: 350,
           exposureMethod: 'UV Contact (365nm)',
-          sidewallAngle: 100, // retrograde undercut
+          sidewallAngle: 90,
           maskName: 'MASK 02: CONTACT_PADS',
           windows: [
             { id: 'w_lo1', xStart: 1800, xEnd: 4200 },

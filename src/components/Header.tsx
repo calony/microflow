@@ -21,6 +21,7 @@ import {
   FlaskConical,
   Info,
   Variable,
+  GitBranch,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -34,6 +35,8 @@ interface HeaderProps {
   onOpenMaskLevels: () => void;
   onOpenVariables?: () => void;
   variableCount?: number;
+  onOpenVariantManager?: () => void;
+  variantStepCount?: number;
   onOpenRunSheet: () => void;
   onOpenMultiStepView: () => void;
   onOpenAbout: () => void;
@@ -56,6 +59,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMaskLevels,
   onOpenVariables,
   variableCount = 0,
+  onOpenVariantManager,
+  variantStepCount = 0,
   onOpenRunSheet,
   onOpenMultiStepView,
   onOpenAbout,
@@ -293,6 +298,22 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
+          {onOpenVariantManager && (
+            <button
+              onClick={onOpenVariantManager}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+              title="Centralized Variant Manager: switch, clone, rename, or delete process variants"
+            >
+              <GitBranch className="w-3.5 h-3.5 text-violet-400" />
+              <span>Variants</span>
+              {variantStepCount > 0 && (
+                <span className="px-1 py-0.2 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 font-mono text-[10px]">
+                  {variantStepCount}
+                </span>
+              )}
+            </button>
+          )}
+
           <button
             onClick={onOpenRunSheet}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
@@ -421,6 +442,26 @@ export const Header: React.FC<HeaderProps> = ({
                   {variableCount > 0 && (
                     <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 font-mono text-[10px]">
                       {variableCount}
+                    </span>
+                  )}
+                </button>
+              )}
+              {onOpenVariantManager && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onOpenVariantManager();
+                  }}
+                  className="w-full flex items-center justify-between gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+                >
+                  <span className="flex items-center gap-2.5">
+                    <GitBranch className="w-4 h-4 text-violet-400" />
+                    <span>Variant Manager</span>
+                  </span>
+                  {variantStepCount > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 font-mono text-[10px]">
+                      {variantStepCount}
                     </span>
                   )}
                 </button>

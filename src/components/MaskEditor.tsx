@@ -11,9 +11,10 @@ import {
   createMaskWindowArray,
   duplicateMaskWindow,
 } from '../lib/maskUtils';
+import { getActiveStepVariant } from '../lib/variantUtils';
 import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
 import { MaskWindowArrayPanel } from './MaskWindowArrayPanel';
-import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown, Copy, LayoutGrid, Undo2, Redo2 } from 'lucide-react';
+import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown, Copy, LayoutGrid, Undo2, Redo2, GitBranch } from 'lucide-react';
 
 interface MaskEditorProps {
   step: ProcessStep;
@@ -150,6 +151,32 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     field: 'width' | 'xStart' | 'xEnd';
   } | null>(null);
   const [arraySourceWinId, setArraySourceWinId] = useState<string | null>(null);
+  const [branchNotice, setBranchNotice] = useState<string | null>(null);
+
+  const activeVariant =
+    step.variants && step.variants.length > 1 ? getActiveStepVariant(step) : null;
+  const siblingVariantsSharingMask =
+    activeVariant && litho.maskId && step.variants
+      ? step.variants.filter(
+          (v) =>
+            v.id !== activeVariant.id &&
+            v.type === 'lithography' &&
+            v.lithography?.maskId === litho.maskId
+        )
+      : [];
+  const isMaskSharedWithOtherVariant = siblingVariantsSharingMask.length > 0;
+  const variantMaskEditMode: 'branch' | 'shared' = step.variantMaskEditMode || 'branch';
+  const prevTrackMaskRef = useRef<{
+    stepId: string;
+    variantId?: string;
+    maskId?: string;
+    wasShared: boolean;
+  }>({
+    stepId: step.id,
+    variantId: activeVariant?.id,
+    maskId: litho.maskId,
+    wasShared: isMaskSharedWithOtherVariant,
+  });
 
   const isMinimized = isMinimizedProp ?? internalMinimized;
   const handleToggleMinimize =
@@ -238,11 +265,51 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     setSelectedWindowIds([]);
     setArraySourceWinId(null);
     setOpenWinBind(null);
+    setBranchNotice(null);
     undoStackRef.current = [];
     redoStackRef.current = [];
     dragStartLithoRef.current = null;
     setHistoryState({ canUndo: false, canRedo: false });
-  }, [step.id]);
+  }, [step.id, step.activeVariantId]);
+
+  useEffect(() => {
+    const prev = prevTrackMaskRef.current;
+    const sameVariant =
+      prev.stepId === step.id && prev.variantId === activeVariant?.id;
+    let timer: number | undefined;
+
+    if (
+      sameVariant &&
+      prev.wasShared &&
+      !isMaskSharedWithOtherVariant &&
+      litho.maskId &&
+      litho.maskId !== prev.maskId &&
+      activeVariant
+    ) {
+      setBranchNotice(
+        `New mask branch detected for "${activeVariant.name}": created "${litho.maskName || 'Dedicated Reticle'}" in Mask Manager.`
+      );
+      timer = window.setTimeout(() => setBranchNotice(null), 4500);
+    }
+
+    prevTrackMaskRef.current = {
+      stepId: step.id,
+      variantId: activeVariant?.id,
+      maskId: litho.maskId,
+      wasShared: isMaskSharedWithOtherVariant,
+    };
+
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [
+    step.id,
+    activeVariant?.id,
+    activeVariant?.name,
+    litho.maskId,
+    litho.maskName,
+    isMaskSharedWithOtherVariant,
+  ]);
 
   const handleSaveMaskName = () => {
     const trimmed = editingMaskName.trim();
@@ -816,6 +883,51 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           <span className="text-xs text-slate-300 font-mono truncate">
             {litho.maskName || 'Photomask Layer'}
           </span>
+          {activeVariant && !isMaskSharedWithOtherVariant && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 bg-violet-500/15 text-violet-300 border-violet-500/35"
+              title="Dedicated mask branch assigned to this variant in Mask Manager."
+            >
+              <GitBranch className="w-2.5 h-2.5" />
+              <span>{activeVariant.name} · Mask Branch</span>
+            </span>
+          )}
+          {activeVariant && isMaskSharedWithOtherVariant && (
+            <div
+              className="inline-flex items-center bg-slate-950 border border-slate-700/80 rounded-md p-0.5 text-[10px] shrink-0"
+              title={`Reticle shared with ${siblingVariantsSharingMask.map((v) => v.name).join(', ')}`}
+            >
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'shared' })
+                }
+                className={`px-1.5 py-0.5 rounded font-medium transition-colors ${
+                  variantMaskEditMode === 'shared'
+                    ? 'bg-sky-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title={`Carry edits to all variants sharing this reticle (${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')})`}
+              >
+                Shared ({siblingVariantsSharingMask.length + 1})
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'branch' })
+                }
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-medium transition-colors ${
+                  variantMaskEditMode === 'branch'
+                    ? 'bg-violet-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Generate a new mask branch in Mask Manager when apertures are modified"
+              >
+                <GitBranch className="w-2.5 h-2.5" />
+                <span>New Branch</span>
+              </button>
+            </div>
+          )}
           <span className="text-xs text-slate-600 shrink-0 hidden sm:inline">·</span>
           <span className="text-[11px] font-mono text-slate-400 shrink-0 hidden sm:inline">
             <span className={isLightField ? 'text-sky-300' : 'text-slate-200'}>
@@ -923,6 +1035,54 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
               <span className="truncate max-w-[140px] sm:max-w-none">{litho.maskName || 'Photomask Layer'}</span>
               <Edit2 className="w-3 h-3 text-slate-500 group-hover/maskname:text-sky-400 transition-colors shrink-0" />
             </button>
+          )}
+          {activeVariant && !isMaskSharedWithOtherVariant && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 bg-violet-500/15 text-violet-300 border-violet-500/35"
+              title="Dedicated mask branch assigned to this variant in Mask Manager."
+            >
+              <GitBranch className="w-2.5 h-2.5" />
+              <span>{activeVariant.name} · Mask Branch</span>
+            </span>
+          )}
+          {activeVariant && isMaskSharedWithOtherVariant && (
+            <div
+              className="inline-flex items-center gap-1 bg-slate-950 border border-slate-700/80 rounded-lg p-0.5 text-[10px] shrink-0"
+              title={`Currently sharing reticle across ${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')}`}
+            >
+              <span className="hidden sm:inline pl-1.5 pr-0.5 text-slate-400 font-medium">
+                {activeVariant.name}:
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'shared' })
+                }
+                className={`px-2 py-0.5 rounded-md font-medium transition-colors ${
+                  variantMaskEditMode === 'shared'
+                    ? 'bg-sky-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+                title={`Share reticle across variants: edits carry over to ${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')}`}
+              >
+                Shared ({siblingVariantsSharingMask.length + 1} var)
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'branch' })
+                }
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-medium transition-colors ${
+                  variantMaskEditMode === 'branch'
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+                title="Generate a new mask branch in Mask Manager when this variant's aperture track is modified"
+              >
+                <GitBranch className="w-2.5 h-2.5" />
+                <span>New Branch</span>
+              </button>
+            </div>
           )}
           <span className="hidden md:inline text-xs text-slate-500">·</span>
           <span className="hidden md:inline text-[11px] text-slate-400">
@@ -1032,6 +1192,27 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           </button>
         </div>
       </div>
+
+      {branchNotice && (
+        <div className="mb-2 px-2.5 py-1.5 rounded-lg bg-violet-950/50 border border-violet-500/40 text-violet-200 text-[11px] flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+            <span className="truncate">{branchNotice}</span>
+          </div>
+          {onOpenMaskLevels && (
+            <button
+              type="button"
+              onClick={() => {
+                setBranchNotice(null);
+                onOpenMaskLevels();
+              }}
+              className="text-[11px] font-semibold text-sky-300 hover:text-sky-200 hover:underline shrink-0"
+            >
+              View in Mask Manager →
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Visual Photomask Bar */}
       <div className="relative my-2 select-none">

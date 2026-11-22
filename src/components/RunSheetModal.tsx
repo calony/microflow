@@ -6,8 +6,9 @@
 import React, { useState, useMemo } from 'react';
 import { ProcessFlow, ProcessStep } from '../types/microfab';
 import { buildTimelineItems } from '../lib/blockUtils';
+import { getActiveStepVariant } from '../lib/variantUtils';
 import { ThicknessUnit, formatThickness } from '../lib/units';
-import { X, Copy, Check, Printer, FileText, Layers, CornerDownRight, Bookmark } from 'lucide-react';
+import { X, Copy, Check, Printer, FileText, Layers, CornerDownRight, Bookmark, GitBranch } from 'lucide-react';
 
 interface RunSheetModalProps {
   flow: ProcessFlow;
@@ -88,6 +89,8 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
         .join(', ');
 
       const sideLabel = formatStepSideLabel(step);
+      const activeVar = step.variants && step.variants.length > 1 ? getActiveStepVariant(step) : null;
+      const variantSuffix = activeVar ? ` [Variant: ${activeVar.name}]` : '';
       const statusSuffix = step.enabled ? '' : ' [SKIPPED]';
       const milestoneSuffix = step.bookmarked
         ? step.bookmarkLabel
@@ -95,7 +98,7 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
           : ' ★ [Milestone]'
         : '';
       const prefix = nestedInModule ? '↳ ' : '';
-      return `| ${idx + 1} | ${prefix}${step.title} (${sideLabel})${milestoneSuffix}${statusSuffix} | ${r?.toolName || 'Standard Cleanroom Bench'} | ${params || 'Standard Recipe'} | ${r?.inspectionNotes || step.notes || 'Visual microscope inspection'} |\n`;
+      return `| ${idx + 1} | ${prefix}${step.title} (${sideLabel})${variantSuffix}${milestoneSuffix}${statusSuffix} | ${r?.toolName || 'Standard Cleanroom Bench'} | ${params || 'Standard Recipe'} | ${r?.inspectionNotes || step.notes || 'Visual microscope inspection'} |\n`;
     };
 
     let modSeq = 0;
@@ -174,6 +177,15 @@ export const RunSheetModal: React.FC<RunSheetModalProps> = ({
         <td className={`py-3 px-3 ${isNested ? 'pl-4' : ''}`}>
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="font-semibold text-slate-100">{step.title}</span>
+            {step.variants && step.variants.length > 1 && (() => {
+              const activeVar = getActiveStepVariant(step);
+              return activeVar ? (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/35 text-[9px] font-mono font-semibold text-violet-300">
+                  <GitBranch className="w-2.5 h-2.5 text-violet-400" />
+                  <span>{activeVar.name}</span>
+                </span>
+              ) : null;
+            })()}
             {step.bookmarked && (
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-[9px] font-mono font-semibold text-amber-300">
                 <Bookmark className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />

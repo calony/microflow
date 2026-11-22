@@ -214,6 +214,18 @@ export const DEFAULT_MATERIALS: Material[] = [
     notes: 'Negative tone photoresist; UV exposed areas crosslink and remain after development',
   },
   {
+    id: 'mat_pr_lor',
+    name: 'LOR Lift-Off Resist',
+    formula: 'PMGI / LOR',
+    color: '#8b5cf6', // Violet 500
+    strokeColor: '#5b21b6',
+    pattern: 'dots',
+    category: 'photoresist',
+    density: 1.16,
+    refractiveIndex: 1.54,
+    notes: 'Non-photosensitive PMGI lift-off underlayer; dissolves isotropically in developer to form re-entrant undercut beneath imaging resist',
+  },
+  {
     id: 'mat_pr_su8',
     name: 'SU-8 Negative Resist',
     formula: 'SU-8 Epoxy',

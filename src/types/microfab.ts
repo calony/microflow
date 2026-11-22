@@ -102,9 +102,12 @@ export interface LithographyConfig {
   resistThickness: number; // nm
   polarity: 'positive' | 'negative';
   maskField?: MaskFieldPolarity; // 'dark-field' (blocks = apertures, default) vs 'light-field' (blocks = opaque chrome blockers)
-  coatMethod?: 'spin-coat' | 'dry-film'; // Spin Coat (planarizing) vs Dry Film Lamination (tenting)
+  coatMethod?: 'spin-coat' | 'dry-film' | 'lor-bilayer'; // Spin Coat (single) vs LOR Double Coat (bilayer undercut) vs Dry Film Lamination
   laminationSag?: number; // 0 - 100% when coatMethod === 'dry-film'
-  planarization?: number; // 0 - 100% when coatMethod === 'spin-coat' (default 100)
+  planarization?: number; // 0 - 100% when coatMethod === 'spin-coat' | 'lor-bilayer' (default 100)
+  lorMaterialId?: string; // Bottom lift-off resist material when coatMethod === 'lor-bilayer' (default 'mat_pr_lor')
+  lorThickness?: number; // Bottom LOR underlayer thickness in nm when coatMethod === 'lor-bilayer' (default 400)
+  lorUndercut?: number; // Adjustable lateral LOR undercut beneath top resist in nm (default 350)
   windows: MaskWindow[];
   sidewallAngle: number; // degrees (e.g. 90 = vertical, >90 = retrograde/undercut for liftoff, <90 = tapered)
   exposureMethod: 'UV Contact (365nm)' | 'DUV Stepper (248nm)' | 'E-Beam Litho' | 'Direct Write Laser';
@@ -124,6 +127,7 @@ export interface PhotomaskLevel {
   color?: string; // Reticle accent color for UI tracking
   windows: MaskWindow[];
   assignedStepId?: string; // ID of assigned photolithography step
+  assignedVariantId?: string; // Optional ID of assigned variant when the step is branched
 }
 
 export interface EtchConfig {
@@ -191,6 +195,8 @@ export interface CmpConfig {
   depth?: number; // nm removed
   targetHeight?: number; // absolute height to level down to
   stopMaterialId?: string;
+  dishing?: number; // 0 - 100 (%) concave feature-scale dishing inside softer inlaid features
+  erosion?: number; // 0 - 100 (%) pattern-density-dependent erosion of surrounding field/stop layers
 }
 
 export interface BondingConfig {
@@ -259,6 +265,27 @@ export interface ProcessBlock {
   placeholderStepIndex?: number; // Timeline step position when block has 0 steps
 }
 
+export interface ProcessStepVariant {
+  id: string;
+  name: string;
+  notes?: string;
+  title: string;
+  type: ProcessStepType;
+  side?: ProcessSide;
+  materialId?: string;
+  thickness?: number; // in nm
+  deposition?: DepositionConfig;
+  lithography?: LithographyConfig;
+  etch?: EtchConfig;
+  strip?: StripConfig;
+  cmp?: CmpConfig;
+  bonding?: BondingConfig;
+  dicing?: DicingConfig;
+  tapeFrame?: TapeFrameConfig;
+  toolRecipe?: ToolRecipe;
+  paramBindings?: Record<string, string>;
+}
+
 export interface ProcessStep {
   id: string;
   title: string;
@@ -283,6 +310,11 @@ export interface ProcessStep {
   tapeFrame?: TapeFrameConfig;
   toolRecipe?: ToolRecipe;
   paramBindings?: Record<string, string>;
+
+  // Process step variants (alternative recipes/parameters for A/B exploration)
+  variants?: ProcessStepVariant[];
+  activeVariantId?: string;
+  variantMaskEditMode?: 'branch' | 'shared'; // 'branch' = fork new mask on variant track edit (default); 'shared' = carry edit to all variants sharing the reticle
 }
 
 export interface SubstrateLayer {

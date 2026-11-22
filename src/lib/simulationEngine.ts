@@ -233,10 +233,10 @@ function applyStep(
 
     case 'cmp': {
       if (side === 'front' || side === 'both') {
-        applyCmpSide(columns, step, 'front', scallopWalls);
+        applyCmpSide(columns, step, materials, totalWidth, 'front', scallopWalls);
       }
       if (side === 'back' || side === 'both') {
-        applyCmpSide(columns, step, 'back', scallopWalls);
+        applyCmpSide(columns, step, materials, totalWidth, 'back', scallopWalls);
       }
       break;
     }
@@ -1596,8 +1596,61 @@ function applyLithographySide(
   const sidewallAngle = cfg?.sidewallAngle ?? 90;
 
   const coatMethod = cfg?.coatMethod ?? 'spin-coat';
+  const isLorBilayer = coatMethod === 'lor-bilayer';
+  const lorMatId = cfg?.lorMaterialId || 'mat_pr_lor';
+  const lorThickness = isLorBilayer ? Math.max(0, cfg?.lorThickness ?? 400) : 0;
+  const lorUndercut = isLorBilayer ? Math.max(0, cfg?.lorUndercut ?? 350) : 0;
 
-  // 1. Apply photoresist (Spin-coat planarizing fill OR Dry Film Lamination tenting sheet)
+  const applySpinCoatLayer = (matId: string, layerThickness: number, planarization: number) => {
+    if (layerThickness <= 0) return;
+    if (targetSide === 'front') {
+      const layerTops = computeSpinCoatSurface(
+        columns,
+        _totalWidth,
+        'front',
+        layerThickness,
+        planarization
+      );
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        if (col.segments.length === 0) continue;
+        const currentTop = getTopY(col);
+        if (layerTops[i] > currentTop) {
+          col.segments.push({
+            yBottom: currentTop,
+            yTop: layerTops[i],
+            materialId: matId,
+            stepId: step.id,
+            side: 'front',
+          });
+        }
+      }
+    } else {
+      const layerBottoms = computeSpinCoatSurface(
+        columns,
+        _totalWidth,
+        'back',
+        layerThickness,
+        planarization
+      );
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        if (col.segments.length === 0) continue;
+        const currentBottom = getBottomY(col);
+        if (layerBottoms[i] < currentBottom) {
+          col.segments.unshift({
+            yBottom: layerBottoms[i],
+            yTop: currentBottom,
+            materialId: matId,
+            stepId: step.id,
+            side: 'back',
+          });
+        }
+      }
+    }
+  };
+
+  // 1. Apply photoresist (Single Spin-Coat, LOR Double-Coat Bilayer, OR Dry Film Lamination)
   if (coatMethod === 'dry-film') {
     const sag = cfg?.laminationSag ?? 0;
     const { yBottom, yTop } = computeDryFilmProfile(
@@ -1623,52 +1676,14 @@ function applyLithographySide(
         col.segments.unshift(seg);
       }
     }
-  } else if (targetSide === 'front') {
-    const planarization = cfg?.planarization ?? 100;
-    const resistTops = computeSpinCoatSurface(
-      columns,
-      _totalWidth,
-      'front',
-      resistThickness,
-      planarization
-    );
-    for (let i = 0; i < columns.length; i++) {
-      const col = columns[i];
-      if (col.segments.length === 0) continue;
-      const currentTop = getTopY(col);
-      if (resistTops[i] > currentTop) {
-        col.segments.push({
-          yBottom: currentTop,
-          yTop: resistTops[i],
-          materialId: resistMatId,
-          stepId: step.id,
-          side: 'front',
-        });
-      }
-    }
   } else {
     const planarization = cfg?.planarization ?? 100;
-    const resistBottoms = computeSpinCoatSurface(
-      columns,
-      _totalWidth,
-      'back',
-      resistThickness,
-      planarization
-    );
-    for (let i = 0; i < columns.length; i++) {
-      const col = columns[i];
-      if (col.segments.length === 0) continue;
-      const currentBottom = getBottomY(col);
-      if (resistBottoms[i] < currentBottom) {
-        col.segments.unshift({
-          yBottom: resistBottoms[i],
-          yTop: currentBottom,
-          materialId: resistMatId,
-          stepId: step.id,
-          side: 'back',
-        });
-      }
+    // First coat (if LOR double coat): sacrificial Lift-Off Resist underlayer
+    if (isLorBilayer && lorThickness > 0) {
+      applySpinCoatLayer(lorMatId, lorThickness, planarization);
     }
+    // Second / top coat: imaging photoresist
+    applySpinCoatLayer(resistMatId, resistThickness, planarization);
   }
 
   // 2. Exposure (Mask Field Polarity) & Development (Resist Tone)
@@ -1691,7 +1706,7 @@ function applyLithographySide(
     isDissolved[i] = polarity === 'positive' ? isExposed : !isExposed;
   }
 
-  // 3. Sidewall angle shaping (tapered < 90° or retrograde undercut > 90°)
+  // 3. Sidewall angle shaping (tapered < 90° or retrograde undercut > 90°) on top imaging resist
   if (Math.abs(sidewallAngle - 90) >= 0.25) {
     applyResistAngle(
       columns,
@@ -1704,43 +1719,44 @@ function applyLithographySide(
     );
   }
 
-  // 4. Remove resist from dissolved columns on this side
+  // 4. Remove resist (and LOR underlayer if bilayer) from dissolved columns on this side
   for (let i = 0; i < columns.length; i++) {
     if (isDissolved[i]) {
       const col = columns[i];
-      col.segments = col.segments.filter(
-        (seg) =>
-          seg.materialId !== resistMatId ||
-          seg.stepId !== step.id ||
-          seg.side !== targetSide
-      );
+      col.segments = col.segments.filter((seg) => {
+        if (seg.stepId !== step.id || seg.side !== targetSide) return true;
+        if (seg.materialId === resistMatId) return false;
+        if (isLorBilayer && seg.materialId === lorMatId) return false;
+        return true;
+      });
     }
+  }
+
+  // 5. Adjustable lateral LOR undercut beneath top imaging resist overhang
+  if (isLorBilayer && lorThickness > 0 && lorUndercut > 0) {
+    applyLorUndercut(
+      columns,
+      isDissolved,
+      lorUndercut,
+      lorMatId,
+      resistMatId,
+      step.id,
+      targetSide,
+      _totalWidth
+    );
   }
 }
 
-/**
- * Tapered (< 90°) and Retrograde / Lift-off Undercut (> 90°) modeling for photoresist sidewalls
- */
-function applyResistAngle(
+function computeDistanceToDissolvedEdge(
   columns: ColumnProfile[],
   isDissolved: boolean[],
-  angle: number,
-  resistMatId: string,
-  stepId: string,
-  targetSide: 'front' | 'back',
   totalWidth: number
-): void {
+): Float64Array {
   const numCols = columns.length;
-  if (numCols === 0) return;
+  const distToEdge = new Float64Array(numCols);
+  if (numCols === 0) return distToEdge;
 
   const dx = totalWidth / numCols;
-  const clampedAngle = Math.max(45, Math.min(135, angle));
-  const absTan = Math.abs(Math.tan((clampedAngle * Math.PI) / 180));
-  if (absTan < 1e-4) return;
-
-  const isRetrograde = clampedAngle > 90;
-
-  // Compute nearest dissolved-mask-edge distance (nm) for every kept column
   const distToOpeningLeft = new Float64Array(numCols);
   const distToOpeningRight = new Float64Array(numCols);
 
@@ -1771,8 +1787,108 @@ function applyResistAngle(
   }
 
   for (let i = 0; i < numCols; i++) {
+    distToEdge[i] = Math.min(distToOpeningLeft[i], distToOpeningRight[i]);
+  }
+  return distToEdge;
+}
+
+/**
+ * Isotropic alkaline developer lateral undercut of LOR underlayer beneath the top imaging resist
+ */
+function applyLorUndercut(
+  columns: ColumnProfile[],
+  isDissolved: boolean[],
+  undercutNm: number,
+  lorMatId: string,
+  resistMatId: string,
+  stepId: string,
+  targetSide: 'front' | 'back',
+  totalWidth: number
+): void {
+  const numCols = columns.length;
+  if (numCols === 0 || undercutNm <= 0) return;
+
+  const distToEdge = computeDistanceToDissolvedEdge(columns, isDissolved, totalWidth);
+
+  for (let i = 0; i < numCols; i++) {
     if (isDissolved[i]) continue;
-    const dEdge = Math.min(distToOpeningLeft[i], distToOpeningRight[i]);
+    const dEdge = distToEdge[i];
+    if (!Number.isFinite(dEdge) || dEdge >= undercutNm) continue;
+
+    const col = columns[i];
+    const prSeg = col.segments.find(
+      (s) =>
+        s.materialId === resistMatId &&
+        s.stepId === stepId &&
+        s.side === targetSide
+    );
+    if (prSeg) {
+      prSeg.isOverhang = true;
+    }
+
+    const lorIdx = col.segments.findIndex(
+      (s) =>
+        s.materialId === lorMatId &&
+        s.stepId === stepId &&
+        s.side === targetSide
+    );
+    if (lorIdx === -1) continue;
+
+    const lorSeg = col.segments[lorIdx];
+    const lorHeight = lorSeg.yTop - lorSeg.yBottom;
+    if (lorHeight <= 0) {
+      col.segments.splice(lorIdx, 1);
+      continue;
+    }
+
+    // Concave isotropic wet-development fillet near the LOR undercut front,
+    // leaving full clear overhang cavity of width `undercutNm` at the LOR/PR interface
+    const footRadius = Math.min(undercutNm * 0.4, lorHeight * 0.65);
+    if (footRadius <= 1 || dEdge <= undercutNm - footRadius) {
+      col.segments.splice(lorIdx, 1);
+      continue;
+    }
+
+    const u = Math.max(0, Math.min(1, (dEdge - (undercutNm - footRadius)) / footRadius));
+    const frac = 1 - Math.sqrt(Math.max(0, 1 - u * u));
+    if (lorHeight * frac < 1) {
+      col.segments.splice(lorIdx, 1);
+      continue;
+    }
+
+    if (targetSide === 'front') {
+      lorSeg.yTop = lorSeg.yBottom + lorHeight * frac;
+    } else {
+      lorSeg.yBottom = lorSeg.yTop - lorHeight * frac;
+    }
+  }
+}
+
+/**
+ * Tapered (< 90°) and Retrograde / Lift-off Undercut (> 90°) modeling for photoresist sidewalls
+ */
+function applyResistAngle(
+  columns: ColumnProfile[],
+  isDissolved: boolean[],
+  angle: number,
+  resistMatId: string,
+  stepId: string,
+  targetSide: 'front' | 'back',
+  totalWidth: number
+): void {
+  const numCols = columns.length;
+  if (numCols === 0) return;
+
+  const clampedAngle = Math.max(45, Math.min(135, angle));
+  const absTan = Math.abs(Math.tan((clampedAngle * Math.PI) / 180));
+  if (absTan < 1e-4) return;
+
+  const isRetrograde = clampedAngle > 90;
+  const distToEdge = computeDistanceToDissolvedEdge(columns, isDissolved, totalWidth);
+
+  for (let i = 0; i < numCols; i++) {
+    if (isDissolved[i]) continue;
+    const dEdge = distToEdge[i];
     if (!Number.isFinite(dEdge)) continue;
 
     const col = columns[i];
@@ -4489,16 +4605,209 @@ function applyStripOrLiftoff(
 }
 
 /**
+ * Relative CMP polish softness rank (higher = polishes faster / dishes more easily).
+ * Explicit stop-on-layer barriers always rank lowest (hardest stop).
+ */
+function getCmpSoftnessRank(mat: Material, stopMaterialId?: string): number {
+  if (stopMaterialId && mat.id === stopMaterialId) return 0;
+  if (mat.category === 'photoresist' || mat.category === 'polymer') return 5.0;
+  if (mat.category === 'metal') {
+    if (mat.id === 'mat_cu' || mat.id === 'mat_al' || mat.id === 'mat_au') return 4.0;
+    return 3.0;
+  }
+  if (mat.category === 'dielectric') {
+    if (mat.id === 'mat_si3n4' || mat.id === 'mat_al2o3' || mat.id === 'mat_hafnium') return 1.0;
+    if (mat.id === 'mat_sio2_thermal') return 2.4;
+    return 2.6;
+  }
+  if (mat.id === 'mat_poly_si') return 2.2;
+  if (mat.category === 'substrate' || mat.category === 'semiconductor') return 1.5;
+  return 2.5;
+}
+
+/**
+ * Computes per-column CMP recession (erosion + concave feature dishing) at polishPlaneY
+ * when multi-material patterns (e.g. Damascene Cu/SiO2 or STI SiO2/Si3N4) are exposed.
+ */
+function computeCmpDishingAndErosion(
+  columns: ColumnProfile[],
+  materials: Material[],
+  totalWidth: number,
+  targetSide: 'front' | 'back',
+  polishPlaneY: number,
+  dishingPct: number,
+  erosionPct: number,
+  stopMaterialId?: string
+): number[] {
+  const n = columns.length;
+  const recess = new Array<number>(n).fill(0);
+  if (n === 0 || (dishingPct <= 0 && erosionPct <= 0)) return recess;
+
+  const dx = totalWidth / n;
+  const exposedMatId: (string | null)[] = new Array(n).fill(null);
+  const contiguousThick: number[] = new Array(n).fill(0);
+  const matCounts = new Map<string, number>();
+
+  for (let i = 0; i < n; i++) {
+    const segs = columns[i].segments;
+    if (segs.length === 0) continue;
+    if (targetSide === 'front') {
+      const topSeg = segs[segs.length - 1];
+      if (Math.abs(topSeg.yTop - polishPlaneY) > 0.5) continue;
+      exposedMatId[i] = topSeg.materialId;
+      matCounts.set(topSeg.materialId, (matCounts.get(topSeg.materialId) || 0) + 1);
+      let thick = 0;
+      for (let s = segs.length - 1; s >= 0; s--) {
+        if (segs[s].materialId === topSeg.materialId) {
+          thick += segs[s].yTop - segs[s].yBottom;
+        } else {
+          break;
+        }
+      }
+      contiguousThick[i] = thick;
+    } else {
+      const botSeg = segs[0];
+      if (Math.abs(botSeg.yBottom - polishPlaneY) > 0.5) continue;
+      exposedMatId[i] = botSeg.materialId;
+      matCounts.set(botSeg.materialId, (matCounts.get(botSeg.materialId) || 0) + 1);
+      let thick = 0;
+      for (let s = 0; s < segs.length; s++) {
+        if (segs[s].materialId === botSeg.materialId) {
+          thick += segs[s].yTop - segs[s].yBottom;
+        } else {
+          break;
+        }
+      }
+      contiguousThick[i] = thick;
+    }
+  }
+
+  // Require at least 2 distinct exposed materials for multi-material dishing & erosion
+  if (matCounts.size < 2) return recess;
+
+  let minRank = Infinity;
+  let maxRank = -Infinity;
+  const rankByMat = new Map<string, number>();
+  for (const matId of matCounts.keys()) {
+    const mat = getMaterialById(materials, matId);
+    const rank = getCmpSoftnessRank(mat, stopMaterialId);
+    rankByMat.set(matId, rank);
+    if (rank < minRank) minRank = rank;
+    if (rank > maxRank) maxRank = rank;
+  }
+
+  // Tie-breaker if all exposed materials have equal softness rank: minority material dishes
+  let majorityMatId: string | null = null;
+  if (maxRank <= minRank + 1e-6) {
+    let bestCount = -1;
+    for (const [mId, cnt] of matCounts.entries()) {
+      if (cnt > bestCount) {
+        bestCount = cnt;
+        majorityMatId = mId;
+      }
+    }
+  }
+
+  const softness = new Array<number>(n).fill(0);
+  const featureThicks: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const mId = exposedMatId[i];
+    if (!mId) continue;
+    let sVal = 0;
+    if (maxRank > minRank + 1e-6) {
+      sVal = ((rankByMat.get(mId) ?? minRank) - minRank) / (maxRank - minRank);
+    } else {
+      sVal = mId === majorityMatId ? 0 : 1;
+    }
+    softness[i] = sVal;
+    if (sVal > 0.2 && contiguousThick[i] > 0) {
+      featureThicks.push(contiguousThick[i]);
+    }
+  }
+
+  if (featureThicks.length === 0) return recess;
+  featureThicks.sort((a, b) => a - b);
+  const medianFeatureThick = featureThicks[Math.floor(featureThicks.length / 2)];
+  const refFeatureThick = Math.max(60, Math.min(2000, medianFeatureThick));
+
+  const maxDishAt100 = Math.min(450, Math.max(90, refFeatureThick * 0.45));
+  const maxErosionAt100 = Math.min(260, Math.max(60, refFeatureThick * 0.28));
+
+  // 1. Pattern-density-dependent erosion across pad planarization length L_pad
+  if (erosionPct > 0) {
+    const halfSpanCols = Math.max(2, Math.round((totalWidth * 0.14) / Math.max(1, dx)));
+    const erosionFrac = erosionPct / 100;
+    for (let i = 0; i < n; i++) {
+      if (!exposedMatId[i]) continue;
+      let weightedSoft = 0;
+      let weightSum = 0;
+      const jMin = Math.max(0, i - halfSpanCols);
+      const jMax = Math.min(n - 1, i + halfSpanCols);
+      for (let j = jMin; j <= jMax; j++) {
+        const w = 0.5 * (1 + Math.cos((Math.PI * Math.abs(j - i)) / (halfSpanCols + 1)));
+        weightSum += w;
+        if (exposedMatId[j]) {
+          weightedSoft += w * softness[j];
+        }
+      }
+      const localDensity = weightSum > 0 ? weightedSoft / weightSum : 0;
+      recess[i] += maxErosionAt100 * erosionFrac * Math.pow(localDensity, 0.85);
+    }
+  }
+
+  // 2. Concave width-dependent dishing inside contiguous soft/inlaid feature runs
+  if (dishingPct > 0) {
+    const dishFrac = dishingPct / 100;
+    const refWidth = Math.max(1000, totalWidth * 0.25);
+    let idx = 0;
+    while (idx < n) {
+      const mId = exposedMatId[idx];
+      if (!mId || softness[idx] <= 0.2) {
+        idx++;
+        continue;
+      }
+      let endIdx = idx;
+      while (
+        endIdx + 1 < n &&
+        exposedMatId[endIdx + 1] === mId &&
+        softness[endIdx + 1] > 0.2
+      ) {
+        endIdx++;
+      }
+      const runLen = endIdx - idx + 1;
+      const runWidth = runLen * dx;
+      const widthFactor = Math.min(1.0, 0.22 + 0.78 * Math.pow(runWidth / refWidth, 0.65));
+
+      for (let k = idx; k <= endIdx; k++) {
+        const u = (k - idx + 0.5) / runLen;
+        const bowl = Math.sin(Math.PI * u);
+        const rawDish = maxDishAt100 * dishFrac * softness[k] * widthFactor * bowl;
+        const maxSafeDish = Math.max(0, contiguousThick[k] * 0.85 - recess[k] * 0.25);
+        recess[k] += Math.min(rawDish, maxSafeDish);
+      }
+      idx = endIdx + 1;
+    }
+  }
+
+  return recess;
+}
+
+/**
  * Handles CMP (Chemical Mechanical Polishing / Backside Grinding & Planarization)
  */
 function applyCmpSide(
   columns: ColumnProfile[],
   step: ProcessStep,
+  materials: Material[],
+  totalWidth: number,
   targetSide: 'front' | 'back',
   scallopWalls?: ScallopWall[]
 ): void {
   const cfg = step.cmp;
   const mode = cfg?.mode ?? 'polish-depth';
+  const operation = cfg?.operation ?? 'cmp';
+  const dishingPct = operation === 'cmp' ? Math.max(0, Math.min(100, cfg?.dishing ?? 0)) : 0;
+  const erosionPct = operation === 'cmp' ? Math.max(0, Math.min(100, cfg?.erosion ?? 0)) : 0;
 
   if (targetSide === 'front') {
     let currentMaxTop = -Infinity;
@@ -4544,6 +4853,35 @@ function applyCmpSide(
       }
       col.segments = newSegs;
     }
+
+    if (dishingPct > 0 || erosionPct > 0) {
+      const recess = computeCmpDishingAndErosion(
+        columns,
+        materials,
+        totalWidth,
+        'front',
+        polishPlaneY,
+        dishingPct,
+        erosionPct,
+        mode === 'stop-on-layer' ? cfg?.stopMaterialId : undefined
+      );
+      for (let i = 0; i < columns.length; i++) {
+        const r = recess[i];
+        if (r <= 0.05) continue;
+        const localPlaneY = polishPlaneY - r;
+        const newSegs: MaterialSegment[] = [];
+        for (const seg of columns[i].segments) {
+          if (seg.yBottom >= localPlaneY) continue;
+          if (seg.yTop > localPlaneY) {
+            newSegs.push({ ...seg, yTop: localPlaneY });
+          } else {
+            newSegs.push(seg);
+          }
+        }
+        columns[i].segments = newSegs;
+      }
+    }
+
     if (scallopWalls && scallopWalls.length > 0) {
       for (let i = scallopWalls.length - 1; i >= 0; i--) {
         const w = scallopWalls[i];
@@ -4605,6 +4943,35 @@ function applyCmpSide(
     }
     col.segments = newSegs;
   }
+
+  if (dishingPct > 0 || erosionPct > 0) {
+    const recess = computeCmpDishingAndErosion(
+      columns,
+      materials,
+      totalWidth,
+      'back',
+      polishPlaneY,
+      dishingPct,
+      erosionPct,
+      mode === 'stop-on-layer' ? cfg?.stopMaterialId : undefined
+    );
+    for (let i = 0; i < columns.length; i++) {
+      const r = recess[i];
+      if (r <= 0.05) continue;
+      const localPlaneY = polishPlaneY + r;
+      const newSegs: MaterialSegment[] = [];
+      for (const seg of columns[i].segments) {
+        if (seg.yTop <= localPlaneY) continue;
+        if (seg.yBottom < localPlaneY) {
+          newSegs.push({ ...seg, yBottom: localPlaneY });
+        } else {
+          newSegs.push(seg);
+        }
+      }
+      columns[i].segments = newSegs;
+    }
+  }
+
   if (scallopWalls && scallopWalls.length > 0) {
     for (let i = scallopWalls.length - 1; i >= 0; i--) {
       const w = scallopWalls[i];

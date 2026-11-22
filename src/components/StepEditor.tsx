@@ -23,7 +23,7 @@ import {
   VariableUnit,
 } from '../types/microfab';
 import { ThicknessUnit, getUnitLabel, formatThickness } from '../lib/units';
-import { resolveResistMaterialId, isCrystallineKohMaterial } from '../lib/materials';
+import { resolveResistMaterialId, isCrystallineKohMaterial, getMaterialById } from '../lib/materials';
 import {
   getEtchRecipes,
   getEtchRateNmMin,
@@ -32,6 +32,14 @@ import {
   formatDurationCompact,
 } from '../lib/etchRates';
 import { getDefaultStepTitle } from '../lib/stepDefaults';
+import {
+  createStepVariant,
+  duplicateStepVariant,
+  switchStepVariant,
+  renameStepVariant,
+  deleteStepVariant,
+  getActiveStepVariant,
+} from '../lib/variantUtils';
 import { ThicknessInput } from './ThicknessInput';
 import {
   ParametricThicknessInput,
@@ -68,6 +76,8 @@ import {
   Slice,
   FlaskConical,
   Bookmark,
+  GitBranch,
+  Copy,
 } from 'lucide-react';
 
 interface StepEditorProps {
@@ -87,6 +97,7 @@ interface StepEditorProps {
   variables?: DesignVariable[];
   onCreateVariable?: (name: string, value: number, unit: VariableUnit, description?: string) => void;
   onOpenVariablesModal?: () => void;
+  onOpenVariantManager?: () => void;
 }
 
 export const StepEditor: React.FC<StepEditorProps> = ({
@@ -106,6 +117,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   variables = [],
   onCreateVariable,
   onOpenVariablesModal,
+  onOpenVariantManager,
 }) => {
   const [activeTab, setActiveTab] = useState<'process' | 'equipment' | 'notes'>('process');
   const [isAddingBlockInline, setIsAddingBlockInline] = useState<boolean>(false);
@@ -114,11 +126,15 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   const [editingMaskName, setEditingMaskName] = useState<string>('');
   const [bondingImportError, setBondingImportError] = useState<string | null>(null);
   const [openStreetBindId, setOpenStreetBindId] = useState<string | null>(null);
+  const [editingVariantId, setEditingVariantId] = useState<string | null>(null);
+  const [editingVariantName, setEditingVariantName] = useState<string>('');
 
   useEffect(() => {
     setIsEditingMaskName(false);
     setEditingMaskName(step.lithography?.maskName || '');
     setBondingImportError(null);
+    setEditingVariantId(null);
+    setEditingVariantName('');
   }, [step.id, step.lithography?.maskName]);
 
   const handleUpdate = (patch: Partial<ProcessStep>) => {
@@ -314,6 +330,189 @@ export const StepEditor: React.FC<StepEditorProps> = ({
           </div>
         )}
 
+        {/* Process Step Variants Section */}
+        {(() => {
+          const variants = step.variants;
+          const activeVariant = getActiveStepVariant(step);
+          if (!variants || variants.length <= 1) {
+            return (
+              <div className="mt-2.5 flex items-center justify-between gap-2">
+                <span className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
+                  <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                  <span>Variants:</span>
+                  <span className="text-slate-500 font-normal">Single recipe</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onUpdateStep(createStepVariant(step))}
+                  className="flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/35 text-[11px] font-medium text-violet-300 transition-colors"
+                  title="Branch this step with an alternative parameter variant (e.g. Baseline vs Variant B)"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Add Variant</span>
+                </button>
+              </div>
+            );
+          }
+
+          return (
+            <div className="mt-2.5 p-2 rounded-xl bg-slate-950/90 border border-violet-500/35 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-violet-300">
+                  <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                  <span>Step Variants</span>
+                  <span className="px-1.5 py-0.2 rounded bg-violet-500/20 border border-violet-500/30 font-mono text-[10px] text-violet-200">
+                    {variants.length}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
+                  {onOpenVariantManager && (
+                    <button
+                      type="button"
+                      onClick={onOpenVariantManager}
+                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] text-violet-300 transition-colors"
+                      title="Open centralized Variant Manager for all steps"
+                    >
+                      Manage All
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onUpdateStep(duplicateStepVariant(step))}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] text-slate-300 transition-colors"
+                    title="Duplicate active variant"
+                  >
+                    <Copy className="w-2.5 h-2.5" />
+                    <span>Clone</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onUpdateStep(createStepVariant(step))}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-600/80 hover:bg-violet-500 text-[10px] font-semibold text-white transition-colors"
+                    title="Create a new parameter variant"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>New</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {variants.map((variant) => {
+                  const isActive = activeVariant?.id === variant.id;
+                  const isEditingThis = editingVariantId === variant.id;
+
+                  if (isEditingThis) {
+                    return (
+                      <div
+                        key={variant.id}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded-lg bg-slate-900 border border-violet-400"
+                      >
+                        <input
+                          type="text"
+                          autoFocus
+                          value={editingVariantName}
+                          onChange={(e) => setEditingVariantName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              if (editingVariantName.trim()) {
+                                onUpdateStep(renameStepVariant(step, variant.id, editingVariantName));
+                              }
+                              setEditingVariantId(null);
+                            } else if (e.key === 'Escape') {
+                              setEditingVariantId(null);
+                            }
+                          }}
+                          onBlur={() => {
+                            if (editingVariantName.trim()) {
+                              onUpdateStep(renameStepVariant(step, variant.id, editingVariantName));
+                            }
+                            setEditingVariantId(null);
+                          }}
+                          className="w-24 bg-transparent text-[11px] font-medium text-white focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            if (editingVariantName.trim()) {
+                              onUpdateStep(renameStepVariant(step, variant.id, editingVariantName));
+                            }
+                            setEditingVariantId(null);
+                          }}
+                          className="text-emerald-400 hover:text-emerald-300"
+                          title="Save variant name"
+                        >
+                          <Check className="w-3 h-3" />
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div
+                      key={variant.id}
+                      className={`group inline-flex items-center gap-1 rounded-lg border text-[11px] transition-all ${
+                        isActive
+                          ? 'bg-violet-600/25 border-violet-400/80 text-white shadow-sm'
+                          : 'bg-slate-900/90 border-slate-700/80 text-slate-300 hover:border-slate-500 hover:text-white'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!isActive) {
+                            onUpdateStep(switchStepVariant(step, variant.id));
+                          }
+                        }}
+                        onDoubleClick={() => {
+                          setEditingVariantId(variant.id);
+                          setEditingVariantName(variant.name);
+                        }}
+                        className="px-2 py-1 font-medium truncate max-w-[130px] text-left"
+                        title={`${variant.name} (${variant.type})${isActive ? ' — Active (double-click to rename)' : ' — Click to activate'}`}
+                      >
+                        {variant.name}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingVariantId(variant.id);
+                          setEditingVariantName(variant.name);
+                        }}
+                        className={`p-0.5 rounded transition-colors ${
+                          isActive
+                            ? 'text-violet-300 hover:text-white'
+                            : 'text-slate-500 opacity-0 group-hover:opacity-100 hover:text-slate-200'
+                        }`}
+                        title="Rename variant"
+                      >
+                        <Edit2 className="w-2.5 h-2.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateStep(deleteStepVariant(step, variant.id))}
+                        className={`pr-1.5 py-0.5 rounded transition-colors ${
+                          isActive
+                            ? 'text-violet-300/80 hover:text-rose-300'
+                            : 'text-slate-500 opacity-0 group-hover:opacity-100 hover:text-rose-400'
+                        }`}
+                        title={
+                          variants.length === 2
+                            ? `Delete "${variant.name}" (returns to single recipe)`
+                            : `Delete "${variant.name}"`
+                        }
+                      >
+                        <Trash2 className="w-2.5 h-2.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Navigation Tabs */}
         <div className="flex items-center gap-1 mt-3 p-1 rounded-lg bg-slate-950 border border-slate-800 text-xs">
           <button
@@ -417,6 +616,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       operation: 'cmp',
                       mode: 'polish-depth',
                       depth: 300,
+                      dishing: 0,
+                      erosion: 0,
                     };
                   }
                   if (newType === 'bonding') {
@@ -1211,9 +1412,40 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                 {/* Mask Level Linking / Reticle Assignment */}
                 <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 space-y-2 min-w-0">
                   <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <span className="text-[11px] font-semibold text-sky-400 flex items-center gap-1.5 min-w-0">
+                    <span className="text-[11px] font-semibold text-sky-400 flex items-center gap-1.5 min-w-0 flex-wrap">
                       <Scan className="w-3.5 h-3.5 shrink-0" />
                       <span className="truncate">Photomask Level / Reticle</span>
+                      {step.variants && step.variants.length > 1 && step.lithography?.maskId && (() => {
+                        const curVar = getActiveStepVariant(step);
+                        const sharedCount = step.variants.filter(
+                          (v) => v.type === 'lithography' && v.lithography?.maskId === step.lithography?.maskId
+                        ).length;
+                        const isSharedMode = step.variantMaskEditMode === 'shared';
+                        return (
+                          <span
+                            className={`px-1.5 py-0.5 rounded border text-[9.5px] font-medium shrink-0 ${
+                              sharedCount > 1
+                                ? isSharedMode
+                                  ? 'bg-sky-500/15 text-sky-300 border-sky-500/35'
+                                  : 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                : 'bg-violet-500/15 text-violet-300 border-violet-500/35'
+                            }`}
+                            title={
+                              sharedCount > 1
+                                ? isSharedMode
+                                  ? `Shared across ${sharedCount} variants — track edits carry over to all sharing variants`
+                                  : `Shared across ${sharedCount} variants — modifying the aperture track creates a new mask branch automatically`
+                                : `Dedicated mask branch for ${curVar?.name || 'this variant'}`
+                            }
+                          >
+                            {sharedCount > 1
+                              ? isSharedMode
+                                ? `Shared Edit (${sharedCount} var)`
+                                : `Auto-Branch (${sharedCount} var)`
+                              : `Branch · ${curVar?.name || 'Variant'}`}
+                          </span>
+                        );
+                      })()}
                     </span>
                     {onOpenMaskLevelsModal && (
                       <button
@@ -1387,11 +1619,24 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   <label className="block text-[11px] text-slate-400">
                     Resist Application Method
                   </label>
-                  <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                  <div className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
                     {(
                       [
-                        { id: 'spin-coat' as const, label: 'Spin Coat (Fill)' },
-                        { id: 'dry-film' as const, label: 'Dry Film Lamination' },
+                        {
+                          id: 'spin-coat' as const,
+                          label: 'Spin Coat',
+                          title: 'Single-layer spin-coated photoresist',
+                        },
+                        {
+                          id: 'lor-bilayer' as const,
+                          label: 'LOR Double Coat',
+                          title: 'Bilayer coat: LOR underlayer + top imaging resist with adjustable lift-off undercut',
+                        },
+                        {
+                          id: 'dry-film' as const,
+                          label: 'Dry Film',
+                          title: 'Laminated dry film photoresist sheet that tents across cavities',
+                        },
                       ]
                     ).map((opt) => {
                       const active = (step.lithography?.coatMethod ?? 'spin-coat') === opt.id;
@@ -1399,6 +1644,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                         <button
                           key={opt.id}
                           type="button"
+                          title={opt.title}
                           onClick={() => {
                             const prevLith = step.lithography || {
                               resistMaterialId: 'mat_pr_pos',
@@ -1413,10 +1659,24 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                               lithography: {
                                 ...prevLith,
                                 coatMethod: opt.id,
-                                ...(opt.id === 'dry-film' &&
-                                hasDfr &&
-                                (prevLith.resistMaterialId === 'mat_pr_pos' ||
-                                  prevLith.resistMaterialId === 'mat_pr_neg')
+                                ...(opt.id === 'lor-bilayer'
+                                  ? {
+                                      lorMaterialId: prevLith.lorMaterialId || 'mat_pr_lor',
+                                      lorThickness: prevLith.lorThickness ?? 400,
+                                      lorUndercut: prevLith.lorUndercut ?? 350,
+                                      ...(prevLith.resistMaterialId === 'mat_dfr'
+                                        ? {
+                                            resistMaterialId:
+                                              prevLith.polarity === 'negative'
+                                                ? 'mat_pr_neg'
+                                                : 'mat_pr_pos',
+                                          }
+                                        : {}),
+                                    }
+                                  : opt.id === 'dry-film' &&
+                                    hasDfr &&
+                                    (prevLith.resistMaterialId === 'mat_pr_pos' ||
+                                      prevLith.resistMaterialId === 'mat_pr_neg')
                                   ? { resistMaterialId: 'mat_dfr' }
                                   : opt.id === 'spin-coat' &&
                                     prevLith.resistMaterialId === 'mat_dfr'
@@ -1430,9 +1690,11 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                               },
                             });
                           }}
-                          className={`py-1 px-2 rounded-md font-medium transition-colors ${
+                          className={`py-1 px-1.5 rounded-md font-medium transition-colors truncate ${
                             active
-                              ? 'bg-rose-600 text-white shadow-sm'
+                              ? opt.id === 'lor-bilayer'
+                                ? 'bg-violet-600 text-white shadow-sm'
+                                : 'bg-rose-600 text-white shadow-sm'
                               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
                           }`}
                         >
@@ -1443,7 +1705,145 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </div>
                 </div>
 
-                {(step.lithography?.coatMethod ?? 'spin-coat') === 'spin-coat' ? (
+                {(step.lithography?.coatMethod ?? 'spin-coat') === 'lor-bilayer' && (() => {
+                  const lorMat = getMaterialById(
+                    materials,
+                    step.lithography?.lorMaterialId || 'mat_pr_lor'
+                  );
+                  const lorThick = step.lithography?.lorThickness ?? 400;
+                  const lorUndercut = step.lithography?.lorUndercut ?? 350;
+                  const maxUndercutSlider = Math.max(1200, Math.round(waferWidth * 0.2));
+                  return (
+                    <div className="p-2.5 rounded-lg bg-violet-950/25 border border-violet-500/35 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className="w-2.5 h-2.5 rounded-sm shrink-0 border border-white/20"
+                            style={{ backgroundColor: lorMat?.color || '#8b5cf6' }}
+                          />
+                          <span className="text-[11px] font-semibold text-violet-300 truncate">
+                            Bilayer Stack · 1st Coat: {lorMat?.name || 'LOR Lift-Off Resist'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] font-mono text-violet-300/90 shrink-0">
+                          Total {formatThickness(lorThick + (step.lithography?.resistThickness ?? 1000), thicknessUnit)}
+                        </span>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] text-slate-300 mb-1">
+                          LOR Underlayer Thickness ({getUnitLabel(thicknessUnit)})
+                        </label>
+                        <ParametricThicknessInput
+                          valueNm={lorThick}
+                          onChangeNm={(val) =>
+                            handleUpdate({
+                              lithography: {
+                                ...step.lithography!,
+                                lorThickness: Math.max(50, val),
+                              },
+                            })
+                          }
+                          unit={thicknessUnit}
+                          minNm={50}
+                          stepNm={50}
+                          className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-violet-500"
+                          expression={step.paramBindings?.['lithography.lorThickness']}
+                          variables={variables}
+                          waferWidth={waferWidth}
+                          suggestedVarName="lor_thick"
+                          targetLabel={`${step.title} · LOR Underlayer Thickness`}
+                          onChangeExpression={(expr) => setStepParamBinding('lithography.lorThickness', expr)}
+                          onCreateVariable={onCreateVariable}
+                          onOpenVariablesModal={onOpenVariablesModal}
+                        />
+                      </div>
+
+                      <div className="space-y-1.5 pt-0.5">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-300 font-medium">
+                            LOR Lateral Undercut ({getUnitLabel(thicknessUnit)})
+                          </span>
+                          <span className="font-mono text-violet-300">
+                            {formatThickness(lorUndercut, thicknessUnit)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max={maxUndercutSlider}
+                          step="25"
+                          value={Math.min(maxUndercutSlider, lorUndercut)}
+                          onChange={(e) =>
+                            handleUpdate({
+                              lithography: {
+                                ...step.lithography!,
+                                lorUndercut: parseInt(e.target.value, 10),
+                              },
+                            })
+                          }
+                          className="w-full accent-violet-500"
+                        />
+                        <ParametricThicknessInput
+                          valueNm={lorUndercut}
+                          onChangeNm={(val) =>
+                            handleUpdate({
+                              lithography: {
+                                ...step.lithography!,
+                                lorUndercut: Math.max(0, val),
+                              },
+                            })
+                          }
+                          unit={thicknessUnit}
+                          minNm={0}
+                          stepNm={25}
+                          className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-violet-500"
+                          expression={step.paramBindings?.['lithography.lorUndercut']}
+                          variables={variables}
+                          waferWidth={waferWidth}
+                          suggestedVarName="lor_undercut"
+                          targetLabel={`${step.title} · LOR Lateral Undercut`}
+                          onChangeExpression={(expr) => setStepParamBinding('lithography.lorUndercut', expr)}
+                          onCreateVariable={onCreateVariable}
+                          onOpenVariablesModal={onOpenVariablesModal}
+                        />
+                        <div className="flex items-center justify-between gap-1">
+                          {[0, 150, 350, 600].map((val) => {
+                            const active = lorUndercut === val;
+                            return (
+                              <button
+                                key={val}
+                                type="button"
+                                onClick={() =>
+                                  handleUpdate({
+                                    lithography: {
+                                      ...step.lithography!,
+                                      lorUndercut: val,
+                                    },
+                                  })
+                                }
+                                className={`flex-1 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                                  active
+                                    ? 'bg-violet-500/20 border-violet-500/60 text-violet-200'
+                                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                                }`}
+                              >
+                                {formatThickness(val, thicknessUnit)}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[10px] text-slate-400 leading-snug">
+                          {lorUndercut === 0
+                            ? 'Flush LOR wall (0 nm undercut). Increase undercut to form a re-entrant overhang for clean metal lift-off.'
+                            : `Isotropic developer recesses LOR ${formatThickness(lorUndercut, thicknessUnit)} beneath the top imaging resist overhang.`}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {(step.lithography?.coatMethod ?? 'spin-coat') !== 'dry-film' ? (
                   <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 space-y-1.5">
                     <div className="flex items-center justify-between text-[11px]">
                       <span className="text-slate-300 font-medium">
@@ -1590,7 +1990,9 @@ export const StepEditor: React.FC<StepEditorProps> = ({
 
                   <div>
                     <label className="block text-[11px] text-slate-400 mb-1">
-                      Resist Tone (Chemistry)
+                      {(step.lithography?.coatMethod ?? 'spin-coat') === 'lor-bilayer'
+                        ? 'Top Resist Tone (2nd Coat)'
+                        : 'Resist Tone (Chemistry)'}
                     </label>
                     <select
                       value={step.lithography?.polarity || 'positive'}
@@ -1646,7 +2048,9 @@ export const StepEditor: React.FC<StepEditorProps> = ({
 
                 <div>
                   <label className="block text-[11px] text-slate-400 mb-1">
-                    Resist Thickness ({getUnitLabel(thicknessUnit)})
+                    {(step.lithography?.coatMethod ?? 'spin-coat') === 'lor-bilayer'
+                      ? `Top Imaging Resist Thickness (${getUnitLabel(thicknessUnit)})`
+                      : `Resist Thickness (${getUnitLabel(thicknessUnit)})`}
                   </label>
                   <ParametricThicknessInput
                     valueNm={step.lithography?.resistThickness ?? 1000}
@@ -2880,6 +3284,94 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                     </select>
                   </div>
                 )}
+
+                {(step.cmp?.operation || 'cmp') === 'cmp' && (() => {
+                  const dishingPct = step.cmp?.dishing ?? 0;
+                  const erosionPct = step.cmp?.erosion ?? 0;
+                  const hasNonIdeality = dishingPct > 0 || erosionPct > 0;
+                  return (
+                    <div className="pt-2.5 border-t border-slate-800 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-semibold text-cyan-300">
+                          CMP Non-Idealities (Dishing &amp; Erosion)
+                        </span>
+                        {hasNonIdeality && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleUpdate({
+                                cmp: {
+                                  ...(step.cmp || { mode: 'polish-depth', depth: 300 }),
+                                  dishing: 0,
+                                  erosion: 0,
+                                },
+                              })
+                            }
+                            className="text-[10px] font-mono text-slate-400 hover:text-cyan-300 transition-colors"
+                          >
+                            Reset 0%
+                          </button>
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                          <span>Dishing Effect</span>
+                          <span className="font-mono text-cyan-400">
+                            {dishingPct === 0 ? '0% (Ideal)' : `${dishingPct}%`}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={dishingPct}
+                          onChange={(e) =>
+                            handleUpdate({
+                              cmp: {
+                                ...(step.cmp || { mode: 'polish-depth', depth: 300 }),
+                                dishing: parseInt(e.target.value, 10),
+                              },
+                            })
+                          }
+                          className="w-full accent-cyan-500"
+                        />
+                        <p className="text-[10px] text-slate-500 leading-snug mt-0.5">
+                          Concave recess inside wider softer/inlaid features (e.g. Cu or oxide trench fills).
+                        </p>
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                          <span>Erosion Effect</span>
+                          <span className="font-mono text-cyan-400">
+                            {erosionPct === 0 ? '0% (Ideal)' : `${erosionPct}%`}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={erosionPct}
+                          onChange={(e) =>
+                            handleUpdate({
+                              cmp: {
+                                ...(step.cmp || { mode: 'polish-depth', depth: 300 }),
+                                erosion: parseInt(e.target.value, 10),
+                              },
+                            })
+                          }
+                          className="w-full accent-cyan-500"
+                        />
+                        <p className="text-[10px] text-slate-500 leading-snug mt-0.5">
+                          Pattern-density thinning of surrounding dielectric/stop areas across dense arrays.
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 

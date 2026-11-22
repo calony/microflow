@@ -19,9 +19,11 @@ import { RunSheetModal } from './components/RunSheetModal';
 import { PresetPickerModal } from './components/PresetPickerModal';
 import { MaskLevelsModal } from './components/MaskLevelsModal';
 import { VariablesModal } from './components/VariablesModal';
+import { VariantManagerModal } from './components/VariantManagerModal';
 import { AboutModal } from './components/AboutModal';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { resolveFlowParameters } from './lib/variableUtils';
+import { syncActiveVariantSnapshot } from './lib/variantUtils';
 import {
   ensureFlowMasks,
   syncStepWindowsToMask,
@@ -112,6 +114,7 @@ export default function App() {
   const [showMaskLevels, setShowMaskLevels] = useState<boolean>(false);
   const [focusMaskId, setFocusMaskId] = useState<string | undefined>(undefined);
   const [showVariables, setShowVariables] = useState<boolean>(false);
+  const [showVariantManager, setShowVariantManager] = useState<boolean>(false);
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
   const [showAbout, setShowAbout] = useState<boolean>(false);
@@ -309,12 +312,13 @@ export default function App() {
   ): ProcessFlow => {
     const prevStep = baseFlow.steps[stepIdx];
     const blockChanged = prevStep && updatedStep.blockId !== prevStep.blockId;
-    const patchedStep =
+    const syncedPatchedStep = syncActiveVariantSnapshot(
       preserveOldBlockIdForReassign && blockChanged
         ? { ...updatedStep, blockId: prevStep.blockId }
-        : updatedStep;
+        : updatedStep
+    );
     const updatedSteps = baseFlow.steps.map((s, idx) =>
-      idx === stepIdx ? patchedStep : s
+      idx === stepIdx ? syncedPatchedStep : s
     );
     let updatedFlow: ProcessFlow = { ...baseFlow, steps: updatedSteps };
     if (updatedStep.type === 'lithography') {
@@ -327,16 +331,18 @@ export default function App() {
             )
           : undefined;
         updatedFlow = validUnclaimedMask
-          ? syncStepWindowsToMask(updatedFlow, updatedStep)
-          : attachNewMaskToLithoStep(updatedFlow, updatedStep.id);
+          ? syncStepWindowsToMask(updatedFlow, syncedPatchedStep)
+          : attachNewMaskToLithoStep(updatedFlow, syncedPatchedStep.id);
       } else {
-        updatedFlow = syncStepWindowsToMask(updatedFlow, updatedStep);
+        updatedFlow = syncStepWindowsToMask(updatedFlow, syncedPatchedStep);
       }
     } else if (prevStep && prevStep.type === 'lithography' && updatedFlow.masks) {
       updatedFlow = {
         ...updatedFlow,
         masks: updatedFlow.masks.map((m) =>
-          m.assignedStepId === updatedStep.id ? { ...m, assignedStepId: undefined } : m
+          m.assignedStepId === updatedStep.id
+            ? { ...m, assignedStepId: undefined, assignedVariantId: undefined }
+            : m
         ),
       };
     }
@@ -531,6 +537,8 @@ export default function App() {
         }}
         onOpenVariables={() => setShowVariables(true)}
         variableCount={flow.variables?.length || 0}
+        onOpenVariantManager={() => setShowVariantManager(true)}
+        variantStepCount={flow.steps.filter((s) => s.variants && s.variants.length > 1).length}
         onOpenRunSheet={() => setShowRunSheet(true)}
         onOpenMultiStepView={() => setShowMultiStep(true)}
         onOpenAbout={() => setShowAbout(true)}
@@ -652,6 +660,7 @@ export default function App() {
                   variables={flow.variables || []}
                   onCreateVariable={handleCreateVariable}
                   onOpenVariablesModal={() => setShowVariables(true)}
+                  onOpenVariantManager={() => setShowVariantManager(true)}
                   onOpenMaskLevelsModal={(maskId) => {
                     setFocusMaskId(maskId);
                     setShowMaskLevels(true);
@@ -837,6 +846,8 @@ export default function App() {
           }}
           initialMaskId={focusMaskId}
           onOpenVariablesModal={() => setShowVariables(true)}
+          activeStepIndex={activeStepIndex}
+          thicknessUnit={thicknessUnit}
         />
       )}
 
@@ -846,6 +857,20 @@ export default function App() {
           isOpen={showVariables}
           onClose={() => setShowVariables(false)}
           onUpdateFlow={handleUpdateFlow}
+        />
+      )}
+
+      {showVariantManager && (
+        <VariantManagerModal
+          flow={flow}
+          isOpen={showVariantManager}
+          thicknessUnit={thicknessUnit}
+          onClose={() => setShowVariantManager(false)}
+          onUpdateFlow={handleUpdateFlow}
+          onSelectStepIndex={(idx) => {
+            setActiveStepIndex(idx);
+            setIsPlaying(false);
+          }}
         />
       )}
 
@@ -862,6 +887,7 @@ export default function App() {
           flow={flow}
           thicknessUnit={thicknessUnit}
           onSelectStepIndex={(idx) => setActiveStepIndex(idx)}
+          onUpdateFlow={handleUpdateFlow}
           onClose={() => setShowMultiStep(false)}
         />
       )}

@@ -34,7 +34,14 @@ import {
   attachNewMaskToLithoStep,
   formatMaskLevelTag,
   getNextMaskLevelNumber,
+  syncStepWindowsToMask,
 } from '../lib/maskUtils';
+import {
+  createStepVariant,
+  switchStepVariant,
+  getActiveStepVariant,
+  detachVariantsForDuplicatedStep,
+} from '../lib/variantUtils';
 import { getEtchRecipeById, formatDurationCompact } from '../lib/etchRates';
 import { getDefaultStepTitle } from '../lib/stepDefaults';
 import { ThicknessUnit, formatThickness } from '../lib/units';
@@ -73,6 +80,7 @@ import {
   CheckSquare,
   Square,
   Minus,
+  GitBranch,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -235,7 +243,11 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       step.deposition?.method || '',
       step.lithography?.maskName || '',
       step.lithography?.polarity || '',
-      step.lithography?.coatMethod === 'dry-film' ? 'dry film lamination' : '',
+      step.lithography?.coatMethod === 'dry-film'
+        ? 'dry film lamination'
+        : step.lithography?.coatMethod === 'lor-bilayer'
+        ? 'lor bilayer double coat undercut lift-off'
+        : '',
       step.etch?.etchType || '',
       step.etch?.etchRecipeId
         ? (() => {
@@ -250,6 +262,9 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       step.dicing?.method || '',
       step.dicing ? `dicing kerf ${step.dicing.cutMode}` : '',
       step.tapeFrame ? `tape frame ${step.tapeFrame.action}` : '',
+      step.variants && step.variants.length > 1
+        ? `variant ${step.variants.map((v) => `${v.name} ${v.title}`).join(' ')}`
+        : '',
       block?.name || '',
       block?.description || '',
     ]
@@ -488,6 +503,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             operation: 'cmp',
             mode: 'polish-depth',
             depth: 250,
+            dishing: 0,
+            erosion: 0,
           },
         };
         break;
@@ -603,13 +620,14 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   const handleDuplicateStep = (idx: number) => {
     const original = flow.steps[idx];
     const now = Date.now();
-    const cloned: ProcessStep = {
+    const clonedBase: ProcessStep = {
       ...JSON.parse(JSON.stringify(original)),
       id: `step_${now}`,
       title: `${original.title} (Copy)`,
       bookmarked: undefined,
       bookmarkLabel: undefined,
     };
+    const cloned = detachVariantsForDuplicatedStep(clonedBase, now);
 
     let dupMaskNameOverride: string | undefined;
     if (cloned.type === 'lithography' && cloned.lithography) {
@@ -666,6 +684,31 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
       i === idx ? { ...s, enabled: !s.enabled } : s
     );
     onUpdateFlow({ ...flow, steps: updated });
+  };
+
+  const handleSwitchStepVariant = (stepId: string, targetVariantId: string) => {
+    const targetStep = flow.steps.find((s) => s.id === stepId);
+    if (!targetStep) return;
+    const switched = switchStepVariant(targetStep, targetVariantId);
+    let nextFlow: ProcessFlow = {
+      ...flow,
+      steps: flow.steps.map((s) => (s.id === stepId ? switched : s)),
+    };
+    if (switched.type === 'lithography') {
+      nextFlow = syncStepWindowsToMask(nextFlow, switched);
+    }
+    onUpdateFlow(nextFlow);
+  };
+
+  const handleBranchStepVariant = (idx: number) => {
+    const targetStep = flow.steps[idx];
+    if (!targetStep) return;
+    const branched = createStepVariant(targetStep);
+    onUpdateFlow({
+      ...flow,
+      steps: flow.steps.map((s, i) => (i === idx ? branched : s)),
+    });
+    onSelectStepIndex(idx);
   };
 
   // Block management handlers
@@ -1207,7 +1250,11 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                   )}`}
                 {step.type === 'lithography' &&
                   `${
-                    step.lithography?.coatMethod === 'dry-film' ? 'dry film · ' : ''
+                    step.lithography?.coatMethod === 'dry-film'
+                      ? 'dry film · '
+                      : step.lithography?.coatMethod === 'lor-bilayer'
+                      ? `LOR (${formatThickness(step.lithography?.lorUndercut ?? 350, thicknessUnit)} UC) · `
+                      : ''
                   }${step.lithography?.polarity || 'pos'} · ${
                     step.lithography?.maskField === 'light-field' ? 'LF' : 'DF'
                   } · ${
@@ -1260,6 +1307,35 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
                       )}`)}
                 {step.type === 'anneal' && 'Thermal Anneal'}
               </div>
+
+              {/* Inline Step Variant Switcher */}
+              {step.variants && step.variants.length > 1 && (() => {
+                const activeVar = getActiveStepVariant(step);
+                return (
+                  <div
+                    className="mt-1.5 flex items-center gap-1.5"
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                  >
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/35 text-[9.5px] font-mono text-violet-300 shrink-0">
+                      <GitBranch className="w-2.5 h-2.5 text-violet-400" />
+                      <span>{step.variants.length}</span>
+                    </span>
+                    <select
+                      value={activeVar?.id || step.variants[0].id}
+                      onChange={(e) => handleSwitchStepVariant(step.id, e.target.value)}
+                      aria-label={`Select variant for ${step.title}`}
+                      className="min-w-0 flex-1 bg-slate-950/85 hover:bg-slate-800/90 border border-violet-500/35 focus:border-violet-400 rounded px-1.5 py-0.5 text-[10.5px] font-medium text-violet-200 truncate focus:outline-none cursor-pointer"
+                    >
+                      {step.variants.map((v) => (
+                        <option key={v.id} value={v.id} className="bg-slate-900 text-slate-100">
+                          {v.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -1319,6 +1395,17 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               }
             >
               <ArrowDown className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => handleBranchStepVariant(globalIdx)}
+              className={`p-1 rounded hover:bg-slate-700/80 transition-colors ${
+                step.variants && step.variants.length > 1
+                  ? 'text-violet-400 hover:text-violet-300'
+                  : 'text-slate-400 hover:text-violet-300'
+              }`}
+              title="Add Parameter Variant"
+            >
+              <GitBranch className="w-3.5 h-3.5" />
             </button>
             <button
               onClick={() => handleDuplicateStep(globalIdx)}

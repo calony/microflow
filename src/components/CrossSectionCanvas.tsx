@@ -15,6 +15,11 @@ import { SvgPatterns } from './SvgPatterns';
 import { getMaterialById } from '../lib/materials';
 import { ThicknessUnit, formatThickness } from '../lib/units';
 import {
+  sampleStackAtX,
+  STACK_PROBE_COLORS,
+  StackProbeSample,
+} from '../lib/stackProbeUtils';
+import {
   ZoomIn,
   ZoomOut,
   Maximize2,
@@ -34,7 +39,19 @@ import {
   Square,
   Axis3d,
   Magnet,
+  GripVertical,
+  RotateCcw,
+  Crosshair,
+  Plus,
+  Trash2,
+  Copy,
+  Check,
 } from 'lucide-react';
+
+interface StackProbePoint {
+  id: string;
+  xNm: number;
+}
 
 interface InsetStepOption {
   stepIndex: number;
@@ -174,6 +191,22 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   const [renderMode, setRenderMode] = useState<'hatch' | 'solid'>('hatch');
   const [showLegend, setShowLegend] = useState<boolean>(true);
   const [insetExpanded, setInsetExpanded] = useState<boolean>(false);
+  const [stackProbeMode, setStackProbeMode] = useState<boolean>(false);
+  const [stackProbes, setStackProbes] = useState<StackProbePoint[]>([]);
+  const [draggingProbeId, setDraggingProbeId] = useState<string | null>(null);
+  const [manualProbeXUm, setManualProbeXUm] = useState<string>('');
+  const [stackCopied, setStackCopied] = useState<boolean>(false);
+  const stackCopyTimerRef = useRef<number | null>(null);
+  const insetRef = useRef<HTMLDivElement>(null);
+  const [insetPos, setInsetPos] = useState<{ x: number; y: number } | null>(null);
+  const [insetDrag, setInsetDrag] = useState<{
+    startClientX: number;
+    startClientY: number;
+    initialX: number;
+    initialY: number;
+    width: number;
+    height: number;
+  } | null>(null);
 
   const legendMaterials = useMemo(() => {
     const seen = new Set<string>();
@@ -593,10 +626,21 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     topPadding,
   ]);
 
-  // Reset viewport lock when switching to a different flow preset or changing wafer width
+  // Reset viewport lock and probes when switching to a different flow preset or changing wafer width
   useEffect(() => {
     setLockedMetrics(null);
-  }, [flowId, waferWidth]);
+    setStackProbes([]);
+  }, [flowId]);
+
+  useEffect(() => {
+    setLockedMetrics(null);
+    setStackProbes((prev) =>
+      prev.map((p) => ({
+        ...p,
+        xNm: Math.max(0, Math.min(waferWidth, p.xNm)),
+      }))
+    );
+  }, [waferWidth]);
 
   // Keep the inspected center feature anchored when container resizes (e.g. MaskEditor mounting on litho steps)
   const prevSvgSizeRef = useRef<{ width: number; height: number }>({
@@ -725,12 +769,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         } else if (measureMode) {
           setMeasureMode(false);
           setMeasurePoints([]);
+        } else if (stackProbeMode) {
+          setStackProbeMode(false);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fitToScreen, zoomSelection, regionZoomMode, measureMode]);
+  }, [fitToScreen, zoomSelection, regionZoomMode, measureMode, stackProbeMode]);
 
   useEffect(() => {
     const syncModifiers = (e: KeyboardEvent) => {
@@ -801,6 +847,163 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       window.removeEventListener('pointercancel', handleWindowPointerUp);
     };
   }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight, ctrlKeyDown]);
+
+  // Drag floating step inset smoothly inside the cross-section viewport
+  useEffect(() => {
+    if (!insetDrag) return;
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      const dx = e.clientX - insetDrag.startClientX;
+      const dy = e.clientY - insetDrag.startClientY;
+      const maxX = Math.max(8, containerSize.width - insetDrag.width - 8);
+      const maxY = Math.max(8, containerSize.height - insetDrag.height - 8);
+      setInsetPos({
+        x: Math.max(8, Math.min(maxX, insetDrag.initialX + dx)),
+        y: Math.max(8, Math.min(maxY, insetDrag.initialY + dy)),
+      });
+    };
+    const handleWindowPointerUp = () => {
+      setInsetDrag(null);
+    };
+    window.addEventListener('pointermove', handleWindowPointerMove);
+    window.addEventListener('pointerup', handleWindowPointerUp);
+    window.addEventListener('pointercancel', handleWindowPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', handleWindowPointerUp);
+      window.removeEventListener('pointercancel', handleWindowPointerUp);
+    };
+  }, [insetDrag, containerSize.width, containerSize.height]);
+
+  // Keep moved inset inside canvas bounds when container resizes or inset expands/compacts
+  useEffect(() => {
+    if (!insetPos || !insetRef.current) return;
+    const w = insetRef.current.offsetWidth || (insetExpanded ? 320 : 240);
+    const h = insetRef.current.offsetHeight || 180;
+    const maxX = Math.max(8, containerSize.width - w - 8);
+    const maxY = Math.max(8, containerSize.height - h - 8);
+    const clampedX = Math.max(8, Math.min(maxX, insetPos.x));
+    const clampedY = Math.max(8, Math.min(maxY, insetPos.y));
+    if (clampedX !== insetPos.x || clampedY !== insetPos.y) {
+      setInsetPos({ x: clampedX, y: clampedY });
+    }
+  }, [insetPos, insetExpanded, containerSize.width, containerSize.height]);
+
+  const startInsetDrag = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.stopPropagation();
+    const containerEl = containerRef.current;
+    const insetEl = insetRef.current;
+    if (!containerEl || !insetEl) return;
+    const containerRect = containerEl.getBoundingClientRect();
+    const insetRect = insetEl.getBoundingClientRect();
+    const initialX = insetRect.left - containerRect.left;
+    const initialY = insetRect.top - containerRect.top;
+    setInsetPos({ x: initialX, y: initialY });
+    setInsetDrag({
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      initialX,
+      initialY,
+      width: insetRect.width,
+      height: insetRect.height,
+    });
+  }, []);
+
+  // Drag vertical stack probe pins smoothly horizontally along the wafer
+  useEffect(() => {
+    if (!draggingProbeId) return;
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      const svgP = clientToSvg(e.clientX, e.clientY);
+      if (!svgP) return;
+      const unscaledX = (svgP.x - pan.x) / zoom;
+      const unscaledY = (svgP.y - pan.y) / zoom;
+      const worldPt = toWorld(unscaledX, unscaledY);
+      const nextX = Math.max(0, Math.min(waferWidth, Math.round(worldPt.x)));
+      setStackProbes((prev) =>
+        prev.map((p) => (p.id === draggingProbeId ? { ...p, xNm: nextX } : p))
+      );
+    };
+    const handleWindowPointerUp = () => {
+      setDraggingProbeId(null);
+    };
+    window.addEventListener('pointermove', handleWindowPointerMove);
+    window.addEventListener('pointerup', handleWindowPointerUp);
+    window.addEventListener('pointercancel', handleWindowPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', handleWindowPointerUp);
+      window.removeEventListener('pointercancel', handleWindowPointerUp);
+    };
+  }, [draggingProbeId, clientToSvg, pan.x, pan.y, zoom, toWorld, waferWidth]);
+
+  const probedStacks = useMemo(
+    () =>
+      stackProbes.map((probe, idx) => ({
+        probe,
+        label: `P${idx + 1}`,
+        color: STACK_PROBE_COLORS[idx % STACK_PROBE_COLORS.length],
+        sample: sampleStackAtX(mesh, materials, probe.xNm),
+      })),
+    [stackProbes, mesh, materials]
+  );
+
+  const liveHoverStack: StackProbeSample | null = useMemo(() => {
+    if (!stackProbeMode || !hoverWorldPos || draggingProbeId) return null;
+    return sampleStackAtX(mesh, materials, hoverWorldPos.x);
+  }, [stackProbeMode, hoverWorldPos, draggingProbeId, mesh, materials]);
+
+  const handleSampleThreeLocations = useCallback(() => {
+    const stamp = Date.now();
+    const fracs = [0.15, 0.5, 0.85];
+    setStackProbes(
+      fracs.map((f, i) => ({
+        id: `probe_${stamp}_${i}`,
+        xNm: Math.round(waferWidth * f),
+      }))
+    );
+  }, [waferWidth]);
+
+  const handleAddManualProbe = useCallback(() => {
+    const parsedUm = parseFloat(manualProbeXUm);
+    if (!Number.isFinite(parsedUm)) return;
+    const xNm = Math.max(0, Math.min(waferWidth, Math.round(parsedUm * 1000)));
+    setStackProbes((prev) => [
+      ...prev,
+      { id: `probe_${Date.now()}_${prev.length}`, xNm },
+    ]);
+    setManualProbeXUm('');
+  }, [manualProbeXUm, waferWidth]);
+
+  const handleCopyStackSummary = useCallback(() => {
+    if (probedStacks.length === 0) return;
+    const lines: string[] = [
+      `Wafer Cross-Section Stack Thickness (${stepNumber === 0 ? 'Substrate' : `Step ${stepNumber}/${totalSteps}`}${activeStepTitle ? ` - ${activeStepTitle}` : ''})`,
+      'Probe,X_um,Total_Stack,Overlayer_Stack,Surface_Top_Z,Layers_Top_to_Bottom',
+    ];
+    probedStacks.forEach(({ label, probe, sample }) => {
+      const layersStr = sample.layersTopToBottom
+        .map((l) => `${l.materialName}: ${formatThickness(l.thicknessNm, thicknessUnit)}`)
+        .join(' | ');
+      lines.push(
+        `${label},${(probe.xNm / 1000).toFixed(3)},${formatThickness(
+          sample.totalMaterialThicknessNm,
+          thicknessUnit
+        )},${
+          sample.hasSubstrateLayers && sample.hasOverlayers
+            ? formatThickness(sample.overlayerThicknessNm, thicknessUnit)
+            : '-'
+        },${formatThickness(sample.surfaceTopY - sample.stackBottomY, thicknessUnit)},"${layersStr}"`
+      );
+    });
+    navigator.clipboard?.writeText(lines.join('\n')).catch(() => {});
+    setStackCopied(true);
+    if (stackCopyTimerRef.current) {
+      window.clearTimeout(stackCopyTimerRef.current);
+    }
+    stackCopyTimerRef.current = window.setTimeout(() => {
+      setStackCopied(false);
+    }, 1800);
+  }, [probedStacks, stepNumber, totalSteps, activeStepTitle, thicknessUnit]);
 
   // Prevent mobile browser page pinch-zoom inside the SVG viewport so custom canvas pinch-zoom works
   useEffect(() => {
@@ -898,6 +1101,25 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       } else {
         setMeasurePoints([basePt]);
       }
+      return;
+    }
+
+    if (stackProbeMode && svgP) {
+      const clickX = (svgP.x - pan.x) / zoom;
+      const clickY = (svgP.y - pan.y) / zoom;
+      const hitThreshold = 10 / Math.max(0.12, zoom);
+      const hitProbe = stackProbes.find(
+        (p) => Math.abs(toScreen(p.xNm, 0).x - clickX) <= hitThreshold
+      );
+      if (hitProbe) {
+        setDraggingProbeId(hitProbe.id);
+        return;
+      }
+      const worldPt = toWorld(clickX, clickY);
+      const xNm = Math.max(0, Math.min(waferWidth, Math.round(worldPt.x)));
+      const newId = `probe_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      setStackProbes((prev) => [...prev, { id: newId, xNm }]);
+      setDraggingProbeId(newId);
       return;
     }
 
@@ -1073,6 +1295,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 setZoomSelection(null);
                 if (next) {
                   setMeasureMode(false);
+                  setStackProbeMode(false);
                 }
               }}
               className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all font-medium text-[11px] ${
@@ -1226,6 +1449,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 if (next) {
                   setRegionZoomMode(false);
                   setZoomSelection(null);
+                  setStackProbeMode(false);
                 }
               }}
               className={`flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors ${
@@ -1260,6 +1484,37 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             </button>
           </div>
 
+          {/* Stack Thickness Multi-Location Probe */}
+          <button
+            type="button"
+            onClick={() => {
+              const next = !stackProbeMode;
+              setStackProbeMode(next);
+              if (next) {
+                setRegionZoomMode(false);
+                setZoomSelection(null);
+                setMeasureMode(false);
+              }
+            }}
+            aria-pressed={stackProbeMode}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              stackProbeMode
+                ? 'bg-cyan-500/20 border-cyan-500/60 text-cyan-200 shadow-sm'
+                : stackProbes.length > 0
+                ? 'bg-slate-800 border-cyan-500/40 text-cyan-300 hover:bg-slate-700'
+                : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700'
+            }`}
+            title="Stack Thickness Probe: Click across the cross-section to inspect layer-by-layer stack thickness at multiple locations"
+          >
+            <Crosshair className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Stack</span>
+            {stackProbes.length > 0 && (
+              <span className="px-1 rounded bg-cyan-500/25 text-cyan-200 font-mono text-[10px]">
+                {stackProbes.length}
+              </span>
+            )}
+          </button>
+
           {/* Export SVG */}
           <button
             onClick={handleExportSingleSvg}
@@ -1285,16 +1540,19 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         </div>
       </div>
 
-      {/* Main SVG Cross-Section Viewport */}
+      {/* Main SVG Cross-Section Viewport + Optional Stack Thickness Drawer */}
+      <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden">
       <div
         ref={containerRef}
         onWheel={handleWheel}
-        className={`relative flex-1 min-h-0 w-full overflow-hidden bg-[#060a12] touch-none ${
+        className={`relative flex-1 min-h-0 min-w-0 overflow-hidden bg-[#060a12] touch-none ${
           regionZoomMode
             ? ctrlKeyDown
               ? 'cursor-zoom-out'
               : 'cursor-zoom-in'
-            : measureMode
+            : draggingProbeId
+            ? 'cursor-ew-resize'
+            : measureMode || stackProbeMode
             ? 'cursor-crosshair'
             : isPanning
             ? 'cursor-grabbing'
@@ -1730,6 +1988,155 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 </g>
               );
             })()}
+
+            {/* Vertical Stack Thickness Probes & Live Laser Cursor */}
+            {(probedStacks.length > 0 || (stackProbeMode && liveHoverStack)) && (() => {
+              const invZ = 1 / Math.max(0.12, zoom);
+              const lineTopY = toScreen(0, rawMaxY).y - 26 * invZ;
+              const lineBotY = toScreen(0, rawMinY).y + 12 * invZ;
+
+              return (
+                <g>
+                  {/* Live hover guide when Stack Probe Mode is active */}
+                  {stackProbeMode && liveHoverStack && (() => {
+                    const sx = toScreen(liveHoverStack.xNm, 0).x;
+                    const labelTxt = `${(liveHoverStack.xNm / 1000).toFixed(2)} µm · ${formatThickness(
+                      liveHoverStack.totalMaterialThicknessNm,
+                      thicknessUnit
+                    )}`;
+                    const boxW = Math.max(122, labelTxt.length * 6 + 14) * invZ;
+                    return (
+                      <g pointerEvents="none" opacity={0.85}>
+                        <line
+                          x1={sx}
+                          y1={lineTopY}
+                          x2={sx}
+                          y2={lineBotY}
+                          stroke="#22d3ee"
+                          strokeWidth={1.3 * invZ}
+                          strokeDasharray={`${4 * invZ} ${3 * invZ}`}
+                        />
+                        {liveHoverStack.layersTopToBottom.map((layer, lIdx) => {
+                          if (layer.kind !== 'material') return null;
+                          const ptTop = toScreen(liveHoverStack.xNm, layer.yTop);
+                          const ptBot = toScreen(liveHoverStack.xNm, layer.yBottom);
+                          return (
+                            <g key={`live_tick_${lIdx}`}>
+                              <circle cx={sx} cy={ptTop.y} r={2.2 * invZ} fill="#22d3ee" />
+                              <circle cx={sx} cy={ptBot.y} r={2.2 * invZ} fill="#22d3ee" />
+                            </g>
+                          );
+                        })}
+                        <rect
+                          x={sx - boxW / 2}
+                          y={lineTopY - 20 * invZ}
+                          width={boxW}
+                          height={17 * invZ}
+                          rx={4 * invZ}
+                          fill="#082f49"
+                          fillOpacity="0.92"
+                          stroke="#22d3ee"
+                          strokeWidth={1 * invZ}
+                        />
+                        <text
+                          x={sx}
+                          y={lineTopY - 8.5 * invZ}
+                          fill="#cffafe"
+                          fontSize={9 * invZ}
+                          fontWeight="600"
+                          fontFamily="JetBrains Mono, monospace"
+                          textAnchor="middle"
+                        >
+                          {labelTxt}
+                        </text>
+                      </g>
+                    );
+                  })()}
+
+                  {/* Pinned multi-location probes */}
+                  {probedStacks.map(({ probe, label, color, sample }) => {
+                    const sx = toScreen(probe.xNm, 0).x;
+                    const badgeTxt = `${label} · ${formatThickness(
+                      sample.totalMaterialThicknessNm,
+                      thicknessUnit
+                    )}`;
+                    const pillW = Math.max(76, badgeTxt.length * 6 + 16) * invZ;
+                    const pillH = 18 * invZ;
+                    return (
+                      <g key={probe.id}>
+                        <line
+                          x1={sx}
+                          y1={lineTopY}
+                          x2={sx}
+                          y2={lineBotY}
+                          stroke={color}
+                          strokeWidth={1.8 * invZ}
+                          strokeDasharray={`${5 * invZ} ${3 * invZ}`}
+                          pointerEvents="none"
+                        />
+                        {sample.layersTopToBottom.map((layer, lIdx) => {
+                          if (layer.kind !== 'material') return null;
+                          const yTopPx = toScreen(probe.xNm, layer.yTop).y;
+                          const yBotPx = toScreen(probe.xNm, layer.yBottom).y;
+                          return (
+                            <g key={`${probe.id}_tick_${lIdx}`} pointerEvents="none">
+                              <line
+                                x1={sx - 5 * invZ}
+                                y1={yTopPx}
+                                x2={sx + 5 * invZ}
+                                y2={yTopPx}
+                                stroke={color}
+                                strokeWidth={1.5 * invZ}
+                              />
+                              <line
+                                x1={sx - 5 * invZ}
+                                y1={yBotPx}
+                                x2={sx + 5 * invZ}
+                                y2={yBotPx}
+                                stroke={color}
+                                strokeWidth={1.5 * invZ}
+                              />
+                            </g>
+                          );
+                        })}
+                        {/* Draggable top pin handle */}
+                        <g
+                          style={{ cursor: 'ew-resize' }}
+                          onPointerDown={(e) => {
+                            if (e.pointerType === 'mouse' && e.button !== 0) return;
+                            e.stopPropagation();
+                            setDraggingProbeId(probe.id);
+                          }}
+                        >
+                          <rect
+                            x={sx - pillW / 2}
+                            y={lineTopY - pillH - 2 * invZ}
+                            width={pillW}
+                            height={pillH}
+                            rx={4.5 * invZ}
+                            fill="#0f172a"
+                            fillOpacity="0.95"
+                            stroke={color}
+                            strokeWidth={1.3 * invZ}
+                          />
+                          <text
+                            x={sx}
+                            y={lineTopY - 7.5 * invZ}
+                            fill={color}
+                            fontSize={9.5 * invZ}
+                            fontWeight="700"
+                            fontFamily="JetBrains Mono, monospace"
+                            textAnchor="middle"
+                          >
+                            {badgeTxt}
+                          </text>
+                        </g>
+                      </g>
+                    );
+                  })}
+                </g>
+              );
+            })()}
           </g>
 
           {/* Magnifying Glass Region Selection Marquee (Screen / Viewport coordinates) */}
@@ -2092,17 +2499,39 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
             return (
               <div
+                ref={insetRef}
                 onPointerDown={(e) => e.stopPropagation()}
                 onWheel={(e) => e.stopPropagation()}
-                className={`absolute top-3 right-3 z-20 flex flex-col bg-slate-900/92 backdrop-blur-md border border-emerald-500/40 rounded-xl shadow-2xl overflow-hidden transition-all ${
+                style={
+                  insetPos
+                    ? { left: `${insetPos.x}px`, top: `${insetPos.y}px` }
+                    : undefined
+                }
+                className={`absolute z-20 flex flex-col bg-slate-900/92 backdrop-blur-md border border-emerald-500/40 rounded-xl shadow-2xl overflow-hidden ${
+                  insetPos ? '' : 'top-3 right-3'
+                } ${
+                  insetDrag
+                    ? 'ring-2 ring-emerald-400/50 select-none'
+                    : insetPos
+                    ? ''
+                    : 'transition-[width] duration-150'
+                } ${
                   insetExpanded
                     ? 'w-72 sm:w-96'
                     : 'w-52 sm:w-64'
                 }`}
               >
-                {/* Inset Header */}
-                <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 bg-slate-950/85 border-b border-slate-800 text-[11px]">
-                  <div className="flex items-center gap-1.5 min-w-0">
+                {/* Inset Header (Drag Handle) */}
+                <div
+                  onPointerDown={startInsetDrag}
+                  onDoubleClick={() => setInsetPos(null)}
+                  title="Drag to move inset (double-click to reset position)"
+                  className={`flex items-center justify-between gap-1.5 px-2 py-1.5 bg-slate-950/85 border-b border-slate-800 text-[11px] select-none touch-none ${
+                    insetDrag ? 'cursor-grabbing' : 'cursor-grab'
+                  }`}
+                >
+                  <div className="flex items-center gap-1 min-w-0">
+                    <GripVertical className="w-3 h-3 text-slate-500 shrink-0" />
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
                     <span
                       className={`px-1 py-0.5 rounded font-mono text-[9px] font-semibold shrink-0 border ${
@@ -2122,7 +2551,21 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-0.5 shrink-0">
+                  <div
+                    className="flex items-center gap-0.5 shrink-0"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                  >
+                    {insetPos && (
+                      <button
+                        type="button"
+                        onClick={() => setInsetPos(null)}
+                        className="p-1 rounded text-slate-400 hover:text-emerald-300 hover:bg-slate-800 transition-colors"
+                        title="Reset inset to top-right corner"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                      </button>
+                    )}
                     {onSelectFinalStep && (
                       <button
                         type="button"
@@ -2211,9 +2654,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   </div>
                 )}
 
-                {/* Inset Mini Cross-Section SVG */}
+                {/* Inset Mini Cross-Section SVG (also draggable) */}
                 <div
-                  className={`relative w-full bg-[#060a12] ${
+                  onPointerDown={startInsetDrag}
+                  onDoubleClick={() => setInsetPos(null)}
+                  title="Drag to move inset (double-click to reset position)"
+                  className={`relative w-full bg-[#060a12] select-none touch-none ${
+                    insetDrag ? 'cursor-grabbing' : 'cursor-grab'
+                  } ${
                     insetExpanded ? 'h-44 sm:h-52' : 'h-28 sm:h-36'
                   }`}
                 >
@@ -2325,6 +2773,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
               setZoomSelection(null);
               if (next) {
                 setMeasureMode(false);
+                setStackProbeMode(false);
               }
             }}
             className={`p-1.5 rounded-lg transition-colors ${
@@ -2354,7 +2803,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         </div>
 
         {/* Hover Layer Inspector Tooltip */}
-        {hoveredPolygon && !zoomSelection && !measureMode && (
+        {hoveredPolygon && !zoomSelection && !measureMode && !stackProbeMode && !draggingProbeId && (
           <div
             className="absolute pointer-events-none z-20 px-3 py-2 rounded-xl bg-slate-900/95 border border-sky-500/50 text-white shadow-2xl backdrop-blur-md"
             style={{
@@ -2404,6 +2853,336 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             })()}
           </div>
         )}
+      </div>
+
+      {/* Stack Thickness Multi-Location Inspector Drawer */}
+      {stackProbeMode && (
+        <aside
+          onPointerDown={(e) => e.stopPropagation()}
+          className="w-full md:w-80 lg:w-96 max-h-[46%] md:max-h-none flex flex-col border-t md:border-t-0 md:border-l border-slate-800 bg-slate-900/95 shrink-0 min-h-0"
+        >
+          {/* Drawer Header */}
+          <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-800 bg-slate-950/75 shrink-0">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Crosshair className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-100 truncate">
+                Stack Thickness
+              </span>
+              {probedStacks.length > 0 && (
+                <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 font-mono text-[10px] shrink-0">
+                  {probedStacks.length}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={handleSampleThreeLocations}
+                className="px-1.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-200 transition-colors"
+                title="Drop 3 probes across the wafer (15%, 50%, 85%)"
+              >
+                L / C / R
+              </button>
+              {probedStacks.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleCopyStackSummary}
+                    className="flex items-center gap-1 px-1.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-medium text-slate-200 transition-colors"
+                    title="Copy multi-location stack table (CSV)"
+                  >
+                    {stackCopied ? (
+                      <Check className="w-3 h-3 text-emerald-400" />
+                    ) : (
+                      <Copy className="w-3 h-3" />
+                    )}
+                    <span>{stackCopied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStackProbes([])}
+                    className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-slate-800 transition-colors"
+                    title="Clear all probe locations"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setStackProbeMode(false)}
+                className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                title="Close Stack Thickness Panel (Esc)"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Live Cursor Readout */}
+          <div className="px-3 py-2 border-b border-slate-800 bg-slate-950/50 shrink-0">
+            {liveHoverStack ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-mono font-semibold text-cyan-300">
+                    Cursor X = {(liveHoverStack.xNm / 1000).toFixed(2)} µm
+                  </span>
+                  <span className="font-mono font-bold text-white">
+                    Total: {formatThickness(liveHoverStack.totalMaterialThicknessNm, thicknessUnit)}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] font-mono text-slate-400">
+                  {liveHoverStack.hasSubstrateLayers && liveHoverStack.hasOverlayers && (
+                    <span>
+                      Films (excl. Sub):{' '}
+                      <strong className="text-sky-300">
+                        {formatThickness(liveHoverStack.overlayerThicknessNm, thicknessUnit)}
+                      </strong>
+                    </span>
+                  )}
+                  <span>
+                    Top Z:{' '}
+                    <strong className="text-slate-200">
+                      {formatThickness(
+                        liveHoverStack.surfaceTopY - liveHoverStack.stackBottomY,
+                        thicknessUnit
+                      )}
+                    </strong>
+                  </span>
+                  <span>Layers: {liveHoverStack.layersTopToBottom.filter((l) => l.kind === 'material').length}</span>
+                </div>
+                {probedStacks.length === 0 && liveHoverStack.layersTopToBottom.length > 0 && (
+                  <div className="pt-1 space-y-0.5 max-h-28 overflow-y-auto pr-1">
+                    {liveHoverStack.layersTopToBottom.map((layer, lIdx) => (
+                      <div
+                        key={`live_layer_${lIdx}`}
+                        className="flex items-center justify-between gap-2 text-[10px]"
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className={`w-2 h-2 rounded-xs shrink-0 ${
+                              layer.kind === 'gap'
+                                ? 'border border-dashed border-slate-400 bg-transparent'
+                                : 'border border-white/15'
+                            }`}
+                            style={
+                              layer.kind === 'material'
+                                ? { backgroundColor: layer.materialColor }
+                                : undefined
+                            }
+                          />
+                          <span className="truncate text-slate-300">{layer.materialName}</span>
+                        </div>
+                        <span className="font-mono text-slate-200 shrink-0">
+                          {formatThickness(layer.thicknessNm, thicknessUnit)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-[11px] text-slate-400">
+                Click anywhere on the cross-section to pin a location, or hover to inspect live stack thickness. Drag pins horizontally to compare sites.
+              </p>
+            )}
+          </div>
+
+          {/* Pinned Locations List */}
+          <div className="flex-1 overflow-y-auto p-2.5 space-y-2.5 min-h-0">
+            {probedStacks.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-800 bg-slate-950/50 p-4 text-center space-y-2">
+                <p className="text-xs font-medium text-slate-300">No pinned locations yet</p>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Click different regions on the wafer (e.g. trench, mesa, field oxide) or use{' '}
+                  <span className="text-slate-300 font-medium">L / C / R</span> above to compare layer thicknesses side-by-side.
+                </p>
+              </div>
+            ) : (
+              probedStacks.map(({ probe, label, color, sample }, idx) => {
+                const baseline = idx > 0 ? probedStacks[0].sample : null;
+                const deltaTopNm = baseline
+                  ? Math.round(
+                      (sample.surfaceTopY - sample.stackBottomY) -
+                        (baseline.surfaceTopY - baseline.stackBottomY)
+                    )
+                  : null;
+                const deltaStackNm = baseline
+                  ? Math.round(sample.totalMaterialThicknessNm - baseline.totalMaterialThicknessNm)
+                  : null;
+
+                return (
+                  <div
+                    key={probe.id}
+                    className="rounded-xl border border-slate-800 bg-slate-950/85 overflow-hidden shadow-sm"
+                  >
+                    {/* Location Header */}
+                    <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 bg-slate-900/90 border-b border-slate-800">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span
+                          className="px-1.5 py-0.5 rounded font-mono text-[10px] font-bold shrink-0 border"
+                          style={{
+                            color,
+                            borderColor: `${color}55`,
+                            backgroundColor: `${color}1a`,
+                          }}
+                        >
+                          {label}
+                        </span>
+                        <label className="flex items-center gap-1 text-[10px] text-slate-400 font-mono">
+                          <span>X:</span>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min={0}
+                            max={Number((waferWidth / 1000).toFixed(3))}
+                            value={Number((probe.xNm / 1000).toFixed(2))}
+                            onChange={(e) => {
+                              const vUm = parseFloat(e.target.value);
+                              if (!Number.isFinite(vUm)) return;
+                              const clamped = Math.max(
+                                0,
+                                Math.min(waferWidth, Math.round(vUm * 1000))
+                              );
+                              setStackProbes((prev) =>
+                                prev.map((p) => (p.id === probe.id ? { ...p, xNm: clamped } : p))
+                              );
+                            }}
+                            className="w-16 bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded px-1.5 py-0.5 text-[11px] font-mono text-slate-100 focus:outline-none"
+                          />
+                          <span>µm</span>
+                        </label>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setStackProbes((prev) => prev.filter((p) => p.id !== probe.id))
+                        }
+                        className="p-1 rounded text-slate-500 hover:text-rose-300 hover:bg-slate-800 transition-colors shrink-0"
+                        title={`Remove ${label}`}
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+
+                    {/* Stack Totals & Delta vs P1 */}
+                    <div className="px-2.5 py-1.5 bg-slate-950/60 border-b border-slate-800/70 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[10px] font-mono">
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-slate-400">
+                          Total:{' '}
+                          <strong className="text-white text-[11px]">
+                            {formatThickness(sample.totalMaterialThicknessNm, thicknessUnit)}
+                          </strong>
+                        </span>
+                        {sample.hasSubstrateLayers && sample.hasOverlayers && (
+                          <span className="text-slate-400">
+                            Films:{' '}
+                            <strong className="text-sky-300">
+                              {formatThickness(sample.overlayerThicknessNm, thicknessUnit)}
+                            </strong>
+                          </span>
+                        )}
+                      </div>
+                      {deltaTopNm !== null && deltaStackNm !== null && (
+                        <span
+                          className="text-amber-300/90"
+                          title={`Difference vs P1: Surface ΔZ ${deltaTopNm >= 0 ? '+' : ''}${formatThickness(deltaTopNm, thicknessUnit)}, Total Stack ${deltaStackNm >= 0 ? '+' : ''}${formatThickness(deltaStackNm, thicknessUnit)}`}
+                        >
+                          ΔP1: {deltaTopNm >= 0 ? '+' : '-'}
+                          {formatThickness(Math.abs(deltaTopNm), thicknessUnit)}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Layer-by-Layer Stack Breakdown (Top -> Bottom) */}
+                    <div className="divide-y divide-slate-800/50">
+                      {sample.layersTopToBottom.length === 0 ? (
+                        <div className="px-2.5 py-2 text-[10px] text-slate-500 italic">
+                          No material at this X coordinate (etched/diced trench)
+                        </div>
+                      ) : (
+                        sample.layersTopToBottom.map((layer, lIdx) => (
+                          <div
+                            key={`${probe.id}_layer_${lIdx}`}
+                            className={`flex items-center justify-between gap-2 px-2.5 py-1 text-[11px] ${
+                              layer.kind === 'gap' ? 'bg-slate-900/40 text-slate-400' : ''
+                            }`}
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span
+                                className={`w-2.5 h-2.5 rounded-xs shrink-0 ${
+                                  layer.kind === 'gap'
+                                    ? 'border border-dashed border-slate-500 bg-transparent'
+                                    : 'border border-white/20'
+                                }`}
+                                style={
+                                  layer.kind === 'material'
+                                    ? { backgroundColor: layer.materialColor }
+                                    : undefined
+                                }
+                              />
+                              <span className="truncate text-slate-200">
+                                {layer.materialName}
+                              </span>
+                              {layer.isSubstrate && (
+                                <span className="text-[9px] font-mono text-slate-500 shrink-0">
+                                  Sub
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0 font-mono">
+                              <span className="text-[9px] text-slate-500 hidden xl:inline">
+                                {formatThickness(layer.yBottom, thicknessUnit)}–
+                                {formatThickness(layer.yTop, thicknessUnit)}
+                              </span>
+                              <span
+                                className={`font-semibold ${
+                                  layer.kind === 'gap' ? 'text-amber-300/80' : 'text-emerald-300'
+                                }`}
+                              >
+                                {formatThickness(layer.thicknessNm, thicknessUnit)}
+                              </span>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Manual Coordinate Entry */}
+          <div className="px-2.5 py-2 border-t border-slate-800 bg-slate-950/80 flex items-center gap-1.5 shrink-0">
+            <input
+              type="number"
+              step="0.1"
+              min={0}
+              max={Number((waferWidth / 1000).toFixed(3))}
+              value={manualProbeXUm}
+              onChange={(e) => setManualProbeXUm(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleAddManualProbe();
+                }
+              }}
+              placeholder={`X (0–${(waferWidth / 1000).toFixed(1)} µm)`}
+              className="flex-1 min-w-0 bg-slate-900 border border-slate-700 focus:border-cyan-500 rounded-lg px-2 py-1 text-[11px] font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={handleAddManualProbe}
+              disabled={!manualProbeXUm.trim()}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 disabled:pointer-events-none text-white text-[11px] font-semibold transition-colors shrink-0"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add</span>
+            </button>
+          </div>
+        </aside>
+      )}
       </div>
 
       {/* Bottom Material Legend Bar */}
