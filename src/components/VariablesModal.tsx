@@ -245,13 +245,15 @@ export const VariablesModal: React.FC<VariablesModalProps> = ({
               </span>
             </div>
             <p className="text-[10.5px] text-slate-400 leading-relaxed">
-              Length variables (<span className="font-mono text-slate-200">nm</span> &amp;{' '}
-              <span className="font-mono text-slate-200">µm</span>) share canonical nanometer math so{' '}
-              <span className="font-mono text-violet-300">gate_cd * 2 + 50nm</span> or{' '}
-              <span className="font-mono text-violet-300">WAFER_W / 2 - 0.5um</span> work seamlessly.
+              Bare numbers use this variable&apos;s designated unit (e.g.{' '}
+              <span className="font-mono text-slate-200">0.5</span> in a{' '}
+              <span className="font-mono text-slate-200">µm</span> variable means{' '}
+              <span className="font-mono text-slate-200">0.5 µm</span>) unless an explicit unit like{' '}
+              <span className="font-mono text-violet-300">500nm</span> or{' '}
+              <span className="font-mono text-violet-300">1.2um</span> is written. Length variables convert automatically.
             </p>
             <div className="flex flex-wrap gap-1.5 font-mono text-[10px]">
-              {['+ - * / ^', '500nm', '1.2um', 'WAFER_W', 'PI', 'min(a,b)', 'max(a,b)', 'clamp(x,lo,hi)'].map(
+              {['+ - * / ^', '500nm', '1.2um', '0.1mm', 'WAFER_W', 'PI', 'min(a,b)', 'max(a,b)', 'clamp(x,lo,hi)'].map(
                 (tok) => (
                   <span
                     key={tok}
@@ -408,10 +410,23 @@ export const VariablesModal: React.FC<VariablesModalProps> = ({
                           onChange={(e) =>
                             handleUpdateVar(v.id, { expression: e.target.value })
                           }
-                          placeholder="e.g. gate_cd * 2 + 100nm"
+                          placeholder={
+                            v.unit === 'um'
+                              ? 'e.g. gate_cd + 0.5 or 1.2 + 200nm'
+                              : v.unit === 'nm'
+                              ? 'e.g. gate_cd * 2 + 100 or 1.5um'
+                              : v.unit === 'deg'
+                              ? 'e.g. 85 + 2.5'
+                              : v.unit === 'sec'
+                              ? 'e.g. 60 + 15'
+                              : 'e.g. trench_depth / trench_w'
+                          }
                           className="flex-1 min-w-0 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 focus:border-violet-500 text-slate-100 font-mono text-xs focus:outline-none"
                         />
-                        <span className="text-[11px] font-mono text-emerald-300 font-semibold shrink-0">
+                        <span
+                          className="text-[11px] font-mono text-emerald-300 font-semibold shrink-0"
+                          title={`Evaluated in ${v.unit === 'um' ? 'µm' : v.unit === 'none' ? 'scalar' : v.unit} (bare numbers default to this unit unless explicitly suffixed)`}
+                        >
                           {diag?.error
                             ? 'ERR'
                             : formatVariableValue(diag?.value ?? v.value, v.unit)}

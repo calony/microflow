@@ -22,6 +22,8 @@ import {
   Info,
   Variable,
   GitBranch,
+  Maximize,
+  Minimize,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -46,6 +48,8 @@ interface HeaderProps {
   onToggleLeftSidebar?: () => void;
   rightSidebarOpen?: boolean;
   onToggleRightSidebar?: () => void;
+  isFullScreen?: boolean;
+  onToggleFullScreen?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -70,6 +74,8 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleLeftSidebar,
   rightSidebarOpen = true,
   onToggleRightSidebar,
+  isFullScreen = false,
+  onToggleFullScreen,
 }) => {
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
   const [titleInput, setTitleInput] = useState<string>(flow.title);
@@ -171,6 +177,15 @@ export const Header: React.FC<HeaderProps> = ({
               Microfab Process Designer
             </span>
           </div>
+          <button
+            type="button"
+            onClick={onOpenAbout}
+            className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700/80 transition-colors shrink-0"
+            title="About this app — App dependencies, local privacy & no-AI disclaimer"
+            aria-label="About this app"
+          >
+            <Info className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         <span className="text-slate-700 hidden sm:inline">|</span>
@@ -353,16 +368,50 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           </div>
 
+          {onToggleFullScreen && (
+            <button
+              type="button"
+              onClick={onToggleFullScreen}
+              aria-pressed={isFullScreen}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                isFullScreen
+                  ? 'bg-sky-600/25 border-sky-500/60 text-sky-200 shadow-sm'
+                  : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+              }`}
+              title={isFullScreen ? 'Exit Full Screen Display Mode' : 'Full Screen Display Mode'}
+            >
+              {isFullScreen ? (
+                <Minimize className="w-3.5 h-3.5" />
+              ) : (
+                <Maximize className="w-3.5 h-3.5" />
+              )}
+              <span className="hidden 2xl:inline">
+                {isFullScreen ? 'Exit Full' : 'Full Screen'}
+              </span>
+            </button>
+          )}
+        </div>
+
+        {/* Compact Full Screen button on <xl */}
+        {onToggleFullScreen && (
           <button
             type="button"
-            onClick={onOpenAbout}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-            title="App dependencies, local privacy & no-AI disclaimer"
+            onClick={onToggleFullScreen}
+            aria-pressed={isFullScreen}
+            className={`xl:hidden p-1.5 rounded-lg border text-xs transition-colors ${
+              isFullScreen
+                ? 'bg-sky-600/25 border-sky-500/60 text-sky-200'
+                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+            }`}
+            title={isFullScreen ? 'Exit Full Screen Display Mode' : 'Full Screen Display Mode'}
           >
-            <Info className="w-3.5 h-3.5 text-sky-400" />
-            <span>About this app</span>
+            {isFullScreen ? (
+              <Minimize className="w-4 h-4" />
+            ) : (
+              <Maximize className="w-4 h-4" />
+            )}
           </button>
-        </div>
+        )}
 
         {/* Mobile & Tablet Tools Dropdown (< xl) */}
         <div className="relative xl:hidden" ref={menuRef}>

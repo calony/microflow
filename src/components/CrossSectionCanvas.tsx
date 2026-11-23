@@ -83,6 +83,10 @@ interface CrossSectionCanvasProps {
   showFinalInset?: boolean;
   onToggleFinalInset?: () => void;
   onSelectFinalStep?: () => void;
+  onPrevStep?: () => void;
+  onNextStep?: () => void;
+  canPrevStep?: boolean;
+  canNextStep?: boolean;
 }
 
 export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
@@ -109,6 +113,10 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   showFinalInset = false,
   onToggleFinalInset,
   onSelectFinalStep,
+  onPrevStep,
+  onNextStep,
+  canPrevStep = false,
+  canNextStep = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -165,8 +173,10 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     endY: number;
   } | null>(null);
 
-  // Fullscreen state
+  // Fullscreen state (native Fullscreen API + CSS full-viewport fallback for iframes)
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [isCssFullscreen, setIsCssFullscreen] = useState<boolean>(false);
+  const isAnyFullscreen = isFullscreen || isCssFullscreen;
 
   // Vertical Z-exaggeration factor (essential in semiconductor CAD)
   const [zScale, setZScale] = useState<number>(2.0);
@@ -771,12 +781,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           setMeasurePoints([]);
         } else if (stackProbeMode) {
           setStackProbeMode(false);
+        } else if (isCssFullscreen) {
+          setIsCssFullscreen(false);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fitToScreen, zoomSelection, regionZoomMode, measureMode, stackProbeMode]);
+  }, [fitToScreen, zoomSelection, regionZoomMode, measureMode, stackProbeMode, isCssFullscreen]);
 
   useEffect(() => {
     const syncModifiers = (e: KeyboardEvent) => {
@@ -800,8 +812,11 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   // Listen to fullscreen change
   useEffect(() => {
     const handleFullscreenChange = () => {
-      const isFs = !!document.fullscreenElement;
+      const isFs = !!document.fullscreenElement && document.fullscreenElement === cardRef.current;
       setIsFullscreen(isFs);
+      if (isFs) {
+        setIsCssFullscreen(false);
+      }
       // Only auto-fit on fullscreen toggle if user hasn't locked a custom zoom/pan
       if (!isLockedRef.current) {
         setTimeout(fitToScreen, 120);
@@ -810,6 +825,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, [fitToScreen]);
+
+  useEffect(() => {
+    if (!isLockedRef.current) {
+      const id = window.setTimeout(fitToScreen, 80);
+      return () => window.clearTimeout(id);
+    }
+  }, [isCssFullscreen, fitToScreen]);
 
   // Complete marquee drag even if pointer leaves SVG bounds
   useEffect(() => {
@@ -1023,11 +1045,23 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   }, []);
 
   const toggleFullscreen = () => {
-    if (!cardRef.current) return;
-    if (!document.fullscreenElement) {
-      cardRef.current.requestFullscreen().catch(() => {});
+    if (isCssFullscreen) {
+      setIsCssFullscreen(false);
+      return;
+    }
+    if (document.fullscreenElement === cardRef.current) {
+      document.exitFullscreen().catch(() => {
+        setIsFullscreen(false);
+      });
+      return;
+    }
+    const el = cardRef.current;
+    if (el && typeof el.requestFullscreen === 'function' && document.fullscreenEnabled !== false) {
+      el.requestFullscreen().catch(() => {
+        setIsCssFullscreen(true);
+      });
     } else {
-      document.exitFullscreen().catch(() => {});
+      setIsCssFullscreen(true);
     }
   };
 
@@ -1234,7 +1268,11 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   return (
     <div
       ref={cardRef}
-      className="relative flex flex-col h-full bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl select-none"
+      className={
+        isCssFullscreen
+          ? 'fixed inset-0 z-[70] w-screen h-dvh flex flex-col bg-slate-950 overflow-hidden select-none'
+          : 'relative flex flex-col h-full bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl select-none'
+      }
     >
       {/* Top CAD Control Bar - Responsive layout */}
       <div className="flex flex-wrap items-center justify-between px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-900 border-b border-slate-800 text-xs gap-1.5 sm:gap-2 min-w-0">
@@ -1245,9 +1283,33 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             {title || 'Wafer Cross-Section'}
           </span>
           {stepNumber !== undefined && (
-            <span className="text-slate-300 font-mono text-[11px] shrink-0 bg-slate-800 px-1.5 py-0.5 rounded border border-slate-700/80">
-              {stepNumber === 0 ? 'Substrate' : `Step ${stepNumber}/${totalSteps}`}
-            </span>
+            <div className="flex items-center bg-slate-800 rounded border border-slate-700/80 shrink-0 overflow-hidden">
+              {onPrevStep && (
+                <button
+                  type="button"
+                  onClick={onPrevStep}
+                  disabled={!canPrevStep}
+                  className="p-0.5 text-slate-300 hover:text-white hover:bg-slate-700 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                  title="Previous Step"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+              )}
+              <span className="text-slate-300 font-mono text-[11px] px-1.5 py-0.5">
+                {stepNumber === 0 ? 'Substrate' : `Step ${stepNumber}/${totalSteps}`}
+              </span>
+              {onNextStep && (
+                <button
+                  type="button"
+                  onClick={onNextStep}
+                  disabled={!canNextStep}
+                  className="p-0.5 text-slate-300 hover:text-white hover:bg-slate-700 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                  title="Next Step"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
           )}
           {activeStepTitle && (
             <span className="text-sky-400 font-medium truncate text-[11px] sm:hidden xl:inline">
@@ -1268,57 +1330,6 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
         {/* Right: Viewport Controls */}
         <div className="flex flex-wrap items-center gap-1 sm:gap-1.5 shrink-0 ml-auto">
-          {/* Zoom Controls (hidden on <sm because Floating Bottom-Right HUD covers it cleanly) */}
-          <div className="hidden sm:flex items-center gap-0.5 bg-slate-800/90 border border-slate-700/80 rounded-lg p-0.5 shrink-0 shadow-sm">
-            <button
-              onClick={() => zoomAroundPoint(zoom * 0.85, svgWidth / 2, svgHeight / 2)}
-              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
-              title="Zoom Out (-)"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
-            <span className="px-1 text-[11px] font-mono text-slate-200 min-w-9 text-center select-none">
-              {Math.round(zoom * 100)}%
-            </span>
-            <button
-              onClick={() => zoomAroundPoint(zoom * 1.18, svgWidth / 2, svgHeight / 2)}
-              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
-              title="Zoom In (+)"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
-            {/* Magnifying Glass Region Zoom */}
-            <button
-              onClick={() => {
-                const next = !regionZoomMode;
-                setRegionZoomMode(next);
-                setZoomSelection(null);
-                if (next) {
-                  setMeasureMode(false);
-                  setStackProbeMode(false);
-                }
-              }}
-              className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all font-medium text-[11px] ${
-                regionZoomMode
-                  ? 'bg-sky-500 text-white shadow-sm ring-1 ring-sky-300/60'
-                  : 'text-slate-300 hover:text-white hover:bg-slate-700'
-              }`}
-              title="Magnifying Glass: Drag a region or click to zoom in (hold Ctrl to zoom out)"
-            >
-              <Search className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Zoom Area</span>
-            </button>
-            {/* The Resize to Screen Button */}
-            <button
-              onClick={fitToScreen}
-              className="flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/50 hover:border-sky-400 transition-all font-semibold text-[11px] shadow-sm active:scale-95"
-              title="Resize to Screen / Fit Wafer (F)"
-            >
-              <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
-              <span className="inline font-medium">Fit</span>
-            </button>
-          </div>
-
           {/* Vertical Z-Scale Selector */}
           <div
             className="flex items-center gap-1 px-1.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 shrink-0"
@@ -1457,10 +1468,10 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   ? 'bg-amber-500/20 text-amber-300'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/60'
               }`}
-              title="Measure distances (Caliper)"
+              title="Measure distances (Ruler)"
             >
               <Ruler className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Caliper</span>
+              <span className="hidden md:inline">Ruler</span>
             </button>
             <button
               type="button"
@@ -1525,17 +1536,24 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             <span className="hidden lg:inline">SVG</span>
           </button>
 
-          {/* Canvas Fullscreen Toggle */}
+          {/* Canvas Fullscreen Display Mode Toggle */}
           <button
+            type="button"
             onClick={toggleFullscreen}
-            className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition-colors"
-            title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen Canvas'}
+            aria-pressed={isAnyFullscreen}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+              isAnyFullscreen
+                ? 'bg-sky-600/25 border-sky-500/60 text-sky-200 shadow-sm'
+                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white'
+            }`}
+            title={isAnyFullscreen ? 'Exit Full Screen Display (Esc)' : 'Full Screen Cross-Section Display'}
           >
-            {isFullscreen ? (
+            {isAnyFullscreen ? (
               <Minimize className="w-3.5 h-3.5" />
             ) : (
               <Maximize className="w-3.5 h-3.5" />
             )}
+            <span className="hidden xl:inline">{isAnyFullscreen ? 'Exit Full' : 'Full'}</span>
           </button>
         </div>
       </div>

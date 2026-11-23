@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ProcessFlow, SubstrateLayer, VariableUnit } from '../types/microfab';
 import { getMaterialById } from '../lib/materials';
-import { ThicknessUnit, formatThickness, getUnitLabel } from '../lib/units';
+import { ThicknessUnit, formatThickness, formatCleanDecimal, getUnitLabel } from '../lib/units';
 import { resolveFlowParameters } from '../lib/variableUtils';
 import {
   ParamBindingBadge,
@@ -147,7 +147,19 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
   onOpenVariablesModal,
 }) => {
   const [waferBindOpen, setWaferBindOpen] = useState(false);
+  const formatWidthUm = (widthNm: number): string =>
+    formatCleanDecimal(widthNm / 1000, 3);
+  const [isWidthFocused, setIsWidthFocused] = useState(false);
+  const [widthDraft, setWidthDraft] = useState<string>(() =>
+    formatWidthUm(flow.substrateWidth)
+  );
   const variables = flow.variables || [];
+
+  useEffect(() => {
+    if (!isWidthFocused) {
+      setWidthDraft(formatWidthUm(flow.substrateWidth));
+    }
+  }, [flow.substrateWidth, isWidthFocused]);
 
   const layers = flow.substrateLayers || [
     {
@@ -224,7 +236,7 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
   };
 
   const handleWidthChange = (valUm: number) => {
-    const clamped = Math.max(1, Math.min(200, valUm));
+    const clamped = Math.max(1, Math.min(1000, valUm));
     onUpdateFlow({
       ...flow,
       substrateWidth: Math.round(clamped * 1000),
@@ -288,23 +300,58 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
               </span>
             </button>
           ) : (
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min="1"
-                max="200"
-                step="1"
-                value={(flow.substrateWidth / 1000).toFixed(1)}
-                onChange={(e) => handleWidthChange(parseFloat(e.target.value || '10'))}
-                className="w-24 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
-              />
-              <span className="text-xs text-slate-400">µm</span>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="1"
+                  max="1000"
+                  step="any"
+                  value={isWidthFocused ? widthDraft : formatWidthUm(flow.substrateWidth)}
+                  onFocus={(e) => {
+                    setIsWidthFocused(true);
+                    setWidthDraft(formatWidthUm(flow.substrateWidth));
+                    e.target.select();
+                  }}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setWidthDraft(raw);
+                    const parsed = parseFloat(raw);
+                    if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
+                      handleWidthChange(parsed);
+                    }
+                  }}
+                  onBlur={() => {
+                    const parsed = parseFloat(widthDraft);
+                    if (Number.isFinite(parsed)) {
+                      handleWidthChange(parsed);
+                      const clamped = Math.max(1, Math.min(1000, parsed));
+                      setWidthDraft(formatCleanDecimal(clamped, 3));
+                    } else {
+                      setWidthDraft(formatWidthUm(flow.substrateWidth));
+                    }
+                    setIsWidthFocused(false);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      (e.target as HTMLInputElement).blur();
+                    } else if (e.key === 'Escape') {
+                      setWidthDraft(formatWidthUm(flow.substrateWidth));
+                      setIsWidthFocused(false);
+                      (e.target as HTMLInputElement).blur();
+                    }
+                  }}
+                  className="w-24 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs focus:outline-none focus:border-sky-500"
+                />
+                <span className="text-xs text-slate-400">µm</span>
+              </div>
 
               {/* Quick presets */}
-              <div className="flex items-center gap-1 ml-auto">
-                {[5, 10, 20, 50].map((w) => (
+              <div className="flex flex-wrap items-center gap-1">
+                {[5, 10, 20, 50, 100, 500].map((w) => (
                   <button
                     key={w}
+                    type="button"
                     onClick={() => handleWidthChange(w)}
                     className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
                       flow.substrateWidth === w * 1000

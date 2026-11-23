@@ -2818,6 +2818,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
                   <option value={250}>250 nm</option>
                   <option value={500}>500 nm</option>
                   <option value={1000}>1 µm</option>
+                  <option value={2500}>2.5 µm</option>
+                  <option value={5000}>5 µm</option>
+                  <option value={10000}>10 µm</option>
                 </select>
               </div>
 
@@ -3006,6 +3009,9 @@ export const GdsLayoutEditor: React.FC<GdsLayoutEditorProps> = ({
               <option value={250} className="bg-slate-900">250 nm</option>
               <option value={500} className="bg-slate-900">500 nm</option>
               <option value={1000} className="bg-slate-900">1 µm</option>
+              <option value={2500} className="bg-slate-900">2.5 µm</option>
+              <option value={5000} className="bg-slate-900">5 µm</option>
+              <option value={10000} className="bg-slate-900">10 µm</option>
             </select>
           </div>
 

@@ -115,8 +115,15 @@ export function suggestVariableName(
   return `${cleanBase}_${idx}`;
 }
 
+export interface EvalExpressionOptions {
+  /** Designated unit for bare numeric literals when evaluating a DesignVariable formula */
+  targetUnit?: VariableUnit;
+  /** Variable names in `scope` that hold canonical length values in nm (WAFER_W is always treated as length) */
+  lengthVarNames?: Set<string>;
+}
+
 type Token =
-  | { type: 'num'; value: number }
+  | { type: 'num'; value: number; hasExplicitLengthUnit: boolean }
   | { type: 'ident'; name: string }
   | { type: 'op'; op: string }
   | { type: 'paren'; value: '(' | ')' }
@@ -134,9 +141,9 @@ function tokenize(expr: string): { ok: true; tokens: Token[] } | { ok: false; er
       continue;
     }
 
-    // Numbers (with optional scientific notation and optional length unit suffix nm/um/µm/mm)
+    // Numbers (with optional scientific notation and optional unit suffix nm/um/µm/mm/deg/sec/s/ms/min)
     if (/[0-9]/.test(ch) || (ch === '.' && i + 1 < n && /[0-9]/.test(expr[i + 1]))) {
-      let start = i;
+      const start = i;
       while (i < n && /[0-9.]/.test(expr[i])) i++;
       if (i < n && (expr[i] === 'e' || expr[i] === 'E')) {
         const expPos = i;
@@ -153,18 +160,31 @@ function tokenize(expr: string): { ok: true; tokens: Token[] } | { ok: false; er
         return { ok: false, error: `Invalid number "${expr.slice(start, i)}"` };
       }
 
-      // Optional unit suffix immediately attached (e.g. 500nm, 2.5um, 2.5µm, 1mm)
+      // Optional unit suffix (attached or separated by horizontal spaces, e.g. 500nm, 500 nm, 2.5µm, 30s)
       let mult = 1;
+      let hasExplicitLengthUnit = false;
       const rest = expr.slice(i);
-      const unitMatch = rest.match(/^(nm|um|µm|mm)(?![a-zA-Z0-9_])/);
+      const unitMatch = rest.match(/^[ \t]*(nm|um|µm|mm|deg|sec|ms|min|s)(?![a-zA-Z0-9_(])/);
       if (unitMatch) {
         const u = unitMatch[1];
-        if (u === 'um' || u === 'µm') mult = 1000;
-        else if (u === 'mm') mult = 1_000_000;
-        i += u.length;
+        if (u === 'nm') {
+          mult = 1;
+          hasExplicitLengthUnit = true;
+        } else if (u === 'um' || u === 'µm') {
+          mult = 1000;
+          hasExplicitLengthUnit = true;
+        } else if (u === 'mm') {
+          mult = 1_000_000;
+          hasExplicitLengthUnit = true;
+        } else if (u === 'ms') {
+          mult = 0.001;
+        } else if (u === 'min') {
+          mult = 60;
+        }
+        i += unitMatch[0].length;
       }
 
-      tokens.push({ type: 'num', value: numVal * mult });
+      tokens.push({ type: 'num', value: numVal * mult, hasExplicitLengthUnit });
       continue;
     }
 
@@ -224,12 +244,30 @@ export function extractReferencedVariables(expr: string): string[] {
 }
 
 /**
+ * Internal evaluated node with physical length-dimension exponent:
+ * - `null`: bare numeric literal / pure numeric sub-expression (no unit explicitly stated)
+ * - `0`: explicitly dimensionless scalar (e.g. aspect_ratio variable or length/length ratio)
+ * - `1`: length in canonical nm
+ * - `n`: length^n (e.g. area = 2 in sqrt(w^2 + d^2))
+ */
+interface DimVal {
+  value: number;
+  lenPow: number | null;
+}
+
+type DimParseResult = { ok: true; node: DimVal } | EvalErrorResult;
+
+/**
  * Safely evaluates a mathematical expression against a variable lookup table.
- * Length variables in `scope` should hold their canonical value in nm.
+ * Length variables in `scope` hold their canonical value in nm.
+ * When `options.targetUnit` is supplied (e.g. from the variable editor), bare
+ * numbers are evaluated in that designated unit unless an explicit unit suffix
+ * or dimensional context dictates otherwise.
  */
 export function evaluateParamExpression(
   expression: string,
-  scope: Record<string, number>
+  scope: Record<string, number>,
+  options?: EvalExpressionOptions
 ): ParamEvalResult {
   const trimmed = expression.trim();
   if (!trimmed) {
@@ -243,85 +281,149 @@ export function evaluateParamExpression(
     return { ok: false, error: 'Empty expression' };
   }
 
+  const targetUnit: VariableUnit = options?.targetUnit ?? 'nm';
+  const lengthUnitForBare: VariableUnit = isLengthUnit(targetUnit) ? targetUnit : 'nm';
+  const lengthVarNames = options?.lengthVarNames;
+
+  const isBareOrScalar = (d: DimVal): boolean => d.lenPow === null || d.lenPow === 0;
+  const coerceToLengthNm = (d: DimVal): number =>
+    d.lenPow === 1 ? d.value : toCanonicalValue(d.value, lengthUnitForBare);
+
   let pos = 0;
 
   const peek = (): Token | undefined => tokens[pos];
   const consume = (): Token => tokens[pos++];
 
-  const parseExpr = (): ParamEvalResult => parseAddSub();
+  const parseExpr = (): DimParseResult => parseAddSub();
 
-  const parseAddSub = (): ParamEvalResult => {
-    let left = parseMulDiv();
-    if (!left.ok) return left;
+  const parseAddSub = (): DimParseResult => {
+    let leftRes = parseMulDiv();
+    if (!leftRes.ok) return leftRes;
+    let left = leftRes.node;
+
     while (pos < tokens.length) {
       const t = peek();
       if (t?.type === 'op' && (t.op === '+' || t.op === '-')) {
         consume();
-        const right = parseMulDiv();
-        if (!right.ok) return right;
-        left = {
-          ok: true,
-          value: t.op === '+' ? left.value + right.value : left.value - right.value,
-        };
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
+        const rightRes = parseMulDiv();
+        if (!rightRes.ok) return rightRes;
+        const right = rightRes.node;
 
-  const parseMulDiv = (): ParamEvalResult => {
-    let left = parsePower();
-    if (!left.ok) return left;
-    while (pos < tokens.length) {
-      const t = peek();
-      if (t?.type === 'op' && (t.op === '*' || t.op === '/' || t.op === '%')) {
-        consume();
-        const right = parsePower();
-        if (!right.ok) return right;
-        if (t.op === '*') {
-          left = { ok: true, value: left.value * right.value };
-        } else if (t.op === '/') {
-          if (right.value === 0) return { ok: false, error: 'Division by zero' };
-          left = { ok: true, value: left.value / right.value };
+        if (left.lenPow === right.lenPow) {
+          left = {
+            value: t.op === '+' ? left.value + right.value : left.value - right.value,
+            lenPow: left.lenPow,
+          };
+        } else if (left.lenPow === 1 && isBareOrScalar(right)) {
+          const rNm = coerceToLengthNm(right);
+          left = {
+            value: t.op === '+' ? left.value + rNm : left.value - rNm,
+            lenPow: 1,
+          };
+        } else if (isBareOrScalar(left) && right.lenPow === 1) {
+          const lNm = coerceToLengthNm(left);
+          left = {
+            value: t.op === '+' ? lNm + right.value : lNm - right.value,
+            lenPow: 1,
+          };
         } else {
-          if (right.value === 0) return { ok: false, error: 'Modulo by zero' };
-          left = { ok: true, value: left.value % right.value };
+          left = {
+            value: t.op === '+' ? left.value + right.value : left.value - right.value,
+            lenPow: left.lenPow ?? right.lenPow,
+          };
         }
       } else {
         break;
       }
     }
-    return left;
+    return { ok: true, node: left };
   };
 
-  const parsePower = (): ParamEvalResult => {
-    const base = parseUnary();
-    if (!base.ok) return base;
+  const parseMulDiv = (): DimParseResult => {
+    let leftRes = parsePower();
+    if (!leftRes.ok) return leftRes;
+    let left = leftRes.node;
+
+    while (pos < tokens.length) {
+      const t = peek();
+      if (t?.type === 'op' && (t.op === '*' || t.op === '/' || t.op === '%')) {
+        consume();
+        const rightRes = parsePower();
+        if (!rightRes.ok) return rightRes;
+        const right = rightRes.node;
+
+        if (t.op === '*') {
+          let nextPow: number | null;
+          if (left.lenPow === null && right.lenPow === null) nextPow = null;
+          else if (left.lenPow === null) nextPow = right.lenPow;
+          else if (right.lenPow === null) nextPow = left.lenPow;
+          else nextPow = left.lenPow + right.lenPow;
+          left = { value: left.value * right.value, lenPow: nextPow };
+        } else if (t.op === '/') {
+          if (right.value === 0) return { ok: false, error: 'Division by zero' };
+          let nextPow: number | null;
+          if (left.lenPow === null && right.lenPow === null) nextPow = null;
+          else if (right.lenPow === null) nextPow = left.lenPow;
+          else if (left.lenPow === null) nextPow = -right.lenPow;
+          else nextPow = left.lenPow - right.lenPow;
+          left = { value: left.value / right.value, lenPow: nextPow };
+        } else {
+          if (right.value === 0) return { ok: false, error: 'Modulo by zero' };
+          if (left.lenPow === 1 && isBareOrScalar(right)) {
+            const rNm = coerceToLengthNm(right);
+            if (rNm === 0) return { ok: false, error: 'Modulo by zero' };
+            left = { value: left.value % rNm, lenPow: 1 };
+          } else if (isBareOrScalar(left) && right.lenPow === 1) {
+            const lNm = coerceToLengthNm(left);
+            left = { value: lNm % right.value, lenPow: 1 };
+          } else {
+            left = { value: left.value % right.value, lenPow: left.lenPow ?? right.lenPow };
+          }
+        }
+      } else {
+        break;
+      }
+    }
+    return { ok: true, node: left };
+  };
+
+  const parsePower = (): DimParseResult => {
+    const baseRes = parseUnary();
+    if (!baseRes.ok) return baseRes;
+    const base = baseRes.node;
     const t = peek();
     if (t?.type === 'op' && t.op === '^') {
       consume();
-      const exp = parsePower(); // right-associative
-      if (!exp.ok) return exp;
+      const expRes = parsePower(); // right-associative
+      if (!expRes.ok) return expRes;
+      const exp = expRes.node;
       const res = Math.pow(base.value, exp.value);
       if (!Number.isFinite(res)) return { ok: false, error: 'Numeric overflow' };
-      return { ok: true, value: res };
+      const nextPow =
+        base.lenPow !== null && base.lenPow !== 0 ? base.lenPow * exp.value : base.lenPow;
+      return { ok: true, node: { value: res, lenPow: nextPow } };
     }
-    return base;
+    return { ok: true, node: base };
   };
 
-  const parseUnary = (): ParamEvalResult => {
+  const parseUnary = (): DimParseResult => {
     const t = peek();
     if (t?.type === 'op' && (t.op === '+' || t.op === '-')) {
       consume();
       const inner = parseUnary();
       if (!inner.ok) return inner;
-      return { ok: true, value: t.op === '-' ? -inner.value : inner.value };
+      return {
+        ok: true,
+        node: {
+          value: t.op === '-' ? -inner.node.value : inner.node.value,
+          lenPow: inner.node.lenPow,
+        },
+      };
     }
     return parsePrimary();
   };
 
-  const parsePrimary = (): ParamEvalResult => {
+  const parsePrimary = (): DimParseResult => {
     const t = peek();
     if (!t) {
       return { ok: false, error: 'Unexpected end of expression' };
@@ -329,7 +431,13 @@ export function evaluateParamExpression(
 
     if (t.type === 'num') {
       consume();
-      return { ok: true, value: t.value };
+      return {
+        ok: true,
+        node: {
+          value: t.value,
+          lenPow: t.hasExplicitLengthUnit ? 1 : null,
+        },
+      };
     }
 
     if (t.type === 'paren' && t.value === '(') {
@@ -353,13 +461,13 @@ export function evaluateParamExpression(
           return { ok: false, error: `Unknown function "${t.name}()"` };
         }
         consume(); // '('
-        const args: number[] = [];
+        const args: DimVal[] = [];
         const afterOpen = peek();
         if (!(afterOpen && afterOpen.type === 'paren' && afterOpen.value === ')')) {
           while (true) {
             const arg = parseExpr();
             if (!arg.ok) return arg;
-            args.push(arg.value);
+            args.push(arg.node);
             const sep = peek();
             if (sep && sep.type === 'comma') {
               consume();
@@ -373,19 +481,61 @@ export function evaluateParamExpression(
           return { ok: false, error: `Expected ")" after ${t.name}(...)` };
         }
         consume();
-        const res = fn(...args);
+
+        let evalArgs = args.map((a) => a.value);
+        let resultLenPow: number | null = args[0]?.lenPow ?? null;
+
+        if (t.name === 'min' || t.name === 'max' || t.name === 'clamp') {
+          const hasLenArg = args.some((a) => a.lenPow === 1);
+          if (hasLenArg) {
+            evalArgs = args.map((a) => coerceToLengthNm(a));
+            resultLenPow = 1;
+          }
+        } else if (t.name === 'round' || t.name === 'floor' || t.name === 'ceil') {
+          if (args.length > 0 && args[0].lenPow === 1) {
+            const inDisplayUnit = fromCanonicalValue(args[0].value, lengthUnitForBare);
+            const rounded = fn(inDisplayUnit);
+            if (!Number.isFinite(rounded)) {
+              return { ok: false, error: `Invalid result in ${t.name}()` };
+            }
+            return {
+              ok: true,
+              node: {
+                value: toCanonicalValue(rounded, lengthUnitForBare),
+                lenPow: 1,
+              },
+            };
+          }
+        } else if (t.name === 'sqrt') {
+          if (args.length > 0 && args[0].lenPow !== null && args[0].lenPow !== 0) {
+            resultLenPow = args[0].lenPow / 2;
+          }
+        } else if (t.name === 'sin' || t.name === 'cos' || t.name === 'tan') {
+          resultLenPow = null;
+        }
+
+        const res = fn(...evalArgs);
         if (!Number.isFinite(res)) {
           return { ok: false, error: `Invalid result in ${t.name}()` };
         }
-        return { ok: true, value: res };
+        return { ok: true, node: { value: res, lenPow: resultLenPow } };
       }
 
       if (BUILTIN_CONSTANTS[t.name] !== undefined) {
-        return { ok: true, value: BUILTIN_CONSTANTS[t.name] };
+        return { ok: true, node: { value: BUILTIN_CONSTANTS[t.name], lenPow: null } };
       }
 
       if (Object.prototype.hasOwnProperty.call(scope, t.name)) {
-        return { ok: true, value: scope[t.name] };
+        const isLenVar = lengthVarNames
+          ? lengthVarNames.has(t.name)
+          : t.name === 'WAFER_W';
+        return {
+          ok: true,
+          node: {
+            value: scope[t.name],
+            lenPow: isLenVar ? 1 : 0,
+          },
+        };
       }
 
       return { ok: false, error: `Unknown variable "${t.name}"` };
@@ -401,11 +551,17 @@ export function evaluateParamExpression(
     return { ok: false, error: 'Unexpected trailing tokens' };
   }
 
-  if (!Number.isFinite(result.value)) {
+  const root = result.node;
+  const finalValue =
+    isLengthUnit(targetUnit) && isBareOrScalar(root)
+      ? toCanonicalValue(root.value, targetUnit)
+      : root.value;
+
+  if (!Number.isFinite(finalValue)) {
     return { ok: false, error: 'Non-finite result' };
   }
 
-  return result;
+  return { ok: true, value: finalValue };
 }
 
 /**
@@ -421,9 +577,15 @@ export function resolveVariables(
   diagnostics: Record<string, VariableDiagnostic>;
 } {
   const byName = new Map<string, DesignVariable>();
+  const lengthVarNames = new Set<string>(['WAFER_W']);
   for (const v of variables) {
     if (v.name && !byName.has(v.name)) {
       byName.set(v.name, v);
+      if (isLengthUnit(v.unit)) {
+        lengthVarNames.add(v.name);
+      } else if (v.name === 'WAFER_W') {
+        lengthVarNames.delete('WAFER_W');
+      }
     }
   }
 
@@ -481,7 +643,10 @@ export function resolveVariables(
     }
     visiting.delete(v.name);
 
-    const evalRes = evaluateParamExpression(v.expression, scope);
+    const evalRes = evaluateParamExpression(v.expression, scope, {
+      targetUnit: v.unit,
+      lengthVarNames,
+    });
     visited.add(v.id);
     if (evalRes.ok) {
       const canonical = evalRes.value;
@@ -707,7 +872,7 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
   let nextSubstrateWidth = flow.substrateWidth || 10000;
   const boundWaferW = evalBoundValue(flow.paramBindings, 'substrateWidth', scope);
   if (boundWaferW !== null) {
-    nextSubstrateWidth = Math.max(1000, Math.min(200000, Math.round(boundWaferW)));
+    nextSubstrateWidth = Math.max(1000, Math.min(1000000, Math.round(boundWaferW)));
     // Re-resolve if WAFER_W changed and wasn't shadowed by a user variable
     if (nextSubstrateWidth !== flow.substrateWidth && !vars.some((v) => v.name === 'WAFER_W')) {
       const re = resolveVariables(resolvedVars, nextSubstrateWidth);

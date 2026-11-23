@@ -38,7 +38,7 @@ import {
   formatDurationCompact,
 } from './lib/etchRates';
 import { ThicknessUnit } from './lib/units';
-import { ListOrdered, Layers as LayersIcon, Sliders as SlidersIcon, X } from 'lucide-react';
+import { ListOrdered, Layers as LayersIcon, Sliders as SlidersIcon, X, Minimize } from 'lucide-react';
 
 export default function App() {
   // Load initial process from localStorage if present, or fallback to CMOS preset
@@ -135,6 +135,53 @@ export default function App() {
     }
   });
   const [selectedInsetStepIndex, setSelectedInsetStepIndex] = useState<number | null>(null);
+  const [isBrowserFullscreen, setIsBrowserFullscreen] = useState<boolean>(false);
+  const [isFocusFullscreen, setIsFocusFullscreen] = useState<boolean>(false);
+  const isFullScreenDisplay = isBrowserFullscreen || isFocusFullscreen;
+
+  useEffect(() => {
+    const handleFsChange = () => {
+      const isAppFs = document.fullscreenElement === document.documentElement;
+      setIsBrowserFullscreen(isAppFs);
+      if (isAppFs) {
+        setIsFocusFullscreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, []);
+
+  useEffect(() => {
+    if (!isFocusFullscreen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsFocusFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFocusFullscreen]);
+
+  const handleToggleFullScreenDisplay = () => {
+    if (isFocusFullscreen) {
+      setIsFocusFullscreen(false);
+      return;
+    }
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {
+        setIsBrowserFullscreen(false);
+      });
+      return;
+    }
+    const rootEl = document.documentElement;
+    if (rootEl && typeof rootEl.requestFullscreen === 'function' && document.fullscreenEnabled !== false) {
+      rootEl.requestFullscreen().catch(() => {
+        setIsFocusFullscreen(true);
+      });
+    } else {
+      setIsFocusFullscreen(true);
+    }
+  };
 
   // Save to localStorage on changes
   useEffect(() => {
@@ -522,38 +569,54 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-dvh w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
-      {/* Top Application Header */}
-      <Header
-        flow={flow}
-        thicknessUnit={thicknessUnit}
-        onChangeThicknessUnit={setThicknessUnit}
-        onUpdateTitle={handleUpdateTitle}
-        onOpenPresets={() => setShowPresets(true)}
-        onOpenMaterials={() => setShowMaterials(true)}
-        onOpenEtchLibrary={() => setShowEtchLibrary(true)}
-        onOpenMaskLevels={() => {
-          setFocusMaskId(undefined);
-          setShowMaskLevels(true);
-        }}
-        onOpenVariables={() => setShowVariables(true)}
-        variableCount={flow.variables?.length || 0}
-        onOpenVariantManager={() => setShowVariantManager(true)}
-        variantStepCount={flow.steps.filter((s) => s.variants && s.variants.length > 1).length}
-        onOpenRunSheet={() => setShowRunSheet(true)}
-        onOpenMultiStepView={() => setShowMultiStep(true)}
-        onOpenAbout={() => setShowAbout(true)}
-        onExportJson={handleExportJson}
-        onImportJson={handleImportJson}
-        leftSidebarOpen={leftSidebarOpen}
-        onToggleLeftSidebar={handleToggleLeftSidebar}
-        rightSidebarOpen={rightSidebarOpen}
-        onToggleRightSidebar={handleToggleRightSidebar}
-      />
+      {/* Top Application Header (hidden in Focus Full Screen fallback mode) */}
+      {!isFocusFullscreen && (
+        <Header
+          flow={flow}
+          thicknessUnit={thicknessUnit}
+          onChangeThicknessUnit={setThicknessUnit}
+          onUpdateTitle={handleUpdateTitle}
+          onOpenPresets={() => setShowPresets(true)}
+          onOpenMaterials={() => setShowMaterials(true)}
+          onOpenEtchLibrary={() => setShowEtchLibrary(true)}
+          onOpenMaskLevels={() => {
+            setFocusMaskId(undefined);
+            setShowMaskLevels(true);
+          }}
+          onOpenVariables={() => setShowVariables(true)}
+          variableCount={flow.variables?.length || 0}
+          onOpenVariantManager={() => setShowVariantManager(true)}
+          variantStepCount={flow.steps.filter((s) => s.variants && s.variants.length > 1).length}
+          onOpenRunSheet={() => setShowRunSheet(true)}
+          onOpenMultiStepView={() => setShowMultiStep(true)}
+          onOpenAbout={() => setShowAbout(true)}
+          onExportJson={handleExportJson}
+          onImportJson={handleImportJson}
+          leftSidebarOpen={leftSidebarOpen}
+          onToggleLeftSidebar={handleToggleLeftSidebar}
+          rightSidebarOpen={rightSidebarOpen}
+          onToggleRightSidebar={handleToggleRightSidebar}
+          isFullScreen={isFullScreenDisplay}
+          onToggleFullScreen={handleToggleFullScreenDisplay}
+        />
+      )}
 
       {/* Main 3-Column CAD Workspace (Drawers on <1024px mobile/tablet, Docked Columns on lg+) */}
       <div className="flex-1 flex overflow-hidden relative min-h-0">
+        {isFocusFullscreen && (
+          <button
+            type="button"
+            onClick={() => setIsFocusFullscreen(false)}
+            className="fixed bottom-4 left-4 z-50 flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/95 hover:bg-slate-800 border border-sky-500/50 text-sky-200 text-xs font-semibold shadow-2xl backdrop-blur-md transition-colors"
+            title="Exit Full Screen Display Mode (Esc)"
+          >
+            <Minimize className="w-3.5 h-3.5 text-sky-400" />
+            <span>Exit Full Screen</span>
+          </button>
+        )}
+
         {/* Compact-viewport Backdrop for active drawer */}
-        {(leftSidebarOpen || rightSidebarOpen) && (
+        {!isFocusFullscreen && (leftSidebarOpen || rightSidebarOpen) && (
           <div
             onClick={() => {
               setLeftSidebarOpen(false);
@@ -564,7 +627,7 @@ export default function App() {
         )}
 
         {/* Left: Process Flow Timeline */}
-        {leftSidebarOpen && (
+        {!isFocusFullscreen && leftSidebarOpen && (
           <aside className="fixed inset-y-0 left-0 z-40 w-[86vw] max-w-[330px] h-full border-r border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-72 xl:w-80 lg:shadow-none flex-shrink-0">
             <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
               <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
@@ -607,7 +670,7 @@ export default function App() {
         )}
 
         {/* Adjacent: Substrate Layer Editor OR Step Deep Parameters Editor (Docked next to Process Timeline) */}
-        {rightSidebarOpen && (
+        {!isFocusFullscreen && rightSidebarOpen && (
           <aside className="fixed inset-y-0 left-0 z-40 w-[88vw] max-w-[370px] h-full border-r border-slate-800 bg-slate-900 shadow-2xl flex flex-col lg:static lg:z-auto lg:w-80 xl:w-[340px] lg:shadow-none flex-shrink-0">
             <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
               <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
@@ -688,7 +751,7 @@ export default function App() {
         {/* Main Viewport: Canvas & Photomask Track */}
         <main className="flex-1 flex flex-col h-full bg-[#030712] p-1.5 sm:p-3 overflow-hidden space-y-2 sm:space-y-3 min-w-0">
           {/* Photomask Aperture Editor (Active if current step is Lithography) */}
-          {activeStep && activeStep.type === 'lithography' && (
+          {!isFocusFullscreen && activeStep && activeStep.type === 'lithography' && (
             <div className="flex-shrink-0">
               <MaskEditor
                 step={activeStep}
@@ -758,13 +821,24 @@ export default function App() {
                   setIsPlaying(false);
                 }
               }}
+              canPrevStep={activeStepIndex > -1}
+              canNextStep={activeStepIndex < flow.steps.length - 1}
+              onPrevStep={() => {
+                setActiveStepIndex((i) => Math.max(-1, i - 1));
+                setIsPlaying(false);
+              }}
+              onNextStep={() => {
+                setActiveStepIndex((i) => Math.min(flow.steps.length - 1, i + 1));
+                setIsPlaying(false);
+              }}
             />
           </div>
         </main>
       </div>
 
       {/* Mobile & Tablet Bottom Panel Switcher (< lg) */}
-      <nav className="lg:hidden shrink-0 grid grid-cols-3 bg-slate-900 border-t border-slate-800 text-[11px] font-medium select-none z-20">
+      {!isFocusFullscreen && (
+        <nav className="lg:hidden shrink-0 grid grid-cols-3 bg-slate-900 border-t border-slate-800 text-[11px] font-medium select-none z-20">
         <button
           type="button"
           onClick={handleToggleLeftSidebar}
@@ -805,11 +879,17 @@ export default function App() {
           <span>{isSubstrateActive ? 'Substrate' : 'Params'}</span>
         </button>
       </nav>
+      )}
 
       {/* Modals */}
       {showPresets && (
         <PresetPickerModal
           onSelectPreset={handleSelectPreset}
+          onImportFlow={(imported) => {
+            handleImportJson(imported);
+            setIsPlaying(false);
+            setShowPresets(false);
+          }}
           onClose={() => setShowPresets(false)}
         />
       )}
