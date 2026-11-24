@@ -4,9 +4,20 @@
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ProcessFlow, ProcessStep, Material, EtchRecipe, VariableUnit } from './types/microfab';
+import {
+  ProcessFlow,
+  ProcessStep,
+  Material,
+  EtchRecipe,
+  VariableUnit,
+  SacrificialReleaseRegion,
+} from './types/microfab';
 import { PRESET_PROCESS_FLOWS } from './lib/presets';
-import { simulateCrossSection, buildRenderPolygons } from './lib/simulationEngine';
+import {
+  simulateCrossSection,
+  buildRenderPolygons,
+  computeFlowSharedYBounds,
+} from './lib/simulationEngine';
 import { Header } from './components/Header';
 import { ProcessFlowSidebar } from './components/ProcessFlowSidebar';
 import { CrossSectionCanvas } from './components/CrossSectionCanvas';
@@ -21,6 +32,7 @@ import { MaskLevelsModal } from './components/MaskLevelsModal';
 import { VariablesModal } from './components/VariablesModal';
 import { VariantManagerModal } from './components/VariantManagerModal';
 import { AboutModal } from './components/AboutModal';
+import { BatchExportModal } from './components/BatchExportModal';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { resolveFlowParameters } from './lib/variableUtils';
 import { syncActiveVariantSnapshot } from './lib/variantUtils';
@@ -37,6 +49,7 @@ import {
   formatEtchRate,
   formatDurationCompact,
 } from './lib/etchRates';
+import { downloadProcessFlowCsv } from './lib/csvExportUtils';
 import { ThicknessUnit } from './lib/units';
 import { ListOrdered, Layers as LayersIcon, Sliders as SlidersIcon, X, Minimize } from 'lucide-react';
 
@@ -117,6 +130,7 @@ export default function App() {
   const [showVariantManager, setShowVariantManager] = useState<boolean>(false);
   const [showRunSheet, setShowRunSheet] = useState<boolean>(false);
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
+  const [showBatchExport, setShowBatchExport] = useState<boolean>(false);
   const [showAbout, setShowAbout] = useState<boolean>(false);
 
   // Panel visibility state: docked open on desktop (>=1024px), drawer-closed on mobile/tablet
@@ -255,6 +269,11 @@ export default function App() {
     return buildRenderPolygons(activeMesh, flow.materials);
   }, [activeMesh, flow.materials]);
 
+  // Global vertical bounds shared across starting substrate and all enabled steps
+  const sharedYBounds = useMemo(() => {
+    return computeFlowSharedYBounds(flow);
+  }, [flow]);
+
   // Identify the last enabled process step and all enabled steps after the currently selected step
   const finalEnabledStepIndex = useMemo(() => {
     for (let i = flow.steps.length - 1; i >= 0; i--) {
@@ -322,6 +341,43 @@ export default function App() {
 
   const isSubstrateActive = activeStepIndex === -1;
   const activeStep = !isSubstrateActive ? flow.steps[activeStepIndex] : undefined;
+
+  const isSacrificialReleaseStep =
+    !isSubstrateActive &&
+    activeStep?.type === 'strip' &&
+    activeStep.strip?.stripType === 'sacrificial-release';
+
+  const [pickReleaseMode, setPickReleaseMode] = useState<boolean>(false);
+
+  useEffect(() => {
+    setPickReleaseMode(false);
+  }, [activeStepIndex, isSacrificialReleaseStep]);
+
+  const activeReleaseConfig = useMemo(() => {
+    if (!isSacrificialReleaseStep || !activeStep?.strip) return null;
+    return {
+      targetMaterialId: activeStep.strip.targetMaterialId || 'mat_sio2_thermal',
+      side: activeStep.side || ('front' as const),
+      releaseScope: activeStep.strip.releaseScope ?? ('all' as const),
+      regions: activeStep.strip.releaseRegions ?? [],
+    };
+  }, [isSacrificialReleaseStep, activeStep]);
+
+  // Pre-release geometry (state just before the sacrificial release step executes)
+  // so dissolved pockets remain clickable/visible while picking regions to keep intact.
+  const preReleaseMesh = useMemo(() => {
+    if (!pickReleaseMode || !isSacrificialReleaseStep || activeStepIndex < 0) return null;
+    let enabledBefore = 0;
+    for (let i = 0; i < activeStepIndex && i < flow.steps.length; i++) {
+      if (flow.steps[i].enabled) enabledBefore++;
+    }
+    return simulateCrossSection(flow, enabledBefore - 1);
+  }, [pickReleaseMode, isSacrificialReleaseStep, activeStepIndex, flow]);
+
+  const preReleasePolygons = useMemo(() => {
+    if (!preReleaseMesh) return undefined;
+    return buildRenderPolygons(preReleaseMesh, flow.materials);
+  }, [preReleaseMesh, flow.materials]);
 
   // Handlers
   const handleUpdateFlow = (updatedFlow: ProcessFlow) => {
@@ -428,6 +484,96 @@ export default function App() {
     setFlow((prev) => ({ ...prev, title }));
   };
 
+  const handleTogglePickReleaseMode = () => {
+    if (!isSacrificialReleaseStep || !activeStep) {
+      setPickReleaseMode(false);
+      return;
+    }
+    if (!pickReleaseMode) {
+      if (activeStep.strip?.releaseScope !== 'regions') {
+        handleUpdateStep({
+          ...activeStep,
+          strip: {
+            ...(activeStep.strip || {
+              stripType: 'sacrificial-release',
+              solvent: 'HF Vapor / BOE',
+              targetMaterialId: 'mat_sio2_thermal',
+            }),
+            stripType: 'sacrificial-release',
+            releaseScope: 'regions',
+            releaseRegions: activeStep.strip?.releaseRegions ?? [],
+          },
+        });
+      }
+      if (isCompactViewport()) {
+        setRightSidebarOpen(false);
+        setLeftSidebarOpen(false);
+      }
+      setPickReleaseMode(true);
+    } else {
+      setPickReleaseMode(false);
+    }
+  };
+
+  const handleAddReleaseRegion = (region: {
+    xStart: number;
+    xEnd: number;
+    yMin?: number;
+    yMax?: number;
+  }) => {
+    if (!activeStep || activeStep.type !== 'strip') return;
+    const prevStrip = activeStep.strip || {
+      stripType: 'sacrificial-release' as const,
+      solvent: 'HF Vapor / BOE',
+      targetMaterialId: 'mat_sio2_thermal',
+    };
+    const xLo = Math.max(0, Math.min(flow.substrateWidth, Math.round(Math.min(region.xStart, region.xEnd))));
+    const xHi = Math.max(0, Math.min(flow.substrateWidth, Math.round(Math.max(region.xStart, region.xEnd))));
+    if (xHi - xLo < 5) return;
+    const nextRegion: SacrificialReleaseRegion = {
+      id: `rel_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      xStart: xLo,
+      xEnd: xHi,
+      ...(region.yMin !== undefined && region.yMax !== undefined
+        ? {
+            yMin: Math.round(Math.min(region.yMin, region.yMax)),
+            yMax: Math.round(Math.max(region.yMin, region.yMax)),
+          }
+        : {}),
+    };
+    handleUpdateStep({
+      ...activeStep,
+      strip: {
+        ...prevStrip,
+        stripType: 'sacrificial-release',
+        releaseScope: 'regions',
+        releaseRegions: [...(prevStrip.releaseRegions || []), nextRegion],
+      },
+    });
+  };
+
+  const handleRemoveReleaseRegion = (regionId: string) => {
+    if (!activeStep || activeStep.type !== 'strip' || !activeStep.strip) return;
+    handleUpdateStep({
+      ...activeStep,
+      strip: {
+        ...activeStep.strip,
+        releaseRegions: (activeStep.strip.releaseRegions || []).filter((r) => r.id !== regionId),
+      },
+    });
+  };
+
+  const handleClearReleaseRegions = () => {
+    if (!activeStep || activeStep.type !== 'strip' || !activeStep.strip) return;
+    handleUpdateStep({
+      ...activeStep,
+      strip: {
+        ...activeStep.strip,
+        releaseRegions: [],
+      },
+    });
+  };
+
   const allEtchRecipes = useMemo(
     () => getEtchRecipes(flow.etchLibrary),
     [flow.etchLibrary]
@@ -531,6 +677,10 @@ export default function App() {
     downloadAnchor.click();
   };
 
+  const handleExportCsv = () => {
+    downloadProcessFlowCsv(flow);
+  };
+
   const handleImportJson = (newFlow: ProcessFlow) => {
     // ensure substrateLayers exists
     if (!newFlow.substrateLayers || newFlow.substrateLayers.length === 0) {
@@ -589,8 +739,10 @@ export default function App() {
           variantStepCount={flow.steps.filter((s) => s.variants && s.variants.length > 1).length}
           onOpenRunSheet={() => setShowRunSheet(true)}
           onOpenMultiStepView={() => setShowMultiStep(true)}
+          onOpenBatchExport={() => setShowBatchExport(true)}
           onOpenAbout={() => setShowAbout(true)}
           onExportJson={handleExportJson}
+          onExportCsv={handleExportCsv}
           onImportJson={handleImportJson}
           leftSidebarOpen={leftSidebarOpen}
           onToggleLeftSidebar={handleToggleLeftSidebar}
@@ -698,6 +850,7 @@ export default function App() {
                 />
               ) : activeStep ? (
                 <StepEditor
+                  flow={flow}
                   step={activeStep}
                   waferWidth={flow.substrateWidth}
                   materials={flow.materials}
@@ -724,6 +877,8 @@ export default function App() {
                   onCreateVariable={handleCreateVariable}
                   onOpenVariablesModal={() => setShowVariables(true)}
                   onOpenVariantManager={() => setShowVariantManager(true)}
+                  pickReleaseMode={pickReleaseMode}
+                  onTogglePickReleaseMode={handleTogglePickReleaseMode}
                   onOpenMaskLevelsModal={(maskId) => {
                     setFocusMaskId(maskId);
                     setShowMaskLevels(true);
@@ -775,6 +930,7 @@ export default function App() {
             <CrossSectionCanvas
               mesh={activeMesh}
               polygons={activePolygons}
+              sharedYBounds={sharedYBounds}
               materials={flow.materials}
               waferWidth={flow.substrateWidth}
               flowId={flow.id}
@@ -831,6 +987,15 @@ export default function App() {
                 setActiveStepIndex((i) => Math.min(flow.steps.length - 1, i + 1));
                 setIsPlaying(false);
               }}
+              activeReleaseConfig={activeReleaseConfig}
+              preReleaseMesh={preReleaseMesh}
+              preReleasePolygons={preReleasePolygons}
+              pickReleaseMode={pickReleaseMode}
+              onTogglePickReleaseMode={handleTogglePickReleaseMode}
+              onAddReleaseRegion={handleAddReleaseRegion}
+              onRemoveReleaseRegion={handleRemoveReleaseRegion}
+              onClearReleaseRegions={handleClearReleaseRegions}
+              onOpenBatchExport={() => setShowBatchExport(true)}
             />
           </div>
         </main>
@@ -958,6 +1123,7 @@ export default function App() {
         <RunSheetModal
           flow={flow}
           thicknessUnit={thicknessUnit}
+          onExportCsv={handleExportCsv}
           onClose={() => setShowRunSheet(false)}
         />
       )}
@@ -968,7 +1134,16 @@ export default function App() {
           thicknessUnit={thicknessUnit}
           onSelectStepIndex={(idx) => setActiveStepIndex(idx)}
           onUpdateFlow={handleUpdateFlow}
+          onOpenBatchExport={() => setShowBatchExport(true)}
           onClose={() => setShowMultiStep(false)}
+        />
+      )}
+
+      {showBatchExport && (
+        <BatchExportModal
+          flow={flow}
+          thicknessUnit={thicknessUnit}
+          onClose={() => setShowBatchExport(false)}
         />
       )}
 

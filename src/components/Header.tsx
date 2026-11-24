@@ -24,6 +24,8 @@ import {
   GitBranch,
   Maximize,
   Minimize,
+  Files,
+  FileSpreadsheet,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -41,8 +43,10 @@ interface HeaderProps {
   variantStepCount?: number;
   onOpenRunSheet: () => void;
   onOpenMultiStepView: () => void;
+  onOpenBatchExport?: () => void;
   onOpenAbout: () => void;
   onExportJson: () => void;
+  onExportCsv?: () => void;
   onImportJson: (json: ProcessFlow) => void;
   leftSidebarOpen?: boolean;
   onToggleLeftSidebar?: () => void;
@@ -67,8 +71,10 @@ export const Header: React.FC<HeaderProps> = ({
   variantStepCount = 0,
   onOpenRunSheet,
   onOpenMultiStepView,
+  onOpenBatchExport,
   onOpenAbout,
   onExportJson,
+  onExportCsv,
   onImportJson,
   leftSidebarOpen = true,
   onToggleLeftSidebar,
@@ -345,6 +351,18 @@ export const Header: React.FC<HeaderProps> = ({
             <span>Process Figure</span>
           </button>
 
+          {onOpenBatchExport && (
+            <button
+              type="button"
+              onClick={onOpenBatchExport}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 hover:text-sky-200 border border-slate-700 text-xs font-medium transition-colors"
+              title="Batch Export All Step Cross-Sections (SVG / PNG)"
+            >
+              <Files className="w-3.5 h-3.5 text-sky-400" />
+              <span className="hidden 2xl:inline">Batch Export</span>
+            </button>
+          )}
+
           {/* JSON Import / Export */}
           <div className="flex items-center gap-1 ml-1 bg-slate-800 p-0.5 rounded-lg border border-slate-700">
             <label
@@ -366,6 +384,17 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Download className="w-3.5 h-3.5" />
             </button>
+            {onExportCsv && (
+              <button
+                type="button"
+                onClick={onExportCsv}
+                className="flex items-center gap-1 px-1.5 py-1 rounded text-emerald-300 hover:text-emerald-200 hover:bg-slate-700 transition-colors text-[11px] font-medium"
+                title="Export Process Flow CSV (for MES / Excel / PLM)"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden 2xl:inline">CSV</span>
+              </button>
+            )}
           </div>
 
           {onToggleFullScreen && (
@@ -561,6 +590,32 @@ export const Header: React.FC<HeaderProps> = ({
                 <Download className="w-4 h-4 text-slate-400" />
                 <span>Export Recipe JSON</span>
               </button>
+              {onExportCsv && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onExportCsv();
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-emerald-300 hover:bg-slate-800"
+                >
+                  <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                  <span>Export Process Flow CSV</span>
+                </button>
+              )}
+              {onOpenBatchExport && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onOpenBatchExport();
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-sky-300 hover:bg-slate-800"
+                >
+                  <Files className="w-4 h-4 text-sky-400" />
+                  <span>Batch Export Steps (SVG / PNG)</span>
+                </button>
+              )}
 
               <div className="my-1 border-t border-slate-800" />
 

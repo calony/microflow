@@ -27,6 +27,7 @@ import {
   ArrowRight,
   Workflow,
   FileText,
+  Files,
 } from 'lucide-react';
 
 interface MultiStepFlowViewProps {
@@ -34,6 +35,7 @@ interface MultiStepFlowViewProps {
   thicknessUnit?: ThicknessUnit;
   onSelectStepIndex: (idx: number) => void;
   onUpdateFlow?: (updatedFlow: ProcessFlow) => void;
+  onOpenBatchExport?: () => void;
   onClose: () => void;
 }
 
@@ -121,6 +123,7 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
   thicknessUnit = 'nm',
   onSelectStepIndex,
   onUpdateFlow,
+  onOpenBatchExport,
   onClose,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1192,6 +1195,18 @@ export const MultiStepFlowView: React.FC<MultiStepFlowViewProps> = ({
             <Download className="w-3.5 h-3.5" />
             <span>{isExporting ? 'Exporting...' : 'PNG'}</span>
           </button>
+
+          {onOpenBatchExport && (
+            <button
+              type="button"
+              onClick={onOpenBatchExport}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 hover:text-sky-200 text-[11px] font-medium transition-colors"
+              title="Batch export all cross-section steps as individual SVG or PNG files"
+            >
+              <Files className="w-3.5 h-3.5 text-sky-400" />
+              <span className="hidden sm:inline">Batch Steps</span>
+            </button>
+          )}
 
           <button
             type="button"

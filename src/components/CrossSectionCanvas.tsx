@@ -10,7 +10,9 @@ import {
   Material,
   CrossSectionMesh,
   RenderedPolygon,
+  SacrificialReleaseRegion,
 } from '../types/microfab';
+import { doesSegmentMatchReleaseSide } from '../lib/simulationEngine';
 import { SvgPatterns } from './SvgPatterns';
 import { getMaterialById } from '../lib/materials';
 import { ThicknessUnit, formatThickness } from '../lib/units';
@@ -19,6 +21,14 @@ import {
   STACK_PROBE_COLORS,
   StackProbeSample,
 } from '../lib/stackProbeUtils';
+import {
+  PiecewiseZMode,
+  CustomZZonesConfig,
+  computePiecewiseZTransform,
+  subdividePolygonAtBreakpoints,
+  formatLocalGain,
+} from '../lib/piecewiseZScale';
+import { PiecewiseZPopover } from './PiecewiseZPopover';
 import {
   ZoomIn,
   ZoomOut,
@@ -35,6 +45,7 @@ import {
   ArrowUpRight,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   X,
   Square,
   Axis3d,
@@ -46,6 +57,9 @@ import {
   Trash2,
   Copy,
   Check,
+  Files,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 
 interface StackProbePoint {
@@ -62,6 +76,7 @@ interface InsetStepOption {
 interface CrossSectionCanvasProps {
   mesh: CrossSectionMesh;
   polygons: RenderedPolygon[];
+  sharedYBounds?: { minY: number; maxY: number };
   materials: Material[];
   waferWidth: number; // nm
   flowId?: string;
@@ -87,11 +102,31 @@ interface CrossSectionCanvasProps {
   onNextStep?: () => void;
   canPrevStep?: boolean;
   canNextStep?: boolean;
+  activeReleaseConfig?: {
+    targetMaterialId: string;
+    side: ProcessSide;
+    releaseScope: 'all' | 'regions';
+    regions: SacrificialReleaseRegion[];
+  } | null;
+  preReleaseMesh?: CrossSectionMesh | null;
+  preReleasePolygons?: RenderedPolygon[];
+  pickReleaseMode?: boolean;
+  onTogglePickReleaseMode?: () => void;
+  onAddReleaseRegion?: (region: {
+    xStart: number;
+    xEnd: number;
+    yMin?: number;
+    yMax?: number;
+  }) => void;
+  onRemoveReleaseRegion?: (regionId: string) => void;
+  onClearReleaseRegions?: () => void;
+  onOpenBatchExport?: () => void;
 }
 
 export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   mesh,
   polygons,
+  sharedYBounds,
   materials,
   waferWidth,
   flowId,
@@ -117,6 +152,14 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   onNextStep,
   canPrevStep = false,
   canNextStep = false,
+  activeReleaseConfig = null,
+  preReleaseMesh = null,
+  preReleasePolygons,
+  pickReleaseMode = false,
+  onTogglePickReleaseMode,
+  onAddReleaseRegion,
+  onClearReleaseRegions,
+  onOpenBatchExport,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -180,6 +223,31 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Vertical Z-exaggeration factor (essential in semiconductor CAD)
   const [zScale, setZScale] = useState<number>(2.0);
+  const [lockSharedYScale, setLockSharedYScale] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('microflow_lock_shared_y_scale') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('microflow_lock_shared_y_scale', String(lockSharedYScale));
+    } catch {
+      // ignore
+    }
+  }, [lockSharedYScale]);
+
+  // Piecewise Z-axis scaling for multi-order-of-magnitude layer stacks
+  const [piecewiseMode, setPiecewiseMode] = useState<PiecewiseZMode>('linear');
+  const [autoCompression, setAutoCompression] = useState<number>(0.75);
+  const [customZConfig, setCustomZConfig] = useState<CustomZZonesConfig>({
+    breakpointsNm: [],
+    zoneGains: [1],
+  });
+  const [showPiecewisePopover, setShowPiecewisePopover] = useState<boolean>(false);
+  const piecewiseMenuRef = useRef<HTMLDivElement>(null);
 
   // Measurement caliper tool
   const [measureMode, setMeasureMode] = useState<boolean>(false);
@@ -191,6 +259,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Hovered layer inspector & cursor SVG coordinate
   const [hoveredPolygon, setHoveredPolygon] = useState<RenderedPolygon | null>(null);
+  const [hoveredGhostPolygon, setHoveredGhostPolygon] = useState<RenderedPolygon | null>(null);
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [hoverWorldPos, setHoverWorldPos] = useState<{ x: number; y: number } | null>(null);
   const [hoverSvgPos, setHoverSvgPos] = useState<{ x: number; y: number } | null>(null);
@@ -202,6 +271,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   const [showLegend, setShowLegend] = useState<boolean>(true);
   const [insetExpanded, setInsetExpanded] = useState<boolean>(false);
   const [stackProbeMode, setStackProbeMode] = useState<boolean>(false);
+  const [releaseDragSelection, setReleaseDragSelection] = useState<{
+    startX: number;
+    startY: number;
+    endX: number;
+    endY: number;
+  } | null>(null);
   const [stackProbes, setStackProbes] = useState<StackProbePoint[]>([]);
   const [draggingProbeId, setDraggingProbeId] = useState<string | null>(null);
   const [manualProbeXUm, setManualProbeXUm] = useState<string>('');
@@ -287,9 +362,55 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     };
   }, [polygons, waferWidth, mesh.minY, mesh.maxY]);
 
-  const rawMinY = boundMinY;
-  const rawMaxY = boundMaxY;
+  const useSharedYScale = lockSharedYScale && Boolean(sharedYBounds);
+  const rawMinY = useSharedYScale
+    ? Math.min(boundMinY, sharedYBounds!.minY)
+    : boundMinY;
+  const rawMaxY = useSharedYScale
+    ? Math.max(boundMaxY, sharedYBounds!.maxY, 2500)
+    : boundMaxY;
   const actualSpan = Math.max(300, rawMaxY - rawMinY);
+
+  // Piecewise Z-axis transform & auto-detection preview
+  const zTransform = useMemo(
+    () =>
+      computePiecewiseZTransform({
+        mode: piecewiseMode,
+        polygons,
+        rawMinY,
+        rawMaxY,
+        waferWidth,
+        autoCompression,
+        customConfig: customZConfig,
+      }),
+    [piecewiseMode, polygons, rawMinY, rawMaxY, waferWidth, autoCompression, customZConfig]
+  );
+
+  const autoPreviewTransform = useMemo(
+    () =>
+      piecewiseMode === 'auto'
+        ? zTransform
+        : computePiecewiseZTransform({
+            mode: 'auto',
+            polygons,
+            rawMinY,
+            rawMaxY,
+            waferWidth,
+            autoCompression,
+          }),
+    [piecewiseMode, zTransform, polygons, rawMinY, rawMaxY, waferWidth, autoCompression]
+  );
+
+  // Subdivide polygon edges at interior Z-breakpoints so diagonal sidewalls remain C^0 exact
+  const subdividedPolygons = useMemo(() => {
+    if (!zTransform.isActive || zTransform.breakpoints.length === 0) {
+      return polygons;
+    }
+    return polygons.map((poly) => ({
+      ...poly,
+      points: subdividePolygonAtBreakpoints(poly.points, zTransform.breakpoints),
+    }));
+  }, [polygons, zTransform]);
 
   const effectiveMinY = lockedMetrics ? lockedMetrics.rawMinY : rawMinY;
   const effectiveSpan = lockedMetrics ? lockedMetrics.heightSpan : actualSpan;
@@ -317,28 +438,30 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     );
   }, [actualSpan, rawMinY, paddingX, datumScreenY, contentWidth, contentHeight]);
 
-  // World point to Screen point
+  // World point to Screen point (applies piecewise Z mapping when active)
   const toScreen = useCallback(
     (x: number, y: number) => {
       const sx = effectivePaddingX + x * scaleX;
+      const visY = zTransform.mapY(y);
       // Cleanroom physics: bottom of wafer is anchored to bottom datum line
-      const sy = effectiveDatumScreenY - (y - effectiveMinY) * scaleY;
+      const sy = effectiveDatumScreenY - (visY - effectiveMinY) * scaleY;
       return { x: sx, y: sy };
     },
-    [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX]
+    [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX, zTransform]
   );
 
-  // Screen point to World nm
+  // Screen point to World nm (inverts piecewise Z mapping when active)
   const toWorld = useCallback(
     (sx: number, sy: number) => {
       const wx = (sx - effectivePaddingX) / scaleX;
-      const wy = effectiveMinY + (effectiveDatumScreenY - sy) / scaleY;
+      const visY = effectiveMinY + (effectiveDatumScreenY - sy) / scaleY;
+      const wy = zTransform.unmapY(visY);
       return { x: Math.max(0, Math.min(waferWidth, wx)), y: wy };
     },
-    [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX, waferWidth]
+    [scaleX, scaleY, effectiveMinY, effectiveDatumScreenY, effectivePaddingX, waferWidth, zTransform]
   );
 
-  // Screen-space snap lookup for Caliper (vertices > edge midpoints > edge projections)
+  // Screen-space snap lookup for Ruler (vertices > edge midpoints > edge projections)
   const findGeometrySnap = useCallback(
     (
       unscaledSx: number,
@@ -361,22 +484,30 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       let bestEdge: { x: number; y: number } | null = null;
       let bestEdgeDist = edgeThreshold;
 
+      // Snap true geometry vertices from original polygons
       for (const poly of polygons) {
+        const pts = poly.points;
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i];
+          const sA = toScreen(a.x, a.y);
+          const vDist = Math.hypot(unscaledSx - sA.x, unscaledSy - sA.y);
+          if (vDist < bestVertexDist) {
+            bestVertexDist = vDist;
+            bestVertex = { x: a.x, y: a.y };
+          }
+        }
+      }
+
+      // Snap midpoints & edges along band-subdivided polygon segments
+      for (const poly of subdividedPolygons) {
         const pts = poly.points;
         const n = pts.length;
         if (n < 2) continue;
 
         for (let i = 0; i < n; i++) {
           const a = pts[i];
-          const sA = toScreen(a.x, a.y);
-
-          const vDist = Math.hypot(unscaledSx - sA.x, unscaledSy - sA.y);
-          if (vDist < bestVertexDist) {
-            bestVertexDist = vDist;
-            bestVertex = { x: a.x, y: a.y };
-          }
-
           const b = pts[(i + 1) % n];
+          const sA = toScreen(a.x, a.y);
           const sB = toScreen(b.x, b.y);
           const dx = sB.x - sA.x;
           const dy = sB.y - sA.y;
@@ -415,7 +546,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       if (bestEdge) return { point: bestEdge, kind: 'edge' };
       return null;
     },
-    [polygons, zoom, toScreen]
+    [polygons, subdividedPolygons, zoom, toScreen]
   );
 
   const activeSnapTarget = useMemo(() => {
@@ -591,8 +722,8 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       y: (svgHeight - bottomPadding) - (y - rawMinY) * actualScaleY,
     });
 
-    const pBL = project(boundMinX, boundMinY);
-    const pTR = project(boundMaxX, boundMaxY);
+    const pBL = project(boundMinX, zTransform.mapY(rawMinY));
+    const pTR = project(boundMaxX, zTransform.mapY(rawMaxY));
 
     const waferScreenW = Math.max(20, Math.abs(pTR.x - pBL.x));
     const waferScreenH = Math.max(20, Math.abs(pBL.y - pTR.y));
@@ -620,13 +751,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     setMeasurePoints([]);
   }, [
     boundMinX,
-    boundMinY,
     boundMaxX,
-    boundMaxY,
     rawMinY,
+    rawMaxY,
     actualSpan,
     waferWidth,
     zScale,
+    zTransform,
     contentWidth,
     contentHeight,
     svgWidth,
@@ -640,7 +771,49 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   useEffect(() => {
     setLockedMetrics(null);
     setStackProbes([]);
+    setCustomZConfig({ breakpointsNm: [], zoneGains: [1] });
+    setPiecewiseMode((prev) => (prev === 'custom' ? 'auto' : prev));
   }, [flowId]);
+
+  const handleSeedCustomFromAuto = useCallback(() => {
+    const bps = [...autoPreviewTransform.breakpoints];
+    const gains = autoPreviewTransform.bands.map((b) =>
+      Math.max(0.01, Math.round(b.localGain * 100) / 100)
+    );
+    setCustomZConfig({
+      breakpointsNm: bps,
+      zoneGains: gains.length === bps.length + 1 ? gains : [1],
+    });
+    setPiecewiseMode('custom');
+    setLockedMetrics(null);
+  }, [autoPreviewTransform]);
+
+  const handleChangePiecewiseMode = useCallback(
+    (next: PiecewiseZMode) => {
+      if (next === 'custom' && customZConfig.breakpointsNm.length === 0 && autoPreviewTransform.isActive) {
+        handleSeedCustomFromAuto();
+        return;
+      }
+      setPiecewiseMode(next);
+      setLockedMetrics(null);
+    },
+    [customZConfig.breakpointsNm.length, autoPreviewTransform.isActive, handleSeedCustomFromAuto]
+  );
+
+  // Close Piecewise Z popover when clicking outside
+  useEffect(() => {
+    if (!showPiecewisePopover) return;
+    const handleOutside = (e: PointerEvent) => {
+      if (
+        piecewiseMenuRef.current &&
+        !piecewiseMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowPiecewisePopover(false);
+      }
+    };
+    window.addEventListener('pointerdown', handleOutside);
+    return () => window.removeEventListener('pointerdown', handleOutside);
+  }, [showPiecewisePopover]);
 
   useEffect(() => {
     setLockedMetrics(null);
@@ -772,7 +945,13 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         e.preventDefault();
         fitToScreen();
       } else if (e.key === 'Escape') {
-        if (zoomSelection) {
+        if (showPiecewisePopover) {
+          setShowPiecewisePopover(false);
+        } else if (releaseDragSelection) {
+          setReleaseDragSelection(null);
+        } else if (pickReleaseMode && onTogglePickReleaseMode) {
+          onTogglePickReleaseMode();
+        } else if (zoomSelection) {
           setZoomSelection(null);
         } else if (regionZoomMode) {
           setRegionZoomMode(false);
@@ -788,7 +967,18 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fitToScreen, zoomSelection, regionZoomMode, measureMode, stackProbeMode, isCssFullscreen]);
+  }, [
+    fitToScreen,
+    showPiecewisePopover,
+    releaseDragSelection,
+    pickReleaseMode,
+    onTogglePickReleaseMode,
+    zoomSelection,
+    regionZoomMode,
+    measureMode,
+    stackProbeMode,
+    isCssFullscreen,
+  ]);
 
   useEffect(() => {
     const syncModifiers = (e: KeyboardEvent) => {
@@ -869,6 +1059,285 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       window.removeEventListener('pointercancel', handleWindowPointerUp);
     };
   }, [zoomSelection !== null, clientToSvg, commitRegionZoom, svgWidth, svgHeight, ctrlKeyDown]);
+
+  // Clear conflicting tools when entering Sacrificial Release Pick Mode
+  useEffect(() => {
+    if (pickReleaseMode) {
+      setRegionZoomMode(false);
+      setZoomSelection(null);
+      setMeasureMode(false);
+      setMeasurePoints([]);
+      setStackProbeMode(false);
+    } else {
+      setReleaseDragSelection(null);
+      setHoveredGhostPolygon(null);
+    }
+  }, [pickReleaseMode]);
+
+  const releaseSourceMesh = pickReleaseMode && preReleaseMesh ? preReleaseMesh : mesh;
+  const releaseSourcePolygons = pickReleaseMode && preReleasePolygons ? preReleasePolygons : polygons;
+
+  // Identify pre-release polygons eligible for sacrificial release on the selected material & side
+  const pickablePolygonIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (
+      !pickReleaseMode ||
+      !activeReleaseConfig ||
+      releaseSourceMesh.columns.length === 0 ||
+      releaseSourceMesh.width <= 0
+    ) {
+      return ids;
+    }
+    const { targetMaterialId, side } = activeReleaseConfig;
+    const cols = releaseSourceMesh.columns;
+    const nCols = cols.length;
+    for (const poly of releaseSourcePolygons) {
+      if (poly.materialId !== targetMaterialId) continue;
+      const startCol = Math.max(0, Math.floor((poly.xMin / releaseSourceMesh.width) * nCols));
+      const endCol = Math.min(nCols - 1, Math.ceil((poly.xMax / releaseSourceMesh.width) * nCols));
+      let matched = false;
+      for (let c = startCol; c <= endCol && !matched; c++) {
+        const col = cols[c];
+        if (col.x < poly.xMin - 20 || col.x > poly.xMax + 20) continue;
+        for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+          const seg = col.segments[sIdx];
+          if (seg.materialId !== targetMaterialId) continue;
+          const midY = (seg.yBottom + seg.yTop) * 0.5;
+          if (midY < poly.yMin - 2 || midY > poly.yMax + 2) continue;
+          if (doesSegmentMatchReleaseSide(col, sIdx, seg, targetMaterialId, side)) {
+            matched = true;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        ids.add(poly.id);
+      }
+    }
+    return ids;
+  }, [pickReleaseMode, activeReleaseConfig, releaseSourcePolygons, releaseSourceMesh]);
+
+  const subdividedPickableGhostPolygons = useMemo(() => {
+    if (!pickReleaseMode || pickablePolygonIds.size === 0) return [];
+    const pickable = releaseSourcePolygons.filter((p) => pickablePolygonIds.has(p.id));
+    if (!zTransform.isActive || zTransform.breakpoints.length === 0) {
+      return pickable;
+    }
+    return pickable.map((poly) => ({
+      ...poly,
+      points: subdividePolygonAtBreakpoints(poly.points, zTransform.breakpoints),
+    }));
+  }, [pickReleaseMode, pickablePolygonIds, releaseSourcePolygons, zTransform]);
+
+  const hasMultipleStackedTargetSegments = useCallback(
+    (xStart: number, xEnd: number, targetMaterialId: string, side: ProcessSide) => {
+      if (releaseSourceMesh.columns.length === 0 || releaseSourceMesh.width <= 0) return false;
+      const nCols = releaseSourceMesh.columns.length;
+      const cStart = Math.max(0, Math.floor((xStart / releaseSourceMesh.width) * nCols));
+      const cEnd = Math.min(nCols - 1, Math.ceil((xEnd / releaseSourceMesh.width) * nCols));
+      for (let c = cStart; c <= cEnd; c++) {
+        const col = releaseSourceMesh.columns[c];
+        if (col.x < xStart - 1e-6 || col.x > xEnd + 1e-6) continue;
+        let count = 0;
+        for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+          const seg = col.segments[sIdx];
+          if (
+            seg.materialId === targetMaterialId &&
+            doesSegmentMatchReleaseSide(col, sIdx, seg, targetMaterialId, side)
+          ) {
+            count++;
+            if (count >= 2) return true;
+          }
+        }
+      }
+      return false;
+    },
+    [releaseSourceMesh]
+  );
+
+  const findPickablePolygonAtPoint = useCallback(
+    (worldX: number, worldY: number): RenderedPolygon | null => {
+      if (hoveredGhostPolygon && pickablePolygonIds.has(hoveredGhostPolygon.id)) {
+        return hoveredGhostPolygon;
+      }
+      if (hoveredPolygon && pickablePolygonIds.has(hoveredPolygon.id)) {
+        return hoveredPolygon;
+      }
+      for (const poly of releaseSourcePolygons) {
+        if (!pickablePolygonIds.has(poly.id)) continue;
+        if (
+          worldX < poly.xMin - 2 ||
+          worldX > poly.xMax + 2 ||
+          worldY < poly.yMin - 2 ||
+          worldY > poly.yMax + 2
+        ) {
+          continue;
+        }
+        const pts = poly.points;
+        let inside = false;
+        for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+          const xi = pts[i].x;
+          const yi = pts[i].y;
+          const xj = pts[j].x;
+          const yj = pts[j].y;
+          const intersect =
+            yi > worldY !== yj > worldY &&
+            worldX < ((xj - xi) * (worldY - yi)) / (yj - yi + 1e-12) + xi;
+          if (intersect) inside = !inside;
+        }
+        if (inside) return poly;
+      }
+      return null;
+    },
+    [hoveredGhostPolygon, hoveredPolygon, pickablePolygonIds, releaseSourcePolygons]
+  );
+
+  const commitReleaseSelection = useCallback(
+    (sel: { startX: number; startY: number; endX: number; endY: number }) => {
+      if (!onAddReleaseRegion || !activeReleaseConfig) return;
+      const dxPx = Math.abs(sel.endX - sel.startX);
+      const dyPx = Math.abs(sel.endY - sel.startY);
+      const { targetMaterialId, side, regions } = activeReleaseConfig;
+
+      const isDuplicate = (cand: { xStart: number; xEnd: number; yMin?: number; yMax?: number }) =>
+        regions.some((r) => {
+          const rx1 = Math.min(r.xStart, r.xEnd);
+          const rx2 = Math.max(r.xStart, r.xEnd);
+          if (Math.abs(rx1 - cand.xStart) > 2 || Math.abs(rx2 - cand.xEnd) > 2) return false;
+          if (cand.yMin === undefined && r.yMin === undefined) return true;
+          if (cand.yMin !== undefined && r.yMin !== undefined && r.yMax !== undefined && cand.yMax !== undefined) {
+            return (
+              Math.abs(Math.min(r.yMin, r.yMax) - cand.yMin) <= 2 &&
+              Math.abs(Math.max(r.yMin, r.yMax) - cand.yMax) <= 2
+            );
+          }
+          return false;
+        });
+
+      // Single click: pick the exact highlighted polygon pocket/layer to protect (keep intact)
+      if (dxPx < 6 && dyPx < 6) {
+        const unscaledX = (sel.startX - pan.x) / zoom;
+        const unscaledY = (sel.startY - pan.y) / zoom;
+        const worldPt = toWorld(unscaledX, unscaledY);
+        const clickedPoly = findPickablePolygonAtPoint(worldPt.x, worldPt.y);
+        if (!clickedPoly) return;
+
+        const isStacked = hasMultipleStackedTargetSegments(
+          clickedPoly.xMin,
+          clickedPoly.xMax,
+          targetMaterialId,
+          side
+        );
+        const cand = isStacked
+          ? {
+              xStart: Math.round(clickedPoly.xMin),
+              xEnd: Math.round(clickedPoly.xMax),
+              yMin: Math.round(clickedPoly.yMin),
+              yMax: Math.round(clickedPoly.yMax),
+            }
+          : {
+              xStart: Math.round(clickedPoly.xMin),
+              xEnd: Math.round(clickedPoly.xMax),
+            };
+        if (!isDuplicate(cand)) {
+          onAddReleaseRegion(cand);
+        }
+        return;
+      }
+
+      // Drag box / X-range selection to protect (keep unetched)
+      const x1Svg = Math.min(sel.startX, sel.endX);
+      const x2Svg = Math.max(sel.startX, sel.endX);
+      const y1Svg = Math.min(sel.startY, sel.endY);
+      const y2Svg = Math.max(sel.startY, sel.endY);
+      const wTL = toWorld((x1Svg - pan.x) / zoom, (y1Svg - pan.y) / zoom);
+      const wBR = toWorld((x2Svg - pan.x) / zoom, (y2Svg - pan.y) / zoom);
+      const xStart = Math.max(0, Math.min(waferWidth, Math.min(wTL.x, wBR.x)));
+      const xEnd = Math.max(0, Math.min(waferWidth, Math.max(wTL.x, wBR.x)));
+      const yLo = Math.min(wTL.y, wBR.y);
+      const yHi = Math.max(wTL.y, wBR.y);
+      if (xEnd - xStart < 5) return;
+
+      const isStacked = hasMultipleStackedTargetSegments(xStart, xEnd, targetMaterialId, side);
+      if (isStacked && releaseSourceMesh.columns.length > 0 && releaseSourceMesh.width > 0) {
+        // Only apply Z-bounding if the drag vertically isolated a strict subset of stacked layers
+        let overlapsAny = false;
+        let missesAny = false;
+        const nCols = releaseSourceMesh.columns.length;
+        const cStart = Math.max(0, Math.floor((xStart / releaseSourceMesh.width) * nCols));
+        const cEnd = Math.min(nCols - 1, Math.ceil((xEnd / releaseSourceMesh.width) * nCols));
+        for (let c = cStart; c <= cEnd; c++) {
+          const col = releaseSourceMesh.columns[c];
+          if (col.x < xStart - 1e-6 || col.x > xEnd + 1e-6) continue;
+          for (let sIdx = 0; sIdx < col.segments.length; sIdx++) {
+            const seg = col.segments[sIdx];
+            if (
+              seg.materialId !== targetMaterialId ||
+              !doesSegmentMatchReleaseSide(col, sIdx, seg, targetMaterialId, side)
+            ) {
+              continue;
+            }
+            const segOverlaps = seg.yTop > yLo && seg.yBottom < yHi;
+            if (segOverlaps) overlapsAny = true;
+            else missesAny = true;
+          }
+        }
+        if (overlapsAny && missesAny) {
+          onAddReleaseRegion({ xStart, xEnd, yMin: yLo, yMax: yHi });
+          return;
+        }
+      }
+
+      onAddReleaseRegion({ xStart, xEnd });
+    },
+    [
+      onAddReleaseRegion,
+      activeReleaseConfig,
+      pan.x,
+      pan.y,
+      zoom,
+      toWorld,
+      findPickablePolygonAtPoint,
+      hasMultipleStackedTargetSegments,
+      waferWidth,
+      releaseSourceMesh,
+    ]
+  );
+
+  // Complete sacrificial release drag selection even if pointer leaves SVG bounds
+  useEffect(() => {
+    if (!releaseDragSelection) return;
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      const svgP = clientToSvg(e.clientX, e.clientY);
+      if (!svgP) return;
+      setReleaseDragSelection((prev) =>
+        prev
+          ? {
+              ...prev,
+              endX: Math.max(0, Math.min(svgWidth, svgP.x)),
+              endY: Math.max(0, Math.min(svgHeight, svgP.y)),
+            }
+          : null
+      );
+    };
+    const handleWindowPointerUp = (e: PointerEvent) => {
+      const isCancel = e.type === 'pointercancel';
+      setReleaseDragSelection((prev) => {
+        if (prev && !isCancel) {
+          commitReleaseSelection(prev);
+        }
+        return null;
+      });
+    };
+    window.addEventListener('pointermove', handleWindowPointerMove);
+    window.addEventListener('pointerup', handleWindowPointerUp);
+    window.addEventListener('pointercancel', handleWindowPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', handleWindowPointerUp);
+      window.removeEventListener('pointercancel', handleWindowPointerUp);
+    };
+  }, [releaseDragSelection !== null, clientToSvg, commitReleaseSelection, svgWidth, svgHeight]);
 
   // Drag floating step inset smoothly inside the cross-section viewport
   useEffect(() => {
@@ -1108,6 +1577,16 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
     const svgP = clientToSvg(e.clientX, e.clientY);
 
+    if (pickReleaseMode && svgP) {
+      setReleaseDragSelection({
+        startX: svgP.x,
+        startY: svgP.y,
+        endX: svgP.x,
+        endY: svgP.y,
+      });
+      return;
+    }
+
     if (regionZoomMode && svgP) {
       setCtrlKeyDown(e.ctrlKey);
       setZoomSelection({
@@ -1275,7 +1754,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
       }
     >
       {/* Top CAD Control Bar - Responsive layout */}
-      <div className="flex flex-wrap items-center justify-between px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-900 border-b border-slate-800 text-xs gap-1.5 sm:gap-2 min-w-0">
+      <div className="relative z-30 flex flex-wrap items-center justify-between px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-900 border-b border-slate-800 text-xs gap-1.5 sm:gap-2 min-w-0">
         {/* Left: Status & Active Step Title */}
         <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 truncate">
           <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-emerald-400 shrink-0 animate-pulse" />
@@ -1360,6 +1839,84 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
               <option value="3.5" className="bg-slate-900">3.5x</option>
               <option value="5.0" className="bg-slate-900">5.0x</option>
             </select>
+          </div>
+
+          {/* Lock Shared Y-Axis Scale Across All Steps */}
+          <button
+            type="button"
+            onClick={() => {
+              setLockSharedYScale((prev) => !prev);
+              setLockedMetrics(null);
+            }}
+            aria-pressed={lockSharedYScale}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors shrink-0 ${
+              lockSharedYScale
+                ? 'bg-amber-500/20 border-amber-400/60 text-amber-200 shadow-sm'
+                : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700'
+            }`}
+            title={
+              lockSharedYScale
+                ? 'Y-Axis Scale Locked Across All Steps (click to fit each step individually)'
+                : 'Lock Y-Axis Scale Across All Process Steps for 1:1 Thickness Comparison'
+            }
+          >
+            {lockSharedYScale ? (
+              <Lock className="w-3.5 h-3.5 text-amber-300" />
+            ) : (
+              <Unlock className="w-3.5 h-3.5 text-slate-400" />
+            )}
+            <span className="hidden md:inline">Lock Y</span>
+          </button>
+
+          {/* Piecewise Z-Axis Scaling Selector */}
+          <div ref={piecewiseMenuRef} className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowPiecewisePopover((v) => !v)}
+              aria-expanded={showPiecewisePopover}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-medium transition-colors ${
+                piecewiseMode !== 'linear'
+                  ? zTransform.isActive
+                    ? 'bg-cyan-500/20 border-cyan-400/60 text-cyan-200'
+                    : 'bg-sky-600/20 border-sky-500/40 text-sky-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+              }`}
+              title="Piecewise Z-Axis Scaling for multi-order-of-magnitude layers"
+            >
+              <span className="font-mono text-[10px] text-slate-400">Z-Map:</span>
+              <span className="font-mono text-[10px]">
+                {piecewiseMode === 'linear'
+                  ? 'Linear'
+                  : piecewiseMode === 'auto'
+                  ? zTransform.isActive
+                    ? `Auto (${zTransform.bands.length})`
+                    : 'Auto (1)'
+                  : `Custom (${zTransform.bands.length})`}
+              </span>
+              {piecewiseMode === 'linear' && autoPreviewTransform.isActive && (
+                <span
+                  className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0"
+                  title={`${autoPreviewTransform.bands.length} Z-scale regimes detected`}
+                />
+              )}
+              <ChevronDown className="w-3 h-3 opacity-70" />
+            </button>
+
+            {showPiecewisePopover && (
+              <PiecewiseZPopover
+                mode={piecewiseMode}
+                onChangeMode={handleChangePiecewiseMode}
+                autoCompression={autoCompression}
+                onChangeAutoCompression={setAutoCompression}
+                customConfig={customZConfig}
+                onChangeCustomConfig={setCustomZConfig}
+                zTransform={zTransform}
+                autoPreviewTransform={autoPreviewTransform}
+                thicknessUnit={thicknessUnit}
+                onSeedCustomFromAuto={handleSeedCustomFromAuto}
+                onClose={() => setShowPiecewisePopover(false)}
+              />
+            )}
           </div>
 
           {/* Hatch vs Solid toggle */}
@@ -1461,6 +2018,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                   setRegionZoomMode(false);
                   setZoomSelection(null);
                   setStackProbeMode(false);
+                  if (pickReleaseMode && onTogglePickReleaseMode) {
+                    onTogglePickReleaseMode();
+                  }
                 }
               }}
               className={`flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors ${
@@ -1505,6 +2065,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 setRegionZoomMode(false);
                 setZoomSelection(null);
                 setMeasureMode(false);
+                if (pickReleaseMode && onTogglePickReleaseMode) {
+                  onTogglePickReleaseMode();
+                }
               }
             }}
             aria-pressed={stackProbeMode}
@@ -1530,11 +2093,23 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           <button
             onClick={handleExportSingleSvg}
             className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-[11px] transition-colors"
-            title="Download SVG Vector"
+            title="Download Current Step SVG Vector"
           >
             <Download className="w-3.5 h-3.5" />
             <span className="hidden lg:inline">SVG</span>
           </button>
+
+          {onOpenBatchExport && (
+            <button
+              type="button"
+              onClick={onOpenBatchExport}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 hover:text-sky-200 text-[11px] font-medium transition-colors"
+              title="Batch Export All Steps as Individual SVG or PNG Files"
+            >
+              <Files className="w-3.5 h-3.5 text-sky-400" />
+              <span className="hidden lg:inline">Batch</span>
+            </button>
+          )}
 
           {/* Canvas Fullscreen Display Mode Toggle */}
           <button
@@ -1570,7 +2145,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
               : 'cursor-zoom-in'
             : draggingProbeId
             ? 'cursor-ew-resize'
-            : measureMode || stackProbeMode
+            : pickReleaseMode || measureMode || stackProbeMode
             ? 'cursor-crosshair'
             : isPanning
             ? 'cursor-grabbing'
@@ -1621,7 +2196,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
             {/* Simulated Material Polygons */}
             <g id="wafer-layers">
-              {polygons.map((poly) => {
+              {subdividedPolygons.map((poly) => {
                 const mat = getMaterialById(materials, poly.materialId);
                 const isHovered = hoveredPolygon?.id === poly.id;
                 const pathStr = getTransformedPath(poly.points);
@@ -1635,6 +2210,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                     key={poly.id}
                     d={pathStr}
                     fill={fillRef}
+                    fillOpacity={pickReleaseMode ? 0.65 : 1}
                     stroke={
                       isHovered
                         ? '#38bdf8'
@@ -1650,6 +2226,97 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                 );
               })}
             </g>
+
+            {/* Pre-Release Sacrificial Ghost Pockets (clickable to protect / keep unetched) */}
+            {pickReleaseMode && subdividedPickableGhostPolygons.length > 0 && (
+              <g id="sacrificial-release-ghosts">
+                {subdividedPickableGhostPolygons.map((poly) => {
+                  const isGhostHovered = hoveredGhostPolygon?.id === poly.id;
+                  const pathStr = getTransformedPath(poly.points);
+                  return (
+                    <path
+                      key={`ghost_${poly.id}`}
+                      d={pathStr}
+                      fill={isGhostHovered ? 'rgba(16, 185, 129, 0.28)' : 'rgba(251, 191, 36, 0.14)'}
+                      stroke={isGhostHovered ? '#34d399' : '#fbbf24'}
+                      strokeWidth={isGhostHovered ? 2.5 : 1.6}
+                      strokeDasharray="4 3"
+                      className="cursor-crosshair transition-colors"
+                      onMouseEnter={() => setHoveredGhostPolygon(poly)}
+                      onMouseLeave={() => setHoveredGhostPolygon(null)}
+                    />
+                  );
+                })}
+              </g>
+            )}
+
+            {/* Protected (Non-Etched) Keep Region Overlays */}
+            {activeReleaseConfig &&
+              activeReleaseConfig.releaseScope === 'regions' &&
+              activeReleaseConfig.regions.length > 0 && (() => {
+                const invZ = 1 / Math.max(0.12, zoom);
+                const fullTopY = toScreen(0, rawMaxY).y - 14 * invZ;
+                const fullBotY = toScreen(0, rawMinY).y + 6 * invZ;
+
+                return (
+                  <g id="sacrificial-release-regions" pointerEvents="none">
+                    {activeReleaseConfig.regions.map((reg, rIdx) => {
+                      const xLo = Math.max(0, Math.min(waferWidth, Math.min(reg.xStart, reg.xEnd)));
+                      const xHi = Math.max(0, Math.min(waferWidth, Math.max(reg.xStart, reg.xEnd)));
+                      if (xHi - xLo < 1) return null;
+                      const sx1 = toScreen(xLo, 0).x;
+                      const sx2 = toScreen(xHi, 0).x;
+                      const hasZBand = reg.yMin !== undefined && reg.yMax !== undefined;
+                      const yTopPx = hasZBand ? toScreen(0, Math.max(reg.yMin!, reg.yMax!)).y : fullTopY;
+                      const yBotPx = hasZBand ? toScreen(0, Math.min(reg.yMin!, reg.yMax!)).y : fullBotY;
+                      const boxTop = Math.min(yTopPx, yBotPx);
+                      const boxH = Math.max(8 * invZ, Math.abs(yBotPx - yTopPx));
+                      const boxW = Math.max(2 * invZ, sx2 - sx1);
+                      const midX = (sx1 + sx2) * 0.5;
+                      const badgeW = 28 * invZ;
+                      const badgeH = 14 * invZ;
+
+                      return (
+                        <g key={reg.id}>
+                          <rect
+                            x={sx1}
+                            y={boxTop}
+                            width={boxW}
+                            height={boxH}
+                            fill="#10b981"
+                            fillOpacity={pickReleaseMode ? 0.16 : 0.08}
+                            stroke="#10b981"
+                            strokeWidth={1.3 * invZ}
+                            strokeDasharray={`${5 * invZ} ${3 * invZ}`}
+                          />
+                          <rect
+                            x={midX - badgeW / 2}
+                            y={boxTop - badgeH - 2 * invZ}
+                            width={badgeW}
+                            height={badgeH}
+                            rx={3 * invZ}
+                            fill="#064e3b"
+                            fillOpacity="0.95"
+                            stroke="#34d399"
+                            strokeWidth={1 * invZ}
+                          />
+                          <text
+                            x={midX}
+                            y={boxTop - 5.5 * invZ}
+                            fill="#a7f3d0"
+                            fontSize={8.5 * invZ}
+                            fontWeight="700"
+                            fontFamily="JetBrains Mono, monospace"
+                            textAnchor="middle"
+                          >
+                            K{rIdx + 1}
+                          </text>
+                        </g>
+                      );
+                    })}
+                  </g>
+                );
+              })()}
 
             {/* Mounted Dicing Tape Ring Frame Brackets */}
             {mesh.mountedFrames && mesh.mountedFrames.length > 0 && (
@@ -1789,7 +2456,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                       {/* Wafer Orientation Markers (Frontside +Z / Backside -Z) */}
                       <text
                         x={effectivePaddingX}
-                        y={toScreen(0, rawMaxY).y - 10}
+                        y={toScreen(0, boundMaxY).y - 10}
                         fill={
                           activeStepSide === 'front' || !activeStepSide
                             ? '#38bdf8'
@@ -1819,6 +2486,265 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
                       >
                         ▼ BACKSIDE (-Z)
                       </text>
+
+                      {/* Shared Y-Axis Lock Envelope & Elevation Spine (when linear Z is active) */}
+                      {useSharedYScale && (() => {
+                        const invZ = Math.min(1.4, Math.max(0.45, 1 / Math.max(0.25, zoom)));
+                        const hasFrames = (mesh.mountedFrames?.length ?? 0) > 0;
+                        const spineX = effectivePaddingX - (hasFrames ? 42 : 12) * invZ;
+                        const topY = toScreen(0, rawMaxY).y;
+                        const botY = toScreen(0, rawMinY).y;
+                        const curTopY = toScreen(0, boundMaxY).y;
+                        const hasHeadroom = rawMaxY - boundMaxY > 25;
+                        const hasFloorroom = boundMinY - rawMinY > 25;
+
+                        return (
+                          <g id="shared-y-lock-guides" pointerEvents="none">
+                            {hasHeadroom && (
+                              <>
+                                <line
+                                  x1={effectivePaddingX}
+                                  y1={topY}
+                                  x2={effectivePaddingX + effectiveContentWidth}
+                                  y2={topY}
+                                  stroke="#fbbf24"
+                                  strokeOpacity="0.45"
+                                  strokeWidth={1.1 * invZ}
+                                  strokeDasharray={`${5 * invZ} ${4 * invZ}`}
+                                />
+                                <text
+                                  x={effectivePaddingX + effectiveContentWidth}
+                                  y={topY - 6 * invZ}
+                                  textAnchor="end"
+                                  fill="#fbbf24"
+                                  fillOpacity="0.85"
+                                  fontSize={8.5 * invZ}
+                                  fontWeight="600"
+                                  fontFamily="JetBrains Mono, monospace"
+                                >
+                                  Y-LOCK PEAK: {formatThickness(rawMaxY - rawMinY, thicknessUnit)}
+                                </text>
+                              </>
+                            )}
+                            {hasFloorroom && (
+                              <line
+                                x1={effectivePaddingX}
+                                y1={botY}
+                                x2={effectivePaddingX + effectiveContentWidth}
+                                y2={botY}
+                                stroke="#fbbf24"
+                                strokeOpacity="0.38"
+                                strokeWidth={1.1 * invZ}
+                                strokeDasharray={`${5 * invZ} ${4 * invZ}`}
+                              />
+                            )}
+                            {!zTransform.isActive && (
+                              <>
+                                <line
+                                  x1={spineX}
+                                  y1={topY}
+                                  x2={spineX}
+                                  y2={botY}
+                                  stroke="#fbbf24"
+                                  strokeOpacity="0.55"
+                                  strokeWidth={1.4 * invZ}
+                                />
+                                <line
+                                  x1={spineX - 4 * invZ}
+                                  y1={topY}
+                                  x2={spineX + 4 * invZ}
+                                  y2={topY}
+                                  stroke="#fbbf24"
+                                  strokeWidth={1.2 * invZ}
+                                />
+                                <text
+                                  x={spineX - 7 * invZ}
+                                  y={topY + 3 * invZ}
+                                  textAnchor="end"
+                                  fill="#fcd34d"
+                                  fontSize={8.5 * invZ}
+                                  fontFamily="JetBrains Mono, monospace"
+                                >
+                                  {formatThickness(rawMaxY - rawMinY, thicknessUnit)}
+                                </text>
+                                <line
+                                  x1={spineX - 4 * invZ}
+                                  y1={botY}
+                                  x2={spineX + 4 * invZ}
+                                  y2={botY}
+                                  stroke="#fbbf24"
+                                  strokeWidth={1.2 * invZ}
+                                />
+                                <text
+                                  x={spineX - 7 * invZ}
+                                  y={botY + 3 * invZ}
+                                  textAnchor="end"
+                                  fill="#fcd34d"
+                                  fontSize={8.5 * invZ}
+                                  fontFamily="JetBrains Mono, monospace"
+                                >
+                                  0
+                                </text>
+                                {hasHeadroom && botY - curTopY >= 14 * invZ && curTopY - topY >= 14 * invZ && (
+                                  <>
+                                    <line
+                                      x1={spineX - 3.5 * invZ}
+                                      y1={curTopY}
+                                      x2={spineX + 3.5 * invZ}
+                                      y2={curTopY}
+                                      stroke="#38bdf8"
+                                      strokeWidth={1.2 * invZ}
+                                    />
+                                    <text
+                                      x={spineX - 7 * invZ}
+                                      y={curTopY + 3 * invZ}
+                                      textAnchor="end"
+                                      fill="#7dd3fc"
+                                      fontSize={8 * invZ}
+                                      fontFamily="JetBrains Mono, monospace"
+                                    >
+                                      {formatThickness(boundMaxY - rawMinY, thicknessUnit)}
+                                    </text>
+                                  </>
+                                )}
+                              </>
+                            )}
+                          </g>
+                        );
+                      })()}
+
+                      {/* Piecewise Z-Axis Elevation Spine, Break Zigzags & Local Scale Badges */}
+                      {zTransform.isActive && (() => {
+                        const invZ = Math.min(1.4, Math.max(0.45, 1 / Math.max(0.25, zoom)));
+                        const hasFrames = (mesh.mountedFrames?.length ?? 0) > 0;
+                        const spineX = effectivePaddingX - (hasFrames ? 42 : 12) * invZ;
+                        const topY = toScreen(0, rawMaxY).y;
+                        const botY = toScreen(0, rawMinY).y;
+
+                        return (
+                          <g id="piecewise-z-axis" pointerEvents="none">
+                            {/* Dashed horizontal regime boundary lines across wafer */}
+                            {zTransform.breakpoints.map((bp, idx) => {
+                              const bpY = toScreen(0, bp).y;
+                              return (
+                                <g key={`pw_bp_${idx}`}>
+                                  <line
+                                    x1={spineX}
+                                    y1={bpY}
+                                    x2={effectivePaddingX + effectiveContentWidth}
+                                    y2={bpY}
+                                    stroke="#38bdf8"
+                                    strokeOpacity="0.28"
+                                    strokeWidth={1 * invZ}
+                                    strokeDasharray={`${5 * invZ} ${4 * invZ}`}
+                                  />
+                                  {/* Break zig-zag glyph on Z spine */}
+                                  <path
+                                    d={`M ${spineX - 4 * invZ} ${bpY + 2.5 * invZ} L ${spineX + 4 * invZ} ${bpY + 0.5 * invZ} M ${spineX - 4 * invZ} ${bpY - 0.5 * invZ} L ${spineX + 4 * invZ} ${bpY - 2.5 * invZ}`}
+                                    stroke="#38bdf8"
+                                    strokeWidth={1.3 * invZ}
+                                    fill="none"
+                                  />
+                                  <text
+                                    x={spineX - 7 * invZ}
+                                    y={bpY + 3 * invZ}
+                                    textAnchor="end"
+                                    fill="#7dd3fc"
+                                    fontSize={8.5 * invZ}
+                                    fontFamily="JetBrains Mono, monospace"
+                                  >
+                                    {formatThickness(bp - rawMinY, thicknessUnit)}
+                                  </text>
+                                </g>
+                              );
+                            })}
+
+                            {/* Top & Bottom spine end ticks */}
+                            <line
+                              x1={spineX - 4 * invZ}
+                              y1={topY}
+                              x2={spineX + 4 * invZ}
+                              y2={topY}
+                              stroke="#94a3b8"
+                              strokeWidth={1.2 * invZ}
+                            />
+                            <text
+                              x={spineX - 7 * invZ}
+                              y={topY + 3 * invZ}
+                              textAnchor="end"
+                              fill="#94a3b8"
+                              fontSize={8.5 * invZ}
+                              fontFamily="JetBrains Mono, monospace"
+                            >
+                              {formatThickness(rawMaxY - rawMinY, thicknessUnit)}
+                            </text>
+                            <line
+                              x1={spineX - 4 * invZ}
+                              y1={botY}
+                              x2={spineX + 4 * invZ}
+                              y2={botY}
+                              stroke="#94a3b8"
+                              strokeWidth={1.2 * invZ}
+                            />
+                            <text
+                              x={spineX - 7 * invZ}
+                              y={botY + 3 * invZ}
+                              textAnchor="end"
+                              fill="#94a3b8"
+                              fontSize={8.5 * invZ}
+                              fontFamily="JetBrains Mono, monospace"
+                            >
+                              0
+                            </text>
+
+                            {/* Vertical band segments + local Z gain badges */}
+                            {zTransform.bands.map((band) => {
+                              const yTopPx = toScreen(0, band.yMax).y;
+                              const yBotPx = toScreen(0, band.yMin).y;
+                              const gap = 3 * invZ;
+                              const segTop = yTopPx + (band.yMax < rawMaxY ? gap : 0);
+                              const segBot = yBotPx - (band.yMin > rawMinY ? gap : 0);
+                              const segH = Math.abs(segBot - segTop);
+                              const isExpanded = band.localGain > 1.15;
+                              const isCompressed = band.localGain < 0.85;
+                              const col = isExpanded
+                                ? '#22d3ee'
+                                : isCompressed
+                                ? '#f59e0b'
+                                : '#64748b';
+                              const midY = (segTop + segBot) * 0.5;
+
+                              return (
+                                <g key={`pw_spine_${band.id}`}>
+                                  {segBot > segTop && (
+                                    <line
+                                      x1={spineX}
+                                      y1={segTop}
+                                      x2={spineX}
+                                      y2={segBot}
+                                      stroke={col}
+                                      strokeWidth={2 * invZ}
+                                    />
+                                  )}
+                                  {segH >= 16 * invZ && (
+                                    <text
+                                      x={spineX - 7 * invZ}
+                                      y={midY + 3 * invZ}
+                                      textAnchor="end"
+                                      fill={col}
+                                      fontSize={8 * invZ}
+                                      fontWeight="600"
+                                      fontFamily="JetBrains Mono, monospace"
+                                    >
+                                      {formatLocalGain(band.localGain)}
+                                    </text>
+                                  )}
+                                </g>
+                              );
+                            })}
+                          </g>
+                        );
+                      })()}
                     </>
                   );
                 })()}
@@ -2212,6 +3138,57 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             );
           })()}
 
+          {/* Sacrificial Release Region Drag Selection Marquee */}
+          {releaseDragSelection && (() => {
+            const x = Math.min(releaseDragSelection.startX, releaseDragSelection.endX);
+            const y = Math.min(releaseDragSelection.startY, releaseDragSelection.endY);
+            const w = Math.abs(releaseDragSelection.endX - releaseDragSelection.startX);
+            const h = Math.abs(releaseDragSelection.endY - releaseDragSelection.startY);
+            const w1 = toWorld((x - pan.x) / zoom, (y - pan.y) / zoom);
+            const w2 = toWorld((x + w - pan.x) / zoom, (y + h - pan.y) / zoom);
+            const dxNm = Math.abs(w2.x - w1.x);
+            return (
+              <g pointerEvents="none">
+                <rect
+                  x={x}
+                  y={y}
+                  width={w}
+                  height={h}
+                  fill="rgba(16, 185, 129, 0.16)"
+                  stroke="#34d399"
+                  strokeWidth="1.6"
+                  strokeDasharray="5 3"
+                  rx="2"
+                />
+                {(w > 18 || h > 18) && (
+                  <g transform={`translate(${Math.min(svgWidth - 155, x)}, ${Math.max(20, y - 6)})`}>
+                    <rect
+                      x="0"
+                      y="-14"
+                      width="148"
+                      height="16"
+                      rx="3"
+                      fill="#064e3b"
+                      fillOpacity="0.95"
+                      stroke="#34d399"
+                      strokeWidth="0.9"
+                    />
+                    <text
+                      x="6"
+                      y="-3"
+                      fill="#a7f3d0"
+                      fontSize="9.5"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="600"
+                    >
+                      Keep ΔX {formatThickness(dxNm, thicknessUnit)}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          })()}
+
           {/* Cleanroom Scale Bar HUD in bottom-left */}
           {showAxesAndLabels && (
             <g transform={`translate(${Math.min(paddingX, 40)}, ${svgHeight - 20})`}>
@@ -2314,6 +3291,46 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             </g>
           )}
         </svg>
+
+        {/* Active Sacrificial Release Pick Mode Banner */}
+        {pickReleaseMode && !regionZoomMode && activeReleaseConfig && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            className="absolute top-3 left-3 z-10 flex flex-wrap items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/92 border border-emerald-500/60 text-emerald-200 text-[11px] font-medium shadow-lg backdrop-blur-md"
+          >
+            <Crosshair className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            <span>
+              Keep Regions ({getMaterialById(materials, activeReleaseConfig.targetMaterialId).name} ·{' '}
+              {activeReleaseConfig.side === 'front'
+                ? 'Front +Z'
+                : activeReleaseConfig.side === 'back'
+                ? 'Back -Z'
+                : 'Both ±Z'}
+              ): Click dashed pocket or drag X-range to protect (not etched)
+            </span>
+            <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-mono text-[10px]">
+              {activeReleaseConfig.regions.length} kept
+            </span>
+            {activeReleaseConfig.regions.length > 0 && onClearReleaseRegions && (
+              <button
+                type="button"
+                onClick={onClearReleaseRegions}
+                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-rose-950/60 text-slate-300 hover:text-rose-200 text-[10px]"
+              >
+                Clear
+              </button>
+            )}
+            {onTogglePickReleaseMode && (
+              <button
+                type="button"
+                onClick={onTogglePickReleaseMode}
+                className="px-1.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-semibold"
+              >
+                Done
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Active Magnifying Glass Mode Banner */}
         {regionZoomMode && (
@@ -2474,17 +3491,31 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             const insetOffsetX = (insetVbW - fSpanX * insetSx) / 2 - fMinX * insetSx;
             const insetCenterY = insetVbH / 2 + (fSpanY * insetSy) / 2;
 
+            const insetZTransform = computePiecewiseZTransform({
+              mode: piecewiseMode,
+              polygons: finalPolygons,
+              rawMinY: fMinY,
+              rawMaxY: fMaxY,
+              waferWidth,
+              autoCompression,
+              customConfig: customZConfig,
+            });
+
             const toInset = (x: number, y: number) => ({
               x: insetOffsetX + x * insetSx,
-              y: insetCenterY - (y - fMinY) * insetSy,
+              y: insetCenterY - (insetZTransform.mapY(y) - fMinY) * insetSy,
             });
 
             const buildInsetPath = (pts: { x: number; y: number }[]) => {
-              if (pts.length < 3) return '';
-              const first = toInset(pts[0].x, pts[0].y);
+              const subPts =
+                insetZTransform.isActive && insetZTransform.breakpoints.length > 0
+                  ? subdividePolygonAtBreakpoints(pts, insetZTransform.breakpoints)
+                  : pts;
+              if (subPts.length < 3) return '';
+              const first = toInset(subPts[0].x, subPts[0].y);
               let d = `M ${first.x.toFixed(1)} ${first.y.toFixed(1)}`;
-              for (let i = 1; i < pts.length; i++) {
-                const pt = toInset(pts[i].x, pts[i].y);
+              for (let i = 1; i < subPts.length; i++) {
+                const pt = toInset(subPts[i].x, subPts[i].y);
                 d += ` L ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
               }
               return d + ' Z';
@@ -2493,10 +3524,12 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             // Main canvas visible world bounds for zoomed-in ROI indicator
             const visLeftWx = ((0 - pan.x) / zoom - effectivePaddingX) / scaleX;
             const visRightWx = ((svgWidth - pan.x) / zoom - effectivePaddingX) / scaleX;
-            const visTopWy =
-              effectiveMinY + (effectiveDatumScreenY - (0 - pan.y) / zoom) / scaleY;
-            const visBotWy =
-              effectiveMinY + (effectiveDatumScreenY - (svgHeight - pan.y) / zoom) / scaleY;
+            const visTopWy = zTransform.unmapY(
+              effectiveMinY + (effectiveDatumScreenY - (0 - pan.y) / zoom) / scaleY
+            );
+            const visBotWy = zTransform.unmapY(
+              effectiveMinY + (effectiveDatumScreenY - (svgHeight - pan.y) / zoom) / scaleY
+            );
             const showRoiBox =
               lockedMetrics !== null &&
               (visRightWx - visLeftWx < fSpanX * 0.88 || visTopWy - visBotWy < fSpanY * 0.88);
@@ -2792,6 +3825,9 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
               if (next) {
                 setMeasureMode(false);
                 setStackProbeMode(false);
+                if (pickReleaseMode && onTogglePickReleaseMode) {
+                  onTogglePickReleaseMode();
+                }
               }
             }}
             className={`p-1.5 rounded-lg transition-colors ${
@@ -2821,56 +3857,72 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
         </div>
 
         {/* Hover Layer Inspector Tooltip */}
-        {hoveredPolygon && !zoomSelection && !measureMode && !stackProbeMode && !draggingProbeId && (
-          <div
-            className="absolute pointer-events-none z-20 px-3 py-2 rounded-xl bg-slate-900/95 border border-sky-500/50 text-white shadow-2xl backdrop-blur-md"
-            style={{
-              left: `${Math.min(svgWidth - 230, Math.max(10, mousePos.x + 15))}px`,
-              top: `${Math.max(10, Math.min(svgHeight - 108, mousePos.y - 78))}px`,
-            }}
-          >
-            {(() => {
-              const mat = getMaterialById(materials, hoveredPolygon.materialId);
-              const zSpanNm = Math.round(hoveredPolygon.yMax - hoveredPolygon.yMin);
-              const localNm = hoverWorldPos
-                ? computeLocalThicknessAtPoint(hoveredPolygon, hoverWorldPos.x, hoverWorldPos.y)
-                : null;
-              return (
-                <div className="space-y-1 text-xs">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span
-                        className="w-3 h-3 rounded-full border border-white/20 shrink-0"
-                        style={{ backgroundColor: mat.color }}
-                      />
-                      <span className="font-semibold text-sky-300 truncate">{mat.name}</span>
+        {(hoveredGhostPolygon || hoveredPolygon) &&
+          !zoomSelection &&
+          !measureMode &&
+          !stackProbeMode &&
+          !draggingProbeId && (() => {
+            const activePoly = (pickReleaseMode && hoveredGhostPolygon) || hoveredPolygon;
+            if (!activePoly) return null;
+            const isGhostTarget = Boolean(pickReleaseMode && hoveredGhostPolygon);
+            return (
+              <div
+                className={`absolute pointer-events-none z-20 px-3 py-2 rounded-xl bg-slate-900/95 border text-white shadow-2xl backdrop-blur-md ${
+                  isGhostTarget ? 'border-emerald-500/60' : 'border-sky-500/50'
+                }`}
+                style={{
+                  left: `${Math.min(svgWidth - 230, Math.max(10, mousePos.x + 15))}px`,
+                  top: `${Math.max(10, Math.min(svgHeight - 108, mousePos.y - 78))}px`,
+                }}
+              >
+                {(() => {
+                  const mat = getMaterialById(materials, activePoly.materialId);
+                  const zSpanNm = Math.round(activePoly.yMax - activePoly.yMin);
+                  const localNm = hoverWorldPos
+                    ? computeLocalThicknessAtPoint(activePoly, hoverWorldPos.x, hoverWorldPos.y)
+                    : null;
+                  return (
+                    <div className="space-y-1 text-xs">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className="w-3 h-3 rounded-full border border-white/20 shrink-0"
+                            style={{ backgroundColor: mat.color }}
+                          />
+                          <span className="font-semibold text-sky-300 truncate">{mat.name}</span>
+                        </div>
+                        <span className="text-[10px] text-slate-400 capitalize shrink-0">
+                          {mat.category}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono space-y-0.5 pt-0.5">
+                        <div className="flex items-center justify-between gap-3 text-slate-100">
+                          <span className="text-slate-400">Local Thickness:</span>
+                          <span className="font-semibold text-emerald-300">
+                            {formatThickness(localNm ?? zSpanNm, thicknessUnit)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 text-slate-300">
+                          <span className="text-slate-400">Total Z-Span:</span>
+                          <span>{formatThickness(zSpanNm, thicknessUnit)}</span>
+                        </div>
+                      </div>
+                      {activePoly.stepId && (
+                        <div className="text-[10px] text-slate-400 pt-0.5 border-t border-slate-800/80">
+                          Step: {activePoly.stepId}
+                        </div>
+                      )}
+                      {isGhostTarget && (
+                        <div className="text-[10px] font-semibold text-emerald-300 pt-0.5 border-t border-emerald-500/30">
+                          Click to keep intact (exclude from etch)
+                        </div>
+                      )}
                     </div>
-                    <span className="text-[10px] text-slate-400 capitalize shrink-0">
-                      {mat.category}
-                    </span>
-                  </div>
-                  <div className="text-[11px] font-mono space-y-0.5 pt-0.5">
-                    <div className="flex items-center justify-between gap-3 text-slate-100">
-                      <span className="text-slate-400">Local Thickness:</span>
-                      <span className="font-semibold text-emerald-300">
-                        {formatThickness(localNm ?? zSpanNm, thicknessUnit)}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-3 text-slate-300">
-                      <span className="text-slate-400">Total Z-Span:</span>
-                      <span>{formatThickness(zSpanNm, thicknessUnit)}</span>
-                    </div>
-                  </div>
-                  {hoveredPolygon.stepId && (
-                    <div className="text-[10px] text-slate-400 pt-0.5 border-t border-slate-800/80">
-                      Step: {hoveredPolygon.stepId}
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-          </div>
-        )}
+                  );
+                })()}
+              </div>
+            );
+          })()}
       </div>
 
       {/* Stack Thickness Multi-Location Inspector Drawer */}

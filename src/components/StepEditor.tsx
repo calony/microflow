@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ProcessStep,
   ProcessFlow,
@@ -21,6 +22,7 @@ import {
   EtchRecipe,
   DesignVariable,
   VariableUnit,
+  SacrificialReleaseRegion,
 } from '../types/microfab';
 import { ThicknessUnit, getUnitLabel, formatThickness } from '../lib/units';
 import { resolveResistMaterialId, isCrystallineKohMaterial, getMaterialById } from '../lib/materials';
@@ -40,12 +42,19 @@ import {
   deleteStepVariant,
   getActiveStepVariant,
 } from '../lib/variantUtils';
+import { resolveFlowParameters } from '../lib/variableUtils';
+import { simulateCrossSection, buildRenderPolygons } from '../lib/simulationEngine';
 import { ThicknessInput } from './ThicknessInput';
 import {
   ParametricThicknessInput,
   ParamBindingBadge,
   ParamBindingPanel,
 } from './ParamBindingControl';
+import {
+  BondingAlignmentControl,
+  resolveEffectiveShiftX,
+} from './BondingAlignmentControl';
+import { SvgPatterns } from './SvgPatterns';
 import {
   Layers,
   Sliders,
@@ -78,9 +87,14 @@ import {
   Bookmark,
   GitBranch,
   Copy,
+  Crosshair,
+  AlertTriangle,
+  Maximize2,
+  X,
 } from 'lucide-react';
 
 interface StepEditorProps {
+  flow?: ProcessFlow;
   step: ProcessStep;
   waferWidth: number;
   materials: Material[];
@@ -98,9 +112,80 @@ interface StepEditorProps {
   onCreateVariable?: (name: string, value: number, unit: VariableUnit, description?: string) => void;
   onOpenVariablesModal?: () => void;
   onOpenVariantManager?: () => void;
+  pickReleaseMode?: boolean;
+  onTogglePickReleaseMode?: () => void;
 }
 
+interface RegionUmInputProps {
+  valueNm: number;
+  minNm?: number;
+  maxNm: number;
+  onCommitNm: (valNm: number) => void;
+  ariaLabel?: string;
+}
+
+const RegionUmInput: React.FC<RegionUmInputProps> = ({
+  valueNm,
+  minNm = 0,
+  maxNm,
+  onCommitNm,
+  ariaLabel,
+}) => {
+  const formatted = (valueNm / 1000).toFixed(2);
+  const [isFocused, setIsFocused] = useState(false);
+  const [draft, setDraft] = useState(formatted);
+
+  useEffect(() => {
+    if (!isFocused) {
+      setDraft(formatted);
+    }
+  }, [formatted, isFocused]);
+
+  return (
+    <input
+      type="number"
+      step="any"
+      min={(minNm / 1000).toFixed(3)}
+      max={(maxNm / 1000).toFixed(3)}
+      aria-label={ariaLabel}
+      value={isFocused ? draft : formatted}
+      onFocus={(e) => {
+        setIsFocused(true);
+        setDraft(formatted);
+        e.target.select();
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        const parsed = parseFloat(raw);
+        if (Number.isFinite(parsed)) {
+          const clamped = Math.max(minNm, Math.min(maxNm, Math.round(parsed * 1000)));
+          onCommitNm(clamped);
+        }
+      }}
+      onBlur={() => {
+        const parsed = parseFloat(draft);
+        if (Number.isFinite(parsed)) {
+          onCommitNm(Math.max(minNm, Math.min(maxNm, Math.round(parsed * 1000))));
+        }
+        setIsFocused(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          (e.target as HTMLInputElement).blur();
+        } else if (e.key === 'Escape') {
+          setDraft(formatted);
+          setIsFocused(false);
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-[11px] focus:outline-none focus:border-emerald-500"
+    />
+  );
+};
+
 export const StepEditor: React.FC<StepEditorProps> = ({
+  flow,
   step,
   waferWidth,
   materials,
@@ -118,6 +203,8 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   onCreateVariable,
   onOpenVariablesModal,
   onOpenVariantManager,
+  pickReleaseMode = false,
+  onTogglePickReleaseMode,
 }) => {
   const [activeTab, setActiveTab] = useState<'process' | 'equipment' | 'notes'>('process');
   const [isAddingBlockInline, setIsAddingBlockInline] = useState<boolean>(false);
@@ -125,6 +212,15 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   const [isEditingMaskName, setIsEditingMaskName] = useState<boolean>(false);
   const [editingMaskName, setEditingMaskName] = useState<string>('');
   const [bondingImportError, setBondingImportError] = useState<string | null>(null);
+  const [pendingBondImport, setPendingBondImport] = useState<{
+    flow: ProcessFlow;
+    title: string;
+    importedWidth: number;
+    mode: 'rescale' | 'crop-pad';
+    alignment: 'left' | 'center' | 'right' | 'custom';
+    offsetNm?: number;
+    paddingMode: 'empty' | 'extend-edges';
+  } | null>(null);
   const [openStreetBindId, setOpenStreetBindId] = useState<string | null>(null);
   const [editingVariantId, setEditingVariantId] = useState<string | null>(null);
   const [editingVariantName, setEditingVariantName] = useState<string>('');
@@ -133,12 +229,148 @@ export const StepEditor: React.FC<StepEditorProps> = ({
     setIsEditingMaskName(false);
     setEditingMaskName(step.lithography?.maskName || '');
     setBondingImportError(null);
+    setPendingBondImport(null);
     setEditingVariantId(null);
     setEditingVariantName('');
   }, [step.id, step.lithography?.maskName]);
 
+  useEffect(() => {
+    if (!pendingBondImport) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPendingBondImport(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [pendingBondImport]);
+
+  const bondingResultPreview = useMemo(() => {
+    if (!pendingBondImport) return null;
+
+    const existingMatIds = new Set(materials.map((m) => m.id));
+    const incomingMats = (pendingBondImport.flow.materials || []).filter(
+      (m) => !existingMatIds.has(m.id)
+    );
+    const mergedMaterials = [...materials, ...incomingMats];
+
+    const previewBondConfig: BondingConfig = {
+      ...(step.bonding || {
+        sourceType: 'imported-flow',
+        bondingMethod: 'fusion',
+        incomingFace: 'front',
+      }),
+      sourceType: 'imported-flow',
+      importedFlow: pendingBondImport.flow,
+      importedFlowTitle: pendingBondImport.title,
+      widthMismatchMode: pendingBondImport.mode,
+      widthAlignment: pendingBondImport.alignment,
+      widthOffsetNm: pendingBondImport.offsetNm,
+      widthPaddingMode: pendingBondImport.paddingMode,
+    };
+
+    const previewStep: ProcessStep = {
+      ...step,
+      enabled: true,
+      bonding: previewBondConfig,
+    };
+
+    const baseFlow: ProcessFlow = flow
+      ? {
+          ...flow,
+          materials: mergedMaterials,
+        }
+      : {
+          id: 'bond_preview_fallback',
+          title: 'Bond Preview',
+          description: '',
+          substrateWidth: waferWidth,
+          substrateThickness: 3000,
+          substrateMaterialId: 'mat_si_sub',
+          substrateLayers: [
+            {
+              id: 'sub_preview_default',
+              name: 'Bulk Silicon <100>',
+              materialId: 'mat_si_sub',
+              thickness: 3000,
+            },
+          ],
+          materials: mergedMaterials,
+          steps: [previewStep],
+        };
+
+    const idxInFlow = baseFlow.steps.findIndex((s) => s.id === step.id);
+    const slicedSteps =
+      idxInFlow >= 0
+        ? baseFlow.steps.slice(0, idxInFlow + 1).map((s, i) => (i === idxInFlow ? previewStep : s))
+        : [...baseFlow.steps, previewStep];
+
+    const previewFlow = resolveFlowParameters({
+      ...baseFlow,
+      steps: slicedSteps,
+    });
+
+    const enabledStepIdx = previewFlow.steps.filter((s) => s.enabled).length - 1;
+    const mesh = simulateCrossSection(
+      previewFlow,
+      enabledStepIdx >= 0 ? enabledStepIdx : undefined
+    );
+    const polygons = buildRenderPolygons(mesh, mergedMaterials);
+
+    let minX = 0;
+    let maxX = waferWidth;
+    let minY = mesh.minY ?? 0;
+    let maxY = Math.max(mesh.maxY ?? 3000, 1000);
+    for (const poly of polygons) {
+      if (poly.xMin < minX) minX = poly.xMin;
+      if (poly.xMax > maxX) maxX = poly.xMax;
+      if (poly.yMin < minY) minY = poly.yMin;
+      if (poly.yMax > maxY) maxY = poly.yMax;
+    }
+
+    return {
+      mesh,
+      polygons,
+      materials: mergedMaterials,
+      bounds: { minX, maxX, minY, maxY },
+      incomingFace: previewBondConfig.incomingFace || 'front',
+      targetSide: step.side === 'back' ? 'back' : 'front',
+      mirrorHorizontal: Boolean(previewBondConfig.mirrorHorizontal),
+    };
+  }, [pendingBondImport, flow, step, waferWidth, materials]);
+
   const handleUpdate = (patch: Partial<ProcessStep>) => {
     onUpdateStep({ ...step, ...patch });
+  };
+
+  const commitImportedFlow = (
+    importedFlow: ProcessFlow,
+    title: string,
+    mode: 'rescale' | 'crop-pad',
+    alignment: 'left' | 'center' | 'right' | 'custom',
+    offsetNm?: number,
+    paddingMode: 'empty' | 'extend-edges' = 'empty'
+  ) => {
+    if (importedFlow.materials && importedFlow.materials.length > 0 && onMergeMaterials) {
+      onMergeMaterials(importedFlow.materials);
+    }
+    const baseBondCfg: BondingConfig = step.bonding || {
+      sourceType: 'imported-flow',
+      bondingMethod: 'fusion',
+      incomingFace: 'front',
+    };
+    handleUpdate({
+      bonding: {
+        ...baseBondCfg,
+        sourceType: 'imported-flow',
+        importedFlow,
+        importedFlowTitle: title,
+        widthMismatchMode: mode,
+        widthAlignment: alignment,
+        widthOffsetNm: offsetNm,
+        widthPaddingMode: paddingMode,
+      },
+    });
   };
 
   const setStepParamBinding = (key: string, expr: string | undefined) => {
@@ -3098,31 +3330,296 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                   </select>
                 </div>
 
-                {step.strip?.stripType === 'sacrificial-release' && (
-                  <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">
-                      Sacrificial Material to Dissolve
-                    </label>
-                    <select
-                      value={step.strip?.targetMaterialId || 'mat_sio2_thermal'}
-                      onChange={(e) =>
-                        handleUpdate({
-                          strip: {
-                            ...step.strip!,
-                            targetMaterialId: e.target.value,
-                          },
-                        })
-                      }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
-                    >
-                      {materials.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.name} ({m.formula})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
+                {step.strip?.stripType === 'sacrificial-release' && (() => {
+                  const releaseScope = step.strip?.releaseScope ?? 'all';
+                  const regions = step.strip?.releaseRegions ?? [];
+                  const activeSide = step.side || 'front';
+
+                  const updateStripPatch = (patch: Partial<NonNullable<ProcessStep['strip']>>) => {
+                    handleUpdate({
+                      strip: {
+                        ...(step.strip || {
+                          stripType: 'sacrificial-release',
+                          solvent: 'HF Vapor / BOE',
+                          targetMaterialId: 'mat_sio2_thermal',
+                        }),
+                        ...patch,
+                      },
+                    });
+                  };
+
+                  const handleAddManualRegion = () => {
+                    const span = Math.max(200, Math.round(waferWidth * 0.2));
+                    const xStart = Math.max(0, Math.round((waferWidth - span) * 0.5));
+                    const xEnd = Math.min(waferWidth, xStart + span);
+                    const nextRegion: SacrificialReleaseRegion = {
+                      id: `rel_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                      xStart,
+                      xEnd,
+                    };
+                    updateStripPatch({
+                      releaseScope: 'regions',
+                      releaseRegions: [...regions, nextRegion],
+                    });
+                  };
+
+                  return (
+                    <div className="space-y-3">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">
+                          Sacrificial Material to Dissolve
+                        </label>
+                        <select
+                          value={step.strip?.targetMaterialId || 'mat_sio2_thermal'}
+                          onChange={(e) =>
+                            updateStripPatch({
+                              targetMaterialId: e.target.value,
+                            })
+                          }
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:border-sky-500"
+                        >
+                          {materials.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name} ({m.formula})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Side summary & Release Scope Selector */}
+                      <div className="space-y-2 pt-1 border-t border-slate-800/80">
+                        <div className="flex items-center justify-between gap-2">
+                          <label className="text-[11px] text-slate-400 font-medium">
+                            Release Region Scope
+                          </label>
+                          <span className="text-[10px] font-mono text-slate-400">
+                            {activeSide === 'front'
+                              ? 'Front (+Z) only'
+                              : activeSide === 'back'
+                              ? 'Back (-Z) only'
+                              : 'Both (±Z)'}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              updateStripPatch({ releaseScope: 'all' });
+                              if (pickReleaseMode && onTogglePickReleaseMode) {
+                                onTogglePickReleaseMode();
+                              }
+                            }}
+                            className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                              releaseScope === 'all'
+                                ? 'bg-emerald-600 text-white shadow-sm'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            Etch Entire Side
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updateStripPatch({ releaseScope: 'regions' })}
+                            className={`py-1.5 px-2 rounded-md font-medium transition-colors ${
+                              releaseScope === 'regions'
+                                ? 'bg-emerald-600 text-white shadow-sm'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            Keep Regions
+                          </button>
+                        </div>
+
+                        {releaseScope === 'regions' && (
+                          <div className="space-y-2.5 p-2.5 rounded-lg bg-slate-900/75 border border-emerald-500/25">
+                            <p className="text-[10px] text-slate-400 leading-snug">
+                              Selected regions are <span className="text-emerald-300 font-medium">protected (not etched)</span>; all other matching material on this side is dissolved.
+                            </p>
+
+                            {/* Toolbar */}
+                            <div className="flex flex-wrap items-center justify-between gap-1.5">
+                              {onTogglePickReleaseMode && (
+                                <button
+                                  type="button"
+                                  onClick={onTogglePickReleaseMode}
+                                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium border transition-colors ${
+                                    pickReleaseMode
+                                      ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-sm'
+                                      : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40'
+                                  }`}
+                                  title="Click sacrificial pockets or drag an X range on the cross-section canvas to keep them unetched"
+                                >
+                                  <Crosshair className="w-3.5 h-3.5 shrink-0" />
+                                  <span>{pickReleaseMode ? 'Picking Kept Regions' : 'Pick on Canvas'}</span>
+                                </button>
+                              )}
+
+                              <div className="flex items-center gap-1 ml-auto">
+                                <button
+                                  type="button"
+                                  onClick={handleAddManualRegion}
+                                  className="flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[11px] font-medium transition-colors"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                  <span>Add</span>
+                                </button>
+                                {regions.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => updateStripPatch({ releaseRegions: [] })}
+                                    className="px-2 py-1 rounded-md bg-slate-800 hover:bg-rose-950/60 border border-slate-700 hover:border-rose-500/40 text-slate-400 hover:text-rose-300 text-[11px] transition-colors"
+                                    title="Clear all kept regions"
+                                  >
+                                    Clear
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Mini Wafer X-Track Preview */}
+                            <div className="space-y-1">
+                              <div className="relative h-5 w-full rounded bg-slate-950 border border-slate-800 overflow-hidden">
+                                {regions.map((reg, rIdx) => {
+                                  const lo = Math.max(0, Math.min(reg.xStart, reg.xEnd));
+                                  const hi = Math.min(waferWidth, Math.max(reg.xStart, reg.xEnd));
+                                  const leftPct = waferWidth > 0 ? (lo / waferWidth) * 100 : 0;
+                                  const widthPct = waferWidth > 0 ? Math.max(1.5, ((hi - lo) / waferWidth) * 100) : 0;
+                                  return (
+                                    <div
+                                      key={reg.id}
+                                      style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                                      className="absolute top-0.5 bottom-0.5 rounded-xs bg-emerald-500/35 border border-emerald-400/80 flex items-center justify-center overflow-hidden"
+                                      title={`Keep K${rIdx + 1} (not etched): ${(lo / 1000).toFixed(2)} – ${(hi / 1000).toFixed(2)} µm`}
+                                    >
+                                      <span className="text-[9px] font-mono font-bold text-emerald-200">
+                                        K{rIdx + 1}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              <div className="flex justify-between text-[9px] font-mono text-slate-500">
+                                <span>0 µm</span>
+                                <span>{(waferWidth / 1000).toFixed(1)} µm</span>
+                              </div>
+                            </div>
+
+                            {/* Region List */}
+                            {regions.length === 0 ? (
+                              <p className="text-[11px] text-slate-400 leading-relaxed">
+                                No protected regions yet — all matching sacrificial material on this side will be etched. Click{' '}
+                                <span className="text-emerald-300 font-medium">Pick on Canvas</span> to select pockets or drag an X range to keep intact.
+                              </p>
+                            ) : (
+                              <div className="space-y-2 max-h-56 overflow-y-auto pr-0.5">
+                                {regions.map((reg, rIdx) => {
+                                  const lo = Math.min(reg.xStart, reg.xEnd);
+                                  const hi = Math.max(reg.xStart, reg.xEnd);
+                                  const hasZBand = reg.yMin !== undefined && reg.yMax !== undefined;
+                                  return (
+                                    <div
+                                      key={reg.id}
+                                      className="p-2 rounded-lg bg-slate-950/90 border border-slate-800 space-y-1.5"
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <div className="flex items-center gap-1.5 min-w-0">
+                                          <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono text-[10px] font-semibold">
+                                            K{rIdx + 1}
+                                          </span>
+                                          <span className="text-[10px] font-mono text-slate-400 truncate">
+                                            Keep ΔX = {formatThickness(hi - lo, thicknessUnit)}
+                                          </span>
+                                        </div>
+                                        <div className="flex items-center gap-1 shrink-0">
+                                          {hasZBand && (
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                updateStripPatch({
+                                                  releaseRegions: regions.map((r) =>
+                                                    r.id === reg.id
+                                                      ? { ...r, yMin: undefined, yMax: undefined }
+                                                      : r
+                                                  ),
+                                                })
+                                              }
+                                              className="px-1.5 py-0.5 rounded bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-[9px] font-mono"
+                                              title={`Protected Z-band: ${(reg.yMin! / 1000).toFixed(2)}–${(reg.yMax! / 1000).toFixed(2)} µm. Click to protect Full Z at this X range.`}
+                                            >
+                                              Z-Band · Full Z
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              updateStripPatch({
+                                                releaseRegions: regions.filter((r) => r.id !== reg.id),
+                                              })
+                                            }
+                                            className="p-1 text-slate-400 hover:text-rose-400 rounded hover:bg-slate-800 transition-colors"
+                                            title="Remove release region"
+                                          >
+                                            <Trash2 className="w-3 h-3" />
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                          <label className="block text-[9px] text-slate-400 mb-0.5">
+                                            Start (µm)
+                                          </label>
+                                          <RegionUmInput
+                                            valueNm={lo}
+                                            minNm={0}
+                                            maxNm={Math.max(0, hi - 10)}
+                                            ariaLabel={`Region ${rIdx + 1} Start X in micrometers`}
+                                            onCommitNm={(valNm) => {
+                                              const nextStart = Math.max(0, Math.min(hi - 10, valNm));
+                                              updateStripPatch({
+                                                releaseRegions: regions.map((r) =>
+                                                  r.id === reg.id
+                                                    ? { ...r, xStart: nextStart, xEnd: hi }
+                                                    : r
+                                                ),
+                                              });
+                                            }}
+                                          />
+                                        </div>
+                                        <div>
+                                          <label className="block text-[9px] text-slate-400 mb-0.5">
+                                            End (µm)
+                                          </label>
+                                          <RegionUmInput
+                                            valueNm={hi}
+                                            minNm={Math.min(waferWidth, lo + 10)}
+                                            maxNm={waferWidth}
+                                            ariaLabel={`Region ${rIdx + 1} End X in micrometers`}
+                                            onCommitNm={(valNm) => {
+                                              const nextEnd = Math.min(waferWidth, Math.max(lo + 10, valNm));
+                                              updateStripPatch({
+                                                releaseRegions: regions.map((r) =>
+                                                  r.id === reg.id
+                                                    ? { ...r, xStart: lo, xEnd: nextEnd }
+                                                    : r
+                                                ),
+                                              });
+                                            }}
+                                          />
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 <div>
                   <label className="block text-[11px] text-slate-400 mb-1">
@@ -3433,14 +3930,23 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                         },
                       ];
                     }
-                    if (parsed.materials && parsed.materials.length > 0 && onMergeMaterials) {
-                      onMergeMaterials(parsed.materials);
+                    const resolvedImported = resolveFlowParameters(parsed);
+                    const importedWidth = resolvedImported.substrateWidth || parsed.substrateWidth;
+                    const flowTitle = parsed.title || file.name;
+
+                    if (Math.abs(importedWidth - waferWidth) <= 1) {
+                      commitImportedFlow(parsed, flowTitle, 'rescale', 'center', undefined, 'empty');
+                    } else {
+                      setPendingBondImport({
+                        flow: parsed,
+                        title: flowTitle,
+                        importedWidth,
+                        mode: bondCfg.widthMismatchMode || 'crop-pad',
+                        alignment: bondCfg.widthAlignment || 'center',
+                        offsetNm: bondCfg.widthOffsetNm,
+                        paddingMode: bondCfg.widthPaddingMode || 'empty',
+                      });
                     }
-                    updateBonding({
-                      sourceType: 'imported-flow',
-                      importedFlow: parsed,
-                      importedFlowTitle: parsed.title || file.name,
-                    });
                   } catch {
                     setBondingImportError('Could not parse JSON process file.');
                   }
@@ -3703,36 +4209,124 @@ export const StepEditor: React.FC<StepEditorProps> = ({
                       )}
 
                       {bondCfg.importedFlow ? (
-                        <div className="p-2.5 rounded-lg bg-slate-900 border border-emerald-500/40 space-y-1.5 text-xs">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-semibold text-emerald-300 flex items-center gap-1.5 truncate">
-                              <FileCheck className="w-3.5 h-3.5 shrink-0" />
-                              <span className="truncate">
-                                {bondCfg.importedFlowTitle || bondCfg.importedFlow.title}
-                              </span>
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                updateBonding({
-                                  importedFlow: undefined,
-                                  importedFlowTitle: undefined,
-                                })
-                              }
-                              className="text-[10px] text-slate-400 hover:text-rose-400 shrink-0"
+                        (() => {
+                          const effectiveImportedWidth =
+                            resolveFlowParameters(bondCfg.importedFlow).substrateWidth ||
+                            bondCfg.importedFlow.substrateWidth;
+                          const hasWidthMismatch = Math.abs(effectiveImportedWidth - waferWidth) > 1;
+                          const mismatchMode = bondCfg.widthMismatchMode || 'rescale';
+                          const widthAlignment = bondCfg.widthAlignment || 'center';
+
+                          return (
+                            <div
+                              className={`p-2.5 rounded-lg bg-slate-900 border space-y-2 text-xs ${
+                                hasWidthMismatch ? 'border-amber-500/40' : 'border-emerald-500/40'
+                              }`}
                             >
-                              Clear
-                            </button>
-                          </div>
-                          <div className="text-[10px] font-mono text-slate-400 flex items-center justify-between">
-                            <span>
-                              {bondCfg.importedFlow.steps.filter((s) => s.enabled).length} enabled steps simulated
-                            </span>
-                            <span>
-                              Width: {(bondCfg.importedFlow.substrateWidth / 1000).toFixed(1)} µm
-                            </span>
-                          </div>
-                        </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-semibold text-emerald-300 flex items-center gap-1.5 truncate">
+                                  <FileCheck className="w-3.5 h-3.5 shrink-0" />
+                                  <span className="truncate">
+                                    {bondCfg.importedFlowTitle || bondCfg.importedFlow.title}
+                                  </span>
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateBonding({
+                                      importedFlow: undefined,
+                                      importedFlowTitle: undefined,
+                                      widthMismatchMode: undefined,
+                                      widthAlignment: undefined,
+                                      widthOffsetNm: undefined,
+                                      widthPaddingMode: undefined,
+                                    })
+                                  }
+                                  className="text-[10px] text-slate-400 hover:text-rose-400 shrink-0"
+                                >
+                                  Clear
+                                </button>
+                              </div>
+
+                              <div className="text-[10px] font-mono text-slate-400 flex items-center justify-between gap-2">
+                                <span>
+                                  {bondCfg.importedFlow.steps.filter((s) => s.enabled).length} enabled steps simulated
+                                </span>
+                                <span className={hasWidthMismatch ? 'text-amber-300' : ''}>
+                                  Width: {(effectiveImportedWidth / 1000).toFixed(2)} µm
+                                  {hasWidthMismatch && ` (wafer ${(waferWidth / 1000).toFixed(2)} µm)`}
+                                </span>
+                              </div>
+
+                              {hasWidthMismatch && (
+                                <div className="pt-2 border-t border-slate-800 space-y-2">
+                                  <div className="flex items-center justify-between gap-1.5">
+                                    <span className="text-[10px] font-medium text-amber-300 flex items-center gap-1">
+                                      <AlertTriangle className="w-3 h-3 shrink-0" />
+                                      <span>Width Mismatch Handling</span>
+                                    </span>
+                                    <span className="text-[10px] font-mono text-slate-400">
+                                      {effectiveImportedWidth > waferWidth ? 'Imported wider' : 'Imported narrower'}
+                                    </span>
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-1 p-0.5 rounded-md bg-slate-950 border border-slate-800 text-[10px]">
+                                    <button
+                                      type="button"
+                                      onClick={() => updateBonding({ widthMismatchMode: 'rescale' })}
+                                      className={`py-1 px-1.5 rounded font-medium flex items-center justify-center gap-1 transition-colors ${
+                                        mismatchMode === 'rescale'
+                                          ? 'bg-indigo-600 text-white'
+                                          : 'text-slate-400 hover:text-slate-200'
+                                      }`}
+                                    >
+                                      <Maximize2 className="w-2.5 h-2.5" />
+                                      <span>Rescale</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateBonding({
+                                          widthMismatchMode: 'crop-pad',
+                                          widthAlignment: bondCfg.widthAlignment || 'center',
+                                        })
+                                      }
+                                      className={`py-1 px-1.5 rounded font-medium flex items-center justify-center gap-1 transition-colors ${
+                                        mismatchMode === 'crop-pad'
+                                          ? 'bg-indigo-600 text-white'
+                                          : 'text-slate-400 hover:text-slate-200'
+                                      }`}
+                                    >
+                                      <Scissors className="w-2.5 h-2.5" />
+                                      <span>{effectiveImportedWidth > waferWidth ? 'Crop + Align' : 'Pad + Align'}</span>
+                                    </button>
+                                  </div>
+
+                                  {mismatchMode === 'crop-pad' && (
+                                    <BondingAlignmentControl
+                                      waferWidth={waferWidth}
+                                      importedWidth={effectiveImportedWidth}
+                                      alignment={widthAlignment}
+                                      offsetNm={bondCfg.widthOffsetNm}
+                                      paddingMode={bondCfg.widthPaddingMode || 'empty'}
+                                      onChangeAlignment={(nextAlign, nextOffsetNm) =>
+                                        updateBonding({
+                                          widthAlignment: nextAlign,
+                                          widthOffsetNm: nextOffsetNm,
+                                        })
+                                      }
+                                      onChangePaddingMode={(nextPad) =>
+                                        updateBonding({ widthPaddingMode: nextPad })
+                                      }
+                                      showPreview={true}
+                                      compact={true}
+                                    />
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()
                       ) : (
                         <p className="text-[11px] text-slate-500 italic leading-relaxed">
                           Upload an exported MicroFlow <span className="font-mono">.json</span> process file. All its enabled fabrication steps will be simulated and bonded onto the selected side.
@@ -4453,6 +5047,532 @@ export const StepEditor: React.FC<StepEditorProps> = ({
           />
         </div>
       </div>
+
+      {/* Wafer Bonding Imported Width Mismatch Modal */}
+      {pendingBondImport &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4"
+            onClick={() => setPendingBondImport(null)}
+          >
+            <div
+              className="w-full max-w-3xl max-h-[92vh] flex flex-col rounded-xl bg-slate-900 border border-slate-700 shadow-2xl overflow-hidden text-slate-100"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-slate-950/60 shrink-0">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <h3 className="text-sm font-semibold text-white">
+                    Imported Wafer Width Mismatch
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPendingBondImport(null)}
+                  className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                  aria-label="Cancel import"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-4 overflow-y-auto">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+                  {/* Left Column: Summary & Adaptation Controls */}
+                  <div className="space-y-3">
+                    <div className="p-3 rounded-lg bg-slate-950/80 border border-slate-800 space-y-1.5 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-slate-400">Imported Process</span>
+                        <span className="font-medium text-slate-100 truncate max-w-[200px]">
+                          {pendingBondImport.title}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 font-mono">
+                        <span className="text-slate-400 font-sans">Imported Wafer Width</span>
+                        <span className="text-amber-300 font-semibold">
+                          {(pendingBondImport.importedWidth / 1000).toFixed(2)} µm
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 font-mono">
+                        <span className="text-slate-400 font-sans">Current Wafer Width</span>
+                        <span className="text-sky-300 font-semibold">
+                          {(waferWidth / 1000).toFixed(2)} µm
+                        </span>
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      The imported wafer ({(pendingBondImport.importedWidth / 1000).toFixed(2)} µm) is{' '}
+                      <span className="font-semibold text-white">
+                        {pendingBondImport.importedWidth > waferWidth ? 'wider' : 'narrower'}
+                      </span>{' '}
+                      than the current wafer ({(waferWidth / 1000).toFixed(2)} µm). Choose how to adapt its lateral width during bonding:
+                    </p>
+
+                    <div className="space-y-2">
+                      {/* Option 1: Rescale */}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPendingBondImport((prev) =>
+                            prev ? { ...prev, mode: 'rescale' } : null
+                          )
+                        }
+                        className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                          pendingBondImport.mode === 'rescale'
+                            ? 'bg-indigo-950/50 border-indigo-500 ring-1 ring-indigo-500/40'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                            <Maximize2 className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Rescale to Current Wafer</span>
+                          </span>
+                          {pendingBondImport.mode === 'rescale' && (
+                            <Check className="w-3.5 h-3.5 text-indigo-400" />
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-1 leading-snug">
+                          Proportionally scales the imported wafer horizontally from{' '}
+                          {(pendingBondImport.importedWidth / 1000).toFixed(2)} µm to{' '}
+                          {(waferWidth / 1000).toFixed(2)} µm to match edge-to-edge.
+                        </p>
+                      </button>
+
+                      {/* Option 2: Crop / Pad + Align */}
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() =>
+                          setPendingBondImport((prev) =>
+                            prev ? { ...prev, mode: 'crop-pad' } : null
+                          )
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setPendingBondImport((prev) =>
+                              prev ? { ...prev, mode: 'crop-pad' } : null
+                            );
+                          }
+                        }}
+                        className={`w-full text-left p-3 rounded-lg border transition-colors cursor-pointer ${
+                          pendingBondImport.mode === 'crop-pad'
+                            ? 'bg-indigo-950/50 border-indigo-500 ring-1 ring-indigo-500/40'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                            <Scissors className="w-3.5 h-3.5 text-sky-400" />
+                            <span>
+                              {pendingBondImport.importedWidth > waferWidth
+                                ? 'Crop & Align (Keep 1:1 Scale)'
+                                : 'Pad & Align (Keep 1:1 Scale)'}
+                            </span>
+                          </span>
+                          {pendingBondImport.mode === 'crop-pad' && (
+                            <Check className="w-3.5 h-3.5 text-indigo-400" />
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-1 leading-snug">
+                          {pendingBondImport.importedWidth > waferWidth
+                            ? 'Preserves true feature dimensions and crops overhanging edges outside the current wafer.'
+                            : 'Preserves true feature dimensions and pads or leaves open the sides outside the imported wafer.'}
+                        </p>
+
+                        {pendingBondImport.mode === 'crop-pad' && (
+                          <div
+                            className="mt-2.5 pt-2.5 border-t border-slate-800/80"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <BondingAlignmentControl
+                              waferWidth={waferWidth}
+                              importedWidth={pendingBondImport.importedWidth}
+                              alignment={pendingBondImport.alignment}
+                              offsetNm={pendingBondImport.offsetNm}
+                              paddingMode={pendingBondImport.paddingMode}
+                              onChangeAlignment={(nextAlign, nextOffsetNm) =>
+                                setPendingBondImport((prev) =>
+                                  prev
+                                    ? { ...prev, alignment: nextAlign, offsetNm: nextOffsetNm }
+                                    : null
+                                )
+                              }
+                              onChangePaddingMode={(nextPad) =>
+                                setPendingBondImport((prev) =>
+                                  prev ? { ...prev, paddingMode: nextPad } : null
+                                )
+                              }
+                              showPreview={false}
+                              compact={false}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column: Alignment Bar + Resulting Cross-Section Preview */}
+                  <div className="space-y-3">
+                    {/* Horizontal Alignment Diagram */}
+                    {pendingBondImport.mode === 'rescale' ? (
+                      <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1.5">
+                        <div className="flex items-center justify-between text-[10px] text-slate-400">
+                          <span>Alignment Diagram</span>
+                          <span className="font-mono text-slate-300">Scaled 100%</span>
+                        </div>
+                        <svg
+                          viewBox="0 0 240 34"
+                          className="w-full h-9 rounded bg-slate-900 border border-slate-800"
+                          aria-label="Wafer bonding rescaled preview"
+                        >
+                          <rect
+                            x={8}
+                            y={5}
+                            width={224}
+                            height={10}
+                            rx={2}
+                            fill="#6366f1"
+                            fillOpacity={0.85}
+                            stroke="#a5b4fc"
+                            strokeWidth={0.8}
+                          />
+                          <rect
+                            x={8}
+                            y={19}
+                            width={224}
+                            height={10}
+                            rx={2}
+                            fill="#0ea5e9"
+                            fillOpacity={0.45}
+                            stroke="#38bdf8"
+                            strokeWidth={0.8}
+                          />
+                        </svg>
+                        <div className="flex items-center justify-between text-[9px] text-slate-500">
+                          <span className="flex items-center gap-1">
+                            <span className="inline-block w-2 h-2 rounded-xs bg-indigo-500/85" />
+                            Imported ({(pendingBondImport.importedWidth / 1000).toFixed(2)} µm → {(waferWidth / 1000).toFixed(2)} µm)
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <span className="inline-block w-2 h-2 rounded-xs bg-sky-500/50 border border-sky-400/70" />
+                            Current ({(waferWidth / 1000).toFixed(2)} µm)
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      (() => {
+                        const effectiveShiftX = resolveEffectiveShiftX(
+                          waferWidth,
+                          pendingBondImport.importedWidth,
+                          pendingBondImport.alignment,
+                          pendingBondImport.offsetNm
+                        );
+                        const hasGap =
+                          effectiveShiftX > 1 ||
+                          effectiveShiftX + pendingBondImport.importedWidth < waferWidth - 1;
+                        const minCoord = Math.min(0, effectiveShiftX);
+                        const maxCoord = Math.max(
+                          waferWidth,
+                          effectiveShiftX + pendingBondImport.importedWidth
+                        );
+                        const span = Math.max(1, maxCoord - minCoord);
+                        const curLeftPct = ((0 - minCoord) / span) * 100;
+                        const curWidthPct = (waferWidth / span) * 100;
+                        const impLeftPct = ((effectiveShiftX - minCoord) / span) * 100;
+                        const impWidthPct = (pendingBondImport.importedWidth / span) * 100;
+                        const svgW = 240;
+                        const padX = 8;
+                        const usableW = svgW - padX * 2;
+                        const curX = padX + (curLeftPct / 100) * usableW;
+                        const curRectW = Math.max(2, (curWidthPct / 100) * usableW);
+                        const impX = padX + (impLeftPct / 100) * usableW;
+                        const impRectW = Math.max(2, (impWidthPct / 100) * usableW);
+                        const leftPadW = Math.max(0, Math.min(curX + curRectW, impX) - curX);
+                        const rightPadStart = Math.max(curX, impX + impRectW);
+                        const rightPadW = Math.max(0, curX + curRectW - rightPadStart);
+
+                        return (
+                          <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1.5">
+                            <div className="flex items-center justify-between text-[10px] text-slate-400">
+                              <span>Alignment Diagram</span>
+                              <span className="font-mono text-slate-300">
+                                Shift {(effectiveShiftX / 1000).toFixed(2)} µm
+                                {hasGap && pendingBondImport.paddingMode === 'extend-edges'
+                                  ? ' · Edge Fill'
+                                  : ''}
+                              </span>
+                            </div>
+                            <svg
+                              viewBox="0 0 240 34"
+                              className="w-full h-9 rounded bg-slate-900 border border-slate-800"
+                              aria-label="Wafer bonding alignment preview"
+                            >
+                              <line
+                                x1={curX}
+                                y1={3}
+                                x2={curX}
+                                y2={31}
+                                stroke="#38bdf8"
+                                strokeOpacity={0.45}
+                                strokeWidth={1}
+                                strokeDasharray="2 2"
+                              />
+                              <line
+                                x1={curX + curRectW}
+                                y1={3}
+                                x2={curX + curRectW}
+                                y2={31}
+                                stroke="#38bdf8"
+                                strokeOpacity={0.45}
+                                strokeWidth={1}
+                                strokeDasharray="2 2"
+                              />
+                              {hasGap &&
+                                pendingBondImport.paddingMode === 'extend-edges' &&
+                                leftPadW > 0.5 && (
+                                  <rect
+                                    x={curX}
+                                    y={6}
+                                    width={leftPadW}
+                                    height={8}
+                                    rx={1}
+                                    fill="#6366f1"
+                                    fillOpacity={0.35}
+                                    stroke="#818cf8"
+                                    strokeWidth={0.7}
+                                    strokeDasharray="2 1"
+                                  />
+                                )}
+                              {hasGap &&
+                                pendingBondImport.paddingMode === 'extend-edges' &&
+                                rightPadW > 0.5 && (
+                                  <rect
+                                    x={rightPadStart}
+                                    y={6}
+                                    width={rightPadW}
+                                    height={8}
+                                    rx={1}
+                                    fill="#6366f1"
+                                    fillOpacity={0.35}
+                                    stroke="#818cf8"
+                                    strokeWidth={0.7}
+                                    strokeDasharray="2 1"
+                                  />
+                                )}
+                              <rect
+                                x={impX}
+                                y={5}
+                                width={impRectW}
+                                height={10}
+                                rx={2}
+                                fill="#6366f1"
+                                fillOpacity={0.85}
+                                stroke="#a5b4fc"
+                                strokeWidth={0.8}
+                              />
+                              <rect
+                                x={curX}
+                                y={19}
+                                width={curRectW}
+                                height={10}
+                                rx={2}
+                                fill="#0ea5e9"
+                                fillOpacity={0.45}
+                                stroke="#38bdf8"
+                                strokeWidth={0.8}
+                              />
+                            </svg>
+                            <div className="flex items-center justify-between text-[9px] text-slate-500">
+                              <span className="flex items-center gap-1">
+                                <span className="inline-block w-2 h-2 rounded-xs bg-indigo-500/85" />
+                                Imported ({(pendingBondImport.importedWidth / 1000).toFixed(2)} µm)
+                              </span>
+                              <span className="flex items-center gap-1">
+                                <span className="inline-block w-2 h-2 rounded-xs bg-sky-500/50 border border-sky-400/70" />
+                                Current ({(waferWidth / 1000).toFixed(2)} µm)
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()
+                    )}
+
+                    {/* Resulting Cross-Section Preview */}
+                    {bondingResultPreview &&
+                      (() => {
+                        const {
+                          mesh,
+                          polygons,
+                          materials: prevMats,
+                          bounds,
+                          incomingFace,
+                          targetSide,
+                          mirrorHorizontal,
+                        } = bondingResultPreview;
+                        const vbW = 380;
+                        const vbH = 220;
+                        const padX = 18;
+                        const padY = 16;
+                        const availW = vbW - padX * 2;
+                        const availH = vbH - padY * 2;
+                        const fSpanX = Math.max(100, bounds.maxX - bounds.minX);
+                        const fSpanY = Math.max(300, bounds.maxY - bounds.minY);
+                        const rawSx = availW / fSpanX;
+                        const rawSy = (availH * 0.72) / fSpanY;
+                        const rawH = fSpanY * rawSy;
+                        const fit = rawH > availH ? availH / rawH : 1;
+                        const sx = rawSx * fit;
+                        const sy = rawSy * fit;
+                        const offsetX = (vbW - fSpanX * sx) / 2 - bounds.minX * sx;
+                        const baseBottomY = vbH / 2 + (fSpanY * sy) / 2;
+
+                        const toScreen = (x: number, y: number) => ({
+                          x: offsetX + x * sx,
+                          y: baseBottomY - (y - bounds.minY) * sy,
+                        });
+                        const buildPath = (pts: { x: number; y: number }[]) => {
+                          if (pts.length < 3) return '';
+                          const first = toScreen(pts[0].x, pts[0].y);
+                          let d = `M ${first.x.toFixed(1)} ${first.y.toFixed(1)}`;
+                          for (let i = 1; i < pts.length; i++) {
+                            const pt = toScreen(pts[i].x, pts[i].y);
+                            d += ` L ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
+                          }
+                          return d + ' Z';
+                        };
+
+                        const datumL = toScreen(bounds.minX, bounds.minY);
+                        const datumR = toScreen(bounds.maxX, bounds.minY);
+                        const spanYLabel =
+                          thicknessUnit === 'um'
+                            ? `${((bounds.maxY - bounds.minY) / 1000).toFixed(2)} µm`
+                            : `${Math.round(bounds.maxY - bounds.minY)} nm`;
+                        const spanXLabel = `${((bounds.maxX - bounds.minX) / 1000).toFixed(2)} µm`;
+
+                        return (
+                          <div className="rounded-lg bg-slate-950 border border-slate-800 overflow-hidden">
+                            <div className="px-2.5 py-1.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-semibold text-slate-200">
+                                Resulting Cross-Section Preview
+                              </span>
+                              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                                {targetSide === 'front' ? 'Top' : 'Bottom'} ← {incomingFace === 'front' ? 'Front' : 'Back'}
+                                {mirrorHorizontal ? ' · Mirrored' : ''}
+                              </span>
+                            </div>
+                            <div className="relative w-full h-52 sm:h-56 bg-[#060a12]">
+                              <svg
+                                viewBox={`0 0 ${vbW} ${vbH}`}
+                                className="w-full h-full block"
+                                preserveAspectRatio="xMidYMid meet"
+                                aria-label="Resulting bonded wafer cross-section preview"
+                              >
+                                <SvgPatterns
+                                  materials={prevMats}
+                                  idPrefix="bond-mismatch-prev-"
+                                />
+                                <g>
+                                  {polygons.map((poly) => {
+                                    const mat = getMaterialById(prevMats, poly.materialId);
+                                    const d = buildPath(poly.points);
+                                    if (!d) return null;
+                                    return (
+                                      <path
+                                        key={poly.id}
+                                        d={d}
+                                        fill={`url(#bond-mismatch-prev-mat-fill-${mat.id})`}
+                                        stroke={mat.strokeColor || '#1e293b'}
+                                        strokeWidth="0.9"
+                                      />
+                                    );
+                                  })}
+                                </g>
+                                {mesh.mountedFrames &&
+                                  mesh.mountedFrames.map((frame, fIdx) => {
+                                    const leftX = toScreen(0, 0).x;
+                                    const rightX = toScreen(waferWidth, 0).x;
+                                    const yTopPx = toScreen(0, frame.yTop).y;
+                                    const yBotPx = toScreen(0, frame.yBottom).y;
+                                    const yMinPx = Math.min(yTopPx, yBotPx);
+                                    const clampH = Math.max(3, Math.abs(yBotPx - yTopPx));
+                                    return (
+                                      <g key={`bm_frame_${fIdx}_${frame.side}`}>
+                                        <rect
+                                          x={leftX - 8}
+                                          y={yMinPx}
+                                          width={8}
+                                          height={clampH}
+                                          fill="#0284c7"
+                                          stroke="#38bdf8"
+                                          strokeWidth="0.7"
+                                        />
+                                        <rect
+                                          x={rightX}
+                                          y={yMinPx}
+                                          width={8}
+                                          height={clampH}
+                                          fill="#0284c7"
+                                          stroke="#38bdf8"
+                                          strokeWidth="0.7"
+                                        />
+                                      </g>
+                                    );
+                                  })}
+                                <line
+                                  x1={datumL.x}
+                                  y1={datumL.y}
+                                  x2={datumR.x}
+                                  y2={datumR.y}
+                                  stroke="#334155"
+                                  strokeWidth="0.7"
+                                  strokeDasharray="3 2"
+                                />
+                              </svg>
+                            </div>
+                            <div className="px-2.5 py-1 bg-slate-950/90 border-t border-slate-800 flex items-center justify-between text-[10px] font-mono text-slate-400">
+                              <span>W: {spanXLabel}</span>
+                              <span>Total H: {spanYLabel}</span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-slate-800 bg-slate-950/60 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setPendingBondImport(null)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitImportedFlow(
+                      pendingBondImport.flow,
+                      pendingBondImport.title,
+                      pendingBondImport.mode,
+                      pendingBondImport.alignment,
+                      pendingBondImport.offsetNm,
+                      pendingBondImport.paddingMode
+                    );
+                    setPendingBondImport(null);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition-colors"
+                >
+                  Import & Apply
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 };

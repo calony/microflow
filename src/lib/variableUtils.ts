@@ -12,6 +12,7 @@ import {
   ProcessFlow,
   ProcessStep,
   ProcessStepVariant,
+  SacrificialReleaseRegion,
   SubstrateLayer,
   VariableUnit,
 } from '../types/microfab';
@@ -749,6 +750,22 @@ function resolveMaskWindow(
   return win;
 }
 
+function resolveReleaseRegion(
+  region: SacrificialReleaseRegion,
+  scope: Record<string, number>,
+  waferWidth: number
+): SacrificialReleaseRegion {
+  const b = region.paramBindings;
+  if (!b) return region;
+  const xStartVal = evalBoundValue(b, 'xStart', scope);
+  const xEndVal = evalBoundValue(b, 'xEnd', scope);
+  if (xStartVal === null && xEndVal === null) return region;
+  const nextStart = xStartVal !== null ? xStartVal : region.xStart;
+  const nextEnd = xEndVal !== null ? xEndVal : region.xEnd;
+  const pair = clampWindowPair(nextStart, nextEnd, waferWidth);
+  return { ...region, ...pair };
+}
+
 function resolveGdsShape(shape: GdsShape, scope: Record<string, number>): GdsShape {
   const b = shape.paramBindings;
   if (!b) return shape;
@@ -852,12 +869,14 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
           (s.paramBindings && Object.keys(s.paramBindings).length > 0) ||
           s.lithography?.windows?.some((w) => w.paramBindings && Object.keys(w.paramBindings).length > 0) ||
           s.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0) ||
+          s.strip?.releaseRegions?.some((r) => r.paramBindings && Object.keys(r.paramBindings).length > 0) ||
           Boolean(
             s.variants?.some(
               (v) =>
                 (v.paramBindings && Object.keys(v.paramBindings).length > 0) ||
                 v.lithography?.windows?.some((w) => w.paramBindings && Object.keys(w.paramBindings).length > 0) ||
-                v.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0)
+                v.dicing?.streets?.some((st) => st.paramBindings && Object.keys(st.paramBindings).length > 0) ||
+                v.strip?.releaseRegions?.some((r) => r.paramBindings && Object.keys(r.paramBindings).length > 0)
             )
           )
       ) ||
@@ -999,6 +1018,17 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
           },
         };
       }
+    } else if (step.type === 'strip' && step.strip?.releaseRegions?.length) {
+      const nextRegions = step.strip.releaseRegions.map((r) =>
+        resolveReleaseRegion(r, scope, nextSubstrateWidth)
+      );
+      updated = {
+        ...updated,
+        strip: {
+          ...step.strip,
+          releaseRegions: nextRegions,
+        },
+      };
     }
 
     if (updated.variants && updated.variants.length > 0) {
@@ -1110,6 +1140,17 @@ export function resolveFlowParameters(flow: ProcessFlow): ProcessFlow {
               },
             };
           }
+        } else if (v.type === 'strip' && v.strip?.releaseRegions?.length) {
+          const nextRegions = v.strip.releaseRegions.map((r) =>
+            resolveReleaseRegion(r, scope, nextSubstrateWidth)
+          );
+          nextV = {
+            ...nextV,
+            strip: {
+              ...v.strip,
+              releaseRegions: nextRegions,
+            },
+          };
         }
         return nextV;
       };
@@ -1203,6 +1244,9 @@ export function countVariableUsages(flow: ProcessFlow): Record<string, VariableU
     step.dicing?.streets?.forEach((st, stIdx) => {
       scanBindings(st.paramBindings, `${label} · Street #${stIdx + 1}`);
     });
+    step.strip?.releaseRegions?.forEach((r, rIdx) => {
+      scanBindings(r.paramBindings, `${label} · Release Region #${rIdx + 1}`);
+    });
     step.variants?.forEach((variant) => {
       if (variant.id === step.activeVariantId) return;
       const vLabel = `${label} [${variant.name}]`;
@@ -1212,6 +1256,9 @@ export function countVariableUsages(flow: ProcessFlow): Record<string, VariableU
       });
       variant.dicing?.streets?.forEach((st, stIdx) => {
         scanBindings(st.paramBindings, `${vLabel} · Street #${stIdx + 1}`);
+      });
+      variant.strip?.releaseRegions?.forEach((r, rIdx) => {
+        scanBindings(r.paramBindings, `${vLabel} · Release Region #${rIdx + 1}`);
       });
     });
   });
@@ -1290,6 +1337,15 @@ export function renameVariableInFlow(
             })),
           }
         : undefined,
+      strip: s.strip
+        ? {
+            ...s.strip,
+            releaseRegions: s.strip.releaseRegions?.map((r) => ({
+              ...r,
+              paramBindings: rewriteMap(r.paramBindings),
+            })),
+          }
+        : undefined,
       variants: s.variants?.map((v) => ({
         ...v,
         paramBindings: rewriteMap(v.paramBindings),
@@ -1308,6 +1364,15 @@ export function renameVariableInFlow(
               streets: v.dicing.streets.map((st) => ({
                 ...st,
                 paramBindings: rewriteMap(st.paramBindings),
+              })),
+            }
+          : undefined,
+        strip: v.strip
+          ? {
+              ...v.strip,
+              releaseRegions: v.strip.releaseRegions?.map((r) => ({
+                ...r,
+                paramBindings: rewriteMap(r.paramBindings),
               })),
             }
           : undefined,
@@ -1387,6 +1452,15 @@ export function removeVariableFromFlow(flow: ProcessFlow, varName: string): Proc
             })),
           }
         : undefined,
+      strip: s.strip
+        ? {
+            ...s.strip,
+            releaseRegions: s.strip.releaseRegions?.map((r) => ({
+              ...r,
+              paramBindings: cleanMap(r.paramBindings),
+            })),
+          }
+        : undefined,
       variants: s.variants?.map((v) => ({
         ...v,
         paramBindings: cleanMap(v.paramBindings),
@@ -1405,6 +1479,15 @@ export function removeVariableFromFlow(flow: ProcessFlow, varName: string): Proc
               streets: v.dicing.streets.map((st) => ({
                 ...st,
                 paramBindings: cleanMap(st.paramBindings),
+              })),
+            }
+          : undefined,
+        strip: v.strip
+          ? {
+              ...v.strip,
+              releaseRegions: v.strip.releaseRegions?.map((r) => ({
+                ...r,
+                paramBindings: cleanMap(r.paramBindings),
               })),
             }
           : undefined,

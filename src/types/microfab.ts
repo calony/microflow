@@ -183,10 +183,22 @@ export interface EtchRecipe {
   isCustom?: boolean;
 }
 
+export interface SacrificialReleaseRegion {
+  id: string;
+  label?: string;
+  xStart: number; // nm
+  xEnd: number;   // nm
+  yMin?: number;  // optional nm lower Z bound (for targeting one of multiple stacked layers)
+  yMax?: number;  // optional nm upper Z bound
+  paramBindings?: Record<string, string>;
+}
+
 export interface StripConfig {
   stripType: 'resist-strip' | 'metal-liftoff' | 'sacrificial-release';
   solvent: string;
   targetMaterialId?: string; // for sacrificial release
+  releaseScope?: 'all' | 'regions'; // 'all' (default) or 'regions'
+  releaseRegions?: SacrificialReleaseRegion[];
 }
 
 export interface CmpConfig {
@@ -204,6 +216,10 @@ export interface BondingConfig {
   bondingMethod: 'fusion' | 'anodic' | 'adhesive' | 'eutectic' | 'hybrid';
   incomingFace?: 'front' | 'back';
   mirrorHorizontal?: boolean;
+  widthMismatchMode?: 'rescale' | 'crop-pad';
+  widthAlignment?: 'left' | 'center' | 'right' | 'custom';
+  widthOffsetNm?: number;
+  widthPaddingMode?: 'empty' | 'extend-edges';
   customLayers?: SubstrateLayer[];
   importedFlow?: ProcessFlow;
   importedFlowTitle?: string;

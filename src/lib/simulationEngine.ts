@@ -22,6 +22,7 @@ import {
   isCrystallineKohMaterial,
 } from './materials';
 import { getEtchRecipeById, getEtchRateNmMin } from './etchRates';
+import { resolveFlowParameters } from './variableUtils';
 
 const DEFAULT_SAMPLE_COLUMNS = 300;
 
@@ -36,16 +37,13 @@ export function simulateCrossSection(
   return simulateCrossSectionInternal(flow, upToStepIndex, 0);
 }
 
-function simulateCrossSectionInternal(
-  flow: ProcessFlow,
-  upToStepIndex?: number,
-  recursionDepth: number = 0
-): CrossSectionMesh {
+function initSubstrateColumns(
+  flow: ProcessFlow
+): { width: number; currentY: number; columns: ColumnProfile[] } {
   const width = flow.substrateWidth || 10000; // default 10 µm
   const numCols = DEFAULT_SAMPLE_COLUMNS;
   const dx = width / numCols;
 
-  // Initialize columns with multi-layer substrate stack
   const columns: ColumnProfile[] = [];
   const subLayers =
     flow.substrateLayers && flow.substrateLayers.length > 0
@@ -59,16 +57,40 @@ function simulateCrossSectionInternal(
           },
         ];
 
-  // Pre-calculate vertical segments for each substrate layer
+  let coreLayerIdx = -1;
+  if (subLayers.length > 1) {
+    let bestCoreScore = -1;
+    for (let i = 0; i < subLayers.length; i++) {
+      const mat = getMaterialById(flow.materials, subLayers[i].materialId);
+      const isBulkCat = mat.category === 'substrate' || mat.category === 'semiconductor';
+      const thick = Math.max(1, subLayers[i].thickness);
+      const score = (isBulkCat ? 1e9 : 0) + thick;
+      if (score > bestCoreScore) {
+        bestCoreScore = score;
+        coreLayerIdx = i;
+      }
+    }
+  }
+
   const initialSegments: MaterialSegment[] = [];
   let currentY = 0;
-  for (const layer of subLayers) {
+  for (let i = 0; i < subLayers.length; i++) {
+    const layer = subLayers[i];
     const layerThick = Math.max(1, layer.thickness);
+    const inferredSide: 'front' | 'back' | undefined =
+      coreLayerIdx >= 0
+        ? i < coreLayerIdx
+          ? 'back'
+          : i > coreLayerIdx
+          ? 'front'
+          : undefined
+        : undefined;
     initialSegments.push({
       yBottom: currentY,
       yTop: currentY + layerThick,
       materialId: layer.materialId,
       stepId: `substrate_${layer.id}`,
+      ...(inferredSide ? { side: inferredSide } : {}),
     });
     currentY += layerThick;
   }
@@ -80,6 +102,63 @@ function simulateCrossSectionInternal(
       segments: initialSegments.map((s) => ({ ...s })),
     });
   }
+
+  return { width, currentY, columns };
+}
+
+/**
+ * Computes the global vertical bounds (minY, maxY in nm) across the starting substrate
+ * and every enabled step in a single forward simulation pass.
+ */
+export function computeFlowSharedYBounds(
+  rawFlow: ProcessFlow
+): { minY: number; maxY: number } {
+  const flow = resolveFlowParameters(rawFlow);
+  const { width, currentY, columns } = initSubstrateColumns(flow);
+
+  let minY = Infinity;
+  let maxY = -Infinity;
+  const updateBounds = () => {
+    for (const col of columns) {
+      for (const seg of col.segments) {
+        if (seg.yBottom < minY) minY = seg.yBottom;
+        if (seg.yTop > maxY) maxY = seg.yTop;
+      }
+    }
+  };
+
+  updateBounds();
+
+  const enabledSteps = flow.steps.filter((s) => s.enabled);
+  const scallopWalls: ScallopWall[] = [];
+  const activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[] = [];
+
+  for (let idx = 0; idx < enabledSteps.length; idx++) {
+    applyStep(
+      columns,
+      enabledSteps[idx],
+      flow.materials,
+      width,
+      0,
+      scallopWalls,
+      activeFrames,
+      flow.etchLibrary
+    );
+    updateBounds();
+  }
+
+  if (minY === Infinity) minY = 0;
+  if (maxY === -Infinity) maxY = currentY;
+
+  return { minY, maxY };
+}
+
+function simulateCrossSectionInternal(
+  flow: ProcessFlow,
+  upToStepIndex?: number,
+  recursionDepth: number = 0
+): CrossSectionMesh {
+  const { width, currentY, columns } = initSubstrateColumns(flow);
 
   const enabledSteps = flow.steps.filter((s) => s.enabled);
   const maxIdx =
@@ -4522,6 +4601,38 @@ function pruneWallsAfterStrip(
   }
 }
 
+export function doesSegmentMatchReleaseSide(
+  col: ColumnProfile,
+  segIdx: number,
+  seg: MaterialSegment,
+  targetMat: string,
+  side: 'front' | 'back' | 'both'
+): boolean {
+  if (side === 'both') return true;
+  if (seg.side === 'front') return side === 'front';
+  if (seg.side === 'back') return side === 'back';
+
+  // Untagged segment (e.g. legacy substrate layer or core): infer side relative to non-target core
+  const segs = col.segments;
+  let coreIdx = -1;
+  let maxOtherSpan = -1;
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i].materialId === targetMat) continue;
+    const span = segs[i].yTop - segs[i].yBottom;
+    if (span > maxOtherSpan) {
+      maxOtherSpan = span;
+      coreIdx = i;
+    }
+  }
+  if (coreIdx === -1) {
+    // Only target material exists in this column (core substrate itself): only remove on 'both'
+    return false;
+  }
+  if (segIdx > coreIdx) return side === 'front';
+  if (segIdx < coreIdx) return side === 'back';
+  return false;
+}
+
 function applyStripOrLiftoff(
   columns: ColumnProfile[],
   step: ProcessStep,
@@ -4535,13 +4646,84 @@ function applyStripOrLiftoff(
 
   if (stripType === 'sacrificial-release') {
     const targetMat = cfg?.targetMaterialId ?? 'mat_sio2_thermal';
+    const releaseScope = cfg?.releaseScope ?? 'all';
+    const regions = cfg?.releaseRegions ?? [];
+
     for (const col of columns) {
-      col.segments = col.segments.filter((seg) => {
-        if (seg.materialId !== targetMat) return true;
-        if (side === 'both') return false;
-        if (side === 'front') return seg.side === 'back';
-        return seg.side !== 'back';
-      });
+      if (releaseScope === 'regions') {
+        // releaseRegions define protected zones that are NOT etched (kept intact)
+        const protectedRegions = regions.filter((r) => {
+          const xLo = Math.min(r.xStart, r.xEnd);
+          const xHi = Math.max(r.xStart, r.xEnd);
+          return xHi - xLo > 0.5 && col.x >= xLo - 1e-6 && col.x <= xHi + 1e-6;
+        });
+
+        const nextSegs: MaterialSegment[] = [];
+        const origSegs = col.segments;
+        for (let sIdx = 0; sIdx < origSegs.length; sIdx++) {
+          const seg = origSegs[sIdx];
+          if (
+            seg.materialId !== targetMat ||
+            !doesSegmentMatchReleaseSide(col, sIdx, seg, targetMat, side)
+          ) {
+            nextSegs.push(seg);
+            continue;
+          }
+
+          if (protectedRegions.length === 0) {
+            // Outside all protected regions -> dissolved
+            continue;
+          }
+
+          const hasFullZProtected = protectedRegions.some(
+            (r) => r.yMin === undefined || r.yMax === undefined
+          );
+          if (hasFullZProtected) {
+            nextSegs.push(seg);
+            continue;
+          }
+
+          // Collect and merge Z-intervals of this segment covered by protected regions
+          const rawKept: [number, number][] = [];
+          for (const r of protectedRegions) {
+            const rLo = Math.min(r.yMin!, r.yMax!) - 1;
+            const rHi = Math.max(r.yMin!, r.yMax!) + 1;
+            const lo = Math.max(seg.yBottom, rLo);
+            const hi = Math.min(seg.yTop, rHi);
+            if (hi - lo > 0.5) {
+              rawKept.push([lo, hi]);
+            }
+          }
+
+          if (rawKept.length === 0) continue;
+
+          rawKept.sort((a, b) => a[0] - b[0]);
+          const mergedKept: [number, number][] = [rawKept[0]];
+          for (let k = 1; k < rawKept.length; k++) {
+            const prev = mergedKept[mergedKept.length - 1];
+            const cur = rawKept[k];
+            if (cur[0] <= prev[1] + 0.5) {
+              prev[1] = Math.max(prev[1], cur[1]);
+            } else {
+              mergedKept.push(cur);
+            }
+          }
+
+          for (const [a, b] of mergedKept) {
+            nextSegs.push({
+              ...seg,
+              yBottom: a,
+              yTop: b,
+            });
+          }
+        }
+        col.segments = nextSegs;
+      } else {
+        col.segments = col.segments.filter((seg, sIdx) => {
+          if (seg.materialId !== targetMat) return true;
+          return !doesSegmentMatchReleaseSide(col, sIdx, seg, targetMat, side);
+        });
+      }
     }
     pruneWallsAfterStrip(columns, scallopWalls);
     return;
@@ -4593,12 +4775,10 @@ function applyStripOrLiftoff(
 
   // Standard resist strip: remove photoresist layers on selected side(s)
   for (const col of columns) {
-    col.segments = col.segments.filter((seg) => {
+    col.segments = col.segments.filter((seg, sIdx) => {
       const mat = getMaterialById(materials, seg.materialId);
       if (mat.category !== 'photoresist') return true;
-      if (side === 'both') return false;
-      if (side === 'front') return seg.side === 'back';
-      return seg.side !== 'back';
+      return !doesSegmentMatchReleaseSide(col, sIdx, seg, seg.materialId, side);
     });
   }
   pruneWallsAfterStrip(columns, scallopWalls);
@@ -5005,80 +5185,157 @@ function applyBonding(
   const targetSide: 'front' | 'back' = step.side === 'back' ? 'back' : 'front';
   const incomingFace: 'front' | 'back' = cfg?.incomingFace || 'front';
 
-  // Determine the flat contact plane on the current wafer (rests on highest/lowest point)
-  let bondPlaneY = targetSide === 'front' ? -Infinity : Infinity;
-  for (const col of columns) {
-    if (col.segments.length === 0) continue;
-    if (targetSide === 'front') {
-      const top = getTopY(col);
-      if (top > bondPlaneY) bondPlaneY = top;
-    } else {
-      const bot = getBottomY(col);
-      if (bot < bondPlaneY) bondPlaneY = bot;
-    }
-  }
-
-  if (bondPlaneY === -Infinity || bondPlaneY === Infinity) {
-    bondPlaneY = 0;
-  }
-
   const iface = cfg?.interfaceLayer;
   const ifaceThick =
     iface?.enabled && (iface.thickness ?? 0) > 0 ? iface.thickness : 0;
 
-  const incomingContactY =
-    targetSide === 'front'
-      ? bondPlaneY + ifaceThick
-      : bondPlaneY - ifaceThick;
-
-  // Helper to append/prepend interface layer if enabled
-  const buildInterfaceSeg = (): MaterialSegment | null => {
-    if (ifaceThick <= 0 || !iface) return null;
-    return targetSide === 'front'
-      ? {
-          yBottom: bondPlaneY,
-          yTop: bondPlaneY + ifaceThick,
-          materialId: iface.materialId || 'mat_sio2_thermal',
-          stepId: step.id,
-          side: 'front',
-        }
-      : {
-          yBottom: bondPlaneY - ifaceThick,
-          yTop: bondPlaneY,
-          materialId: iface.materialId || 'mat_sio2_thermal',
-          stepId: step.id,
-          side: 'back',
-        };
-  };
-
   if (cfg?.sourceType === 'imported-flow' && cfg.importedFlow) {
+    const resolvedImported = resolveFlowParameters(cfg.importedFlow);
     const meshB = simulateCrossSectionInternal(
-      cfg.importedFlow,
+      resolvedImported,
       undefined,
       recursionDepth + 1
     );
     const colsB = meshB.columns;
     if (colsB.length === 0) return;
 
-    const minYB = meshB.minY;
-    const maxYB = meshB.maxY;
-
+    const totalWidth =
+      _totalWidth > 0
+        ? _totalWidth
+        : columns.length > 0
+        ? columns[columns.length - 1].x + columns[0].x
+        : 10000;
+    const importedWidth = meshB.width || resolvedImported.substrateWidth || totalWidth;
+    const widthsMatch = Math.abs(importedWidth - totalWidth) <= 1;
+    const useCropPad = !widthsMatch && cfg.widthMismatchMode === 'crop-pad';
+    const alignment = cfg.widthAlignment || 'center';
+    const paddingMode = cfg.widthPaddingMode || 'empty';
     const mirrorHoriz = Boolean(cfg.mirrorHorizontal);
+
+    const shiftX =
+      alignment === 'custom' &&
+      typeof cfg.widthOffsetNm === 'number' &&
+      Number.isFinite(cfg.widthOffsetNm)
+        ? cfg.widthOffsetNm
+        : alignment === 'left'
+        ? 0
+        : alignment === 'right'
+        ? totalWidth - importedWidth
+        : (totalWidth - importedWidth) / 2;
+
+    // Pre-map each base column to its corresponding imported column segments (or null if padded empty)
+    const mappedColsB: (MaterialSegment[] | null)[] = new Array(columns.length);
+    for (let i = 0; i < columns.length; i++) {
+      if (!useCropPad) {
+        const rawIdxB = Math.min(
+          colsB.length - 1,
+          Math.floor((i / columns.length) * colsB.length)
+        );
+        const idxB = mirrorHoriz ? colsB.length - 1 - rawIdxB : rawIdxB;
+        mappedColsB[i] = colsB[idxB].segments;
+      } else {
+        const localX = columns[i].x - shiftX;
+        if (localX < 0 || localX > importedWidth) {
+          if (paddingMode === 'extend-edges') {
+            const clampedLocalX = localX < 0 ? 0 : importedWidth;
+            const rawIdxB = Math.min(
+              colsB.length - 1,
+              Math.max(0, Math.floor((clampedLocalX / importedWidth) * colsB.length))
+            );
+            const idxB = mirrorHoriz ? colsB.length - 1 - rawIdxB : rawIdxB;
+            mappedColsB[i] = colsB[idxB].segments;
+          } else {
+            mappedColsB[i] = null;
+          }
+        } else {
+          const rawIdxB = Math.min(
+            colsB.length - 1,
+            Math.max(0, Math.floor((localX / importedWidth) * colsB.length))
+          );
+          const idxB = mirrorHoriz ? colsB.length - 1 - rawIdxB : rawIdxB;
+          mappedColsB[i] = colsB[idxB].segments;
+        }
+      }
+    }
+
+    // Determine contact plane on current wafer across overlapping bonded columns (falling back to all columns)
+    let bondPlaneY = targetSide === 'front' ? -Infinity : Infinity;
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      const segsB = mappedColsB[i];
+      if (col.segments.length === 0 || !segsB || segsB.length === 0) continue;
+      if (targetSide === 'front') {
+        const top = getTopY(col);
+        if (top > bondPlaneY) bondPlaneY = top;
+      } else {
+        const bot = getBottomY(col);
+        if (bot < bondPlaneY) bondPlaneY = bot;
+      }
+    }
+    if (bondPlaneY === -Infinity || bondPlaneY === Infinity) {
+      for (const col of columns) {
+        if (col.segments.length === 0) continue;
+        if (targetSide === 'front') {
+          const top = getTopY(col);
+          if (top > bondPlaneY) bondPlaneY = top;
+        } else {
+          const bot = getBottomY(col);
+          if (bot < bondPlaneY) bondPlaneY = bot;
+        }
+      }
+    }
+    if (bondPlaneY === -Infinity || bondPlaneY === Infinity) {
+      bondPlaneY = 0;
+    }
+
+    const incomingContactY =
+      targetSide === 'front'
+        ? bondPlaneY + ifaceThick
+        : bondPlaneY - ifaceThick;
+
+    const buildInterfaceSeg = (): MaterialSegment | null => {
+      if (ifaceThick <= 0 || !iface) return null;
+      return targetSide === 'front'
+        ? {
+            yBottom: bondPlaneY,
+            yTop: bondPlaneY + ifaceThick,
+            materialId: iface.materialId || 'mat_sio2_thermal',
+            stepId: step.id,
+            side: 'front',
+          }
+        : {
+            yBottom: bondPlaneY - ifaceThick,
+            yTop: bondPlaneY,
+            materialId: iface.materialId || 'mat_sio2_thermal',
+            stepId: step.id,
+            side: 'back',
+          };
+    };
+
+    // Determine effective vertical bounds over surviving imported columns (important when cropping overhanging tall structures)
+    let minYB = Infinity;
+    let maxYB = -Infinity;
+    for (let i = 0; i < mappedColsB.length; i++) {
+      const segs = mappedColsB[i];
+      if (!segs) continue;
+      for (const s of segs) {
+        if (s.yBottom < minYB) minYB = s.yBottom;
+        if (s.yTop > maxYB) maxYB = s.yTop;
+      }
+    }
+    if (minYB === Infinity) minYB = meshB.minY;
+    if (maxYB === -Infinity) maxYB = meshB.maxY;
 
     for (let i = 0; i < columns.length; i++) {
       const col = columns[i];
-      const rawIdxB = Math.min(
-        colsB.length - 1,
-        Math.floor((i / columns.length) * colsB.length)
-      );
-      const idxB = mirrorHoriz ? colsB.length - 1 - rawIdxB : rawIdxB;
-      const segsB = colsB[idxB].segments;
+      const segsB = mappedColsB[i];
+      if (!segsB || segsB.length === 0) continue;
 
       const addedSegs: MaterialSegment[] = [];
       const ifaceSeg = buildInterfaceSeg();
 
       if (targetSide === 'front') {
-        if (ifaceSeg && segsB.length > 0) addedSegs.push(ifaceSeg);
+        if (ifaceSeg) addedSegs.push(ifaceSeg);
         if (incomingFace === 'front') {
           // Flip Wafer B upside-down so its front (maxYB) mates with incomingContactY
           for (let k = segsB.length - 1; k >= 0; k--) {
@@ -5130,12 +5387,54 @@ function applyBonding(
             });
           }
         }
-        if (ifaceSeg && segsB.length > 0) addedSegs.push(ifaceSeg);
+        if (ifaceSeg) addedSegs.push(ifaceSeg);
         col.segments = [...addedSegs, ...col.segments];
       }
     }
     return;
   }
+
+  // Determine the flat contact plane on the current wafer (rests on highest/lowest point)
+  let bondPlaneY = targetSide === 'front' ? -Infinity : Infinity;
+  for (const col of columns) {
+    if (col.segments.length === 0) continue;
+    if (targetSide === 'front') {
+      const top = getTopY(col);
+      if (top > bondPlaneY) bondPlaneY = top;
+    } else {
+      const bot = getBottomY(col);
+      if (bot < bondPlaneY) bondPlaneY = bot;
+    }
+  }
+
+  if (bondPlaneY === -Infinity || bondPlaneY === Infinity) {
+    bondPlaneY = 0;
+  }
+
+  const incomingContactY =
+    targetSide === 'front'
+      ? bondPlaneY + ifaceThick
+      : bondPlaneY - ifaceThick;
+
+  // Helper to append/prepend interface layer if enabled
+  const buildInterfaceSeg = (): MaterialSegment | null => {
+    if (ifaceThick <= 0 || !iface) return null;
+    return targetSide === 'front'
+      ? {
+          yBottom: bondPlaneY,
+          yTop: bondPlaneY + ifaceThick,
+          materialId: iface.materialId || 'mat_sio2_thermal',
+          stepId: step.id,
+          side: 'front',
+        }
+      : {
+          yBottom: bondPlaneY - ifaceThick,
+          yTop: bondPlaneY,
+          materialId: iface.materialId || 'mat_sio2_thermal',
+          stepId: step.id,
+          side: 'back',
+        };
+  };
 
   // Custom user-defined multi-layer substrate
   const layers =
