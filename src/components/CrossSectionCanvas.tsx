@@ -60,6 +60,7 @@ import {
   Files,
   Lock,
   Unlock,
+  HelpCircle,
 } from 'lucide-react';
 
 interface StackProbePoint {
@@ -123,6 +124,7 @@ interface CrossSectionCanvasProps {
   onRemoveReleaseRegion?: (regionId: string) => void;
   onClearReleaseRegions?: () => void;
   onOpenBatchExport?: () => void;
+  onOpenHelp?: () => void;
 }
 
 export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
@@ -164,6 +166,7 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   onAddReleaseRegion,
   onClearReleaseRegions,
   onOpenBatchExport,
+  onOpenHelp,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -2140,6 +2143,18 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
             )}
             <span className="hidden xl:inline">{isAnyFullscreen ? 'Exit Full' : 'Full'}</span>
           </button>
+
+          {onOpenHelp && (
+            <button
+              type="button"
+              onClick={onOpenHelp}
+              className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-sky-300 transition-colors"
+              title="Help: Cross-Section Viewport, Z-Scale, Caliper & Stack Probe"
+              aria-label="Help for Cross-Section Viewport"
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
 

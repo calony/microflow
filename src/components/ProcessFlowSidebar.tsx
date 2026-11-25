@@ -82,6 +82,7 @@ import {
   Minus,
   GitBranch,
   FileInput,
+  HelpCircle,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -97,6 +98,7 @@ interface ProcessFlowSidebarProps {
   onOpenPresets: () => void;
   onOpenImportFlow?: () => void;
   onOpenParameters?: () => void;
+  onOpenHelp?: () => void;
 }
 
 export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
@@ -112,6 +114,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   onOpenPresets,
   onOpenImportFlow,
   onOpenParameters,
+  onOpenHelp,
 }) => {
   type AddStepPlacement =
     | { mode: 'end' }
@@ -1495,6 +1498,18 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
             >
               <FileInput className="w-3 h-3" />
               <span>Import</span>
+            </button>
+          )}
+
+          {onOpenHelp && (
+            <button
+              type="button"
+              onClick={onOpenHelp}
+              className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-sky-300 border border-slate-700 transition-colors"
+              title="Help: Timeline, Process Blocks & Variants"
+              aria-label="Help for Process Traveller"
+            >
+              <HelpCircle className="w-3 h-3" />
             </button>
           )}
         </div>

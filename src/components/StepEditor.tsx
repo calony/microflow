@@ -91,6 +91,7 @@ import {
   AlertTriangle,
   Maximize2,
   X,
+  HelpCircle,
 } from 'lucide-react';
 
 interface StepEditorProps {
@@ -114,6 +115,7 @@ interface StepEditorProps {
   onOpenVariantManager?: () => void;
   pickReleaseMode?: boolean;
   onTogglePickReleaseMode?: () => void;
+  onOpenHelp?: () => void;
 }
 
 interface RegionUmInputProps {
@@ -205,6 +207,7 @@ export const StepEditor: React.FC<StepEditorProps> = ({
   onOpenVariantManager,
   pickReleaseMode = false,
   onTogglePickReleaseMode,
+  onOpenHelp,
 }) => {
   const [activeTab, setActiveTab] = useState<'process' | 'equipment' | 'notes'>('process');
   const [isAddingBlockInline, setIsAddingBlockInline] = useState<boolean>(false);
@@ -414,6 +417,17 @@ export const StepEditor: React.FC<StepEditorProps> = ({
               {step.type}
             </span>
             <span className="text-xs text-slate-400 font-mono">Step Config</span>
+            {onOpenHelp && (
+              <button
+                type="button"
+                onClick={onOpenHelp}
+                className="p-0.5 rounded text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                title="Help: Process Step Models & Parameters"
+                aria-label="Help for Step Parameters"
+              >
+                <HelpCircle className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-2.5">

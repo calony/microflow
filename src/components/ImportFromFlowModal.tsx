@@ -45,6 +45,7 @@ import {
   CheckSquare,
   Square,
   RotateCcw,
+  HelpCircle,
 } from 'lucide-react';
 
 interface ImportFromFlowModalProps {
@@ -54,6 +55,7 @@ interface ImportFromFlowModalProps {
   initialMode?: FlowImportMode;
   onApplyImport: (nextFlow: ProcessFlow, nextActiveStepIndex?: number) => void;
   onClose: () => void;
+  onOpenHelp?: () => void;
 }
 
 const STEP_TYPE_LABEL: Record<ProcessStepType, string> = {
@@ -91,6 +93,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
   initialMode = 'steps-and-masks',
   onApplyImport,
   onClose,
+  onOpenHelp,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -549,6 +552,17 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                   <span className="hidden sm:inline">Change Source</span>
                 </button>
               </>
+            )}
+            {onOpenHelp && (
+              <button
+                type="button"
+                onClick={onOpenHelp}
+                className="p-1 rounded-lg text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                title="Help: Importing Steps, Masks & Blocks"
+                aria-label="Help for Import Flow"
+              >
+                <HelpCircle className="w-4 h-4" />
+              </button>
             )}
             <button
               type="button"
@@ -1379,7 +1393,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                     </div>
 
                     {sourceSummary.description && (
-                      <p className="text-[11.5px] text-slate-300 leading-relaxed">
+                      <p className="text-[11.5px] text-slate-200 leading-relaxed whitespace-pre-line">
                         {sourceSummary.description}
                       </p>
                     )}

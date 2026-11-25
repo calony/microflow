@@ -14,13 +14,15 @@ import {
   Wrench,
   Layers,
   AlertCircle,
+  HelpCircle,
 } from 'lucide-react';
 
 interface AboutModalProps {
   onClose: () => void;
+  onOpenHelp?: () => void;
 }
 
-export const AboutModal: React.FC<AboutModalProps> = ({ onClose }) => {
+export const AboutModal: React.FC<AboutModalProps> = ({ onClose, onOpenHelp }) => {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-2 sm:p-4">
       <div className="relative w-full max-w-3xl max-h-[94dvh] sm:max-h-[88vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col text-slate-200 overflow-hidden">
@@ -183,13 +185,28 @@ export const AboutModal: React.FC<AboutModalProps> = ({ onClose }) => {
             <Cpu className="w-3.5 h-3.5 text-sky-400" />
             <span>MicroFlow CAD · Deterministic Client-Side Simulation</span>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
-          >
-            Close
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {onOpenHelp && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenHelp();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-sky-300 font-medium transition-colors"
+              >
+                <HelpCircle className="w-3.5 h-3.5" />
+                <span>User Guide &amp; Help</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -271,6 +271,29 @@ export const SubstrateEditor: React.FC<SubstrateEditorProps> = ({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {/* Process Flow Description */}
+        <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-1.5">
+          <div className="flex items-center justify-between text-xs">
+            <label htmlFor="flow-description-input" className="font-semibold text-slate-300">
+              Process Flow Description
+            </label>
+            <span className="text-[10px] text-slate-500">Shown on Import &amp; SOP</span>
+          </div>
+          <textarea
+            id="flow-description-input"
+            rows={2}
+            value={flow.description || ''}
+            onChange={(e) =>
+              onUpdateFlow({
+                ...flow,
+                description: e.target.value,
+              })
+            }
+            placeholder="Describe what this flow fabricates, key targets, or notes for reuse when importing..."
+            className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 placeholder-slate-500 text-xs leading-relaxed focus:outline-none focus:border-sky-500 resize-y"
+          />
+        </div>
+
         {/* Wafer Width Setting */}
         <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2">
           <div className="flex items-center justify-between text-xs">

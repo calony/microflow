@@ -61,6 +61,7 @@ import {
   Redo2,
   GitBranch,
   FileInput,
+  HelpCircle,
 } from 'lucide-react';
 import { GdsLayoutEditor } from './GdsLayoutEditor';
 import { MaskStackView } from './MaskStackView';
@@ -80,6 +81,7 @@ interface MaskLevelsModalProps {
   activeStepIndex?: number;
   thicknessUnit?: ThicknessUnit;
   onOpenImportMasks?: () => void;
+  onOpenHelp?: () => void;
 }
 
 type MaskCoordUnit = 'um' | 'nm';
@@ -216,6 +218,7 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
   activeStepIndex: _activeStepIndex,
   thicknessUnit = 'nm',
   onOpenImportMasks,
+  onOpenHelp,
 }) => {
   const [apertureUnit, setApertureUnit] = useState<MaskCoordUnit>(() => {
     try {
@@ -2070,6 +2073,17 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 <span className="hidden sm:inline">New Mask</span>
                 <span className="sm:hidden">New</span>
               </button>
+              {onOpenHelp && (
+                <button
+                  type="button"
+                  onClick={onOpenHelp}
+                  className="p-1 rounded-lg text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                  title="Help: Mask Levels, Aligned Stack & 2D GDS"
+                  aria-label="Help for Mask Levels"
+                >
+                  <HelpCircle className="w-4 h-4" />
+                </button>
+              )}
               <button
                 onClick={onClose}
                 className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
@@ -2224,6 +2238,18 @@ export const MaskLevelsModal: React.FC<MaskLevelsModalProps> = ({
                 <Plus className="w-3 h-3" />
                 <span>New Mask</span>
               </button>
+
+              {onOpenHelp && (
+                <button
+                  type="button"
+                  onClick={onOpenHelp}
+                  className="p-1 rounded-lg text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+                  title="Help: Mask Levels, Aligned Stack & 2D GDS"
+                  aria-label="Help for Mask Levels"
+                >
+                  <HelpCircle className="w-4 h-4" />
+                </button>
+              )}
 
               <button
                 onClick={onClose}

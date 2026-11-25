@@ -27,6 +27,7 @@ import {
   Files,
   FileSpreadsheet,
   FileInput,
+  HelpCircle,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -34,6 +35,7 @@ interface HeaderProps {
   thicknessUnit: ThicknessUnit;
   onChangeThicknessUnit: (unit: ThicknessUnit) => void;
   onUpdateTitle: (title: string) => void;
+  onUpdateDescription?: (description: string) => void;
   onOpenPresets: () => void;
   onOpenImportFlow?: (initialMode?: 'steps-and-masks' | 'masks-only') => void;
   onOpenMaterials: () => void;
@@ -47,6 +49,7 @@ interface HeaderProps {
   onOpenMultiStepView: () => void;
   onOpenBatchExport?: () => void;
   onOpenAbout: () => void;
+  onOpenHelp?: () => void;
   onExportJson: () => void;
   onExportCsv?: () => void;
   onImportJson: (json: ProcessFlow) => void;
@@ -63,6 +66,7 @@ export const Header: React.FC<HeaderProps> = ({
   thicknessUnit,
   onChangeThicknessUnit,
   onUpdateTitle,
+  onUpdateDescription,
   onOpenPresets,
   onOpenImportFlow,
   onOpenMaterials,
@@ -76,6 +80,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMultiStepView,
   onOpenBatchExport,
   onOpenAbout,
+  onOpenHelp,
   onExportJson,
   onExportCsv,
   onImportJson,
@@ -88,12 +93,19 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
   const [titleInput, setTitleInput] = useState<string>(flow.title);
+  const [descOpen, setDescOpen] = useState<boolean>(false);
+  const [descDraft, setDescDraft] = useState<string>(flow.description || '');
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const descRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setTitleInput(flow.title);
   }, [flow.title]);
+
+  useEffect(() => {
+    setDescDraft(flow.description || '');
+  }, [flow.description]);
 
   useEffect(() => {
     if (!mobileMenuOpen) return;
@@ -106,11 +118,27 @@ export const Header: React.FC<HeaderProps> = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [mobileMenuOpen]);
 
+  useEffect(() => {
+    if (!descOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (descRef.current && !descRef.current.contains(e.target as Node)) {
+        setDescOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [descOpen]);
+
   const handleTitleSubmit = () => {
     setIsEditingTitle(false);
     if (titleInput.trim()) {
       onUpdateTitle(titleInput.trim());
     }
+  };
+
+  const handleDescriptionSave = () => {
+    onUpdateDescription?.(descDraft.trim());
+    setDescOpen(false);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -195,35 +223,141 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <Info className="w-3.5 h-3.5" />
           </button>
+          {onOpenHelp && (
+            <button
+              type="button"
+              onClick={onOpenHelp}
+              className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700/80 text-xs font-medium transition-colors shrink-0"
+              title="Open MicroFlow CAD Help Guide & Shortcuts"
+              aria-label="Help Guide"
+            >
+              <HelpCircle className="w-3.5 h-3.5 text-sky-400" />
+              <span className="hidden md:inline">Help</span>
+            </button>
+          )}
         </div>
 
         <span className="text-slate-700 hidden sm:inline">|</span>
 
-        {/* Process Title (Click to edit) */}
-        {isEditingTitle ? (
-          <input
-            type="text"
-            value={titleInput}
-            onChange={(e) => setTitleInput(e.target.value)}
-            onBlur={handleTitleSubmit}
-            onKeyDown={(e) => e.key === 'Enter' && handleTitleSubmit()}
-            autoFocus
-            className="px-2 py-1 rounded bg-slate-950 border border-sky-500 text-xs sm:text-sm font-semibold text-white focus:outline-none min-w-0 max-w-[160px] sm:max-w-[220px]"
-          />
-        ) : (
-          <div
-            onClick={() => setIsEditingTitle(true)}
-            className="group flex items-center gap-1 px-1.5 sm:px-2 py-1 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors min-w-0"
-            title="Click to rename process"
-          >
-            <span className="text-xs sm:text-sm font-semibold text-slate-100 group-hover:text-sky-300 transition-colors truncate max-w-[130px] sm:max-w-[200px] lg:max-w-[240px]">
-              {flow.title}
-            </span>
-            <span className="text-[10px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-              ✎
-            </span>
-          </div>
-        )}
+        {/* Process Title & Custom Description */}
+        <div className="flex items-center gap-1 min-w-0">
+          {isEditingTitle ? (
+            <input
+              type="text"
+              value={titleInput}
+              onChange={(e) => setTitleInput(e.target.value)}
+              onBlur={handleTitleSubmit}
+              onKeyDown={(e) => e.key === 'Enter' && handleTitleSubmit()}
+              autoFocus
+              className="px-2 py-1 rounded bg-slate-950 border border-sky-500 text-xs sm:text-sm font-semibold text-white focus:outline-none min-w-0 max-w-[160px] sm:max-w-[220px]"
+            />
+          ) : (
+            <div
+              onClick={() => setIsEditingTitle(true)}
+              className="group flex items-center gap-1 px-1.5 sm:px-2 py-1 rounded-lg hover:bg-slate-800 cursor-pointer transition-colors min-w-0"
+              title="Click to rename process"
+            >
+              <span className="text-xs sm:text-sm font-semibold text-slate-100 group-hover:text-sky-300 transition-colors truncate max-w-[130px] sm:max-w-[200px] lg:max-w-[240px]">
+                {flow.title}
+              </span>
+              <span className="text-[10px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                ✎
+              </span>
+            </div>
+          )}
+
+          {onUpdateDescription && (
+            <div className="relative shrink-0" ref={descRef}>
+              <button
+                type="button"
+                onClick={() => {
+                  setDescDraft(flow.description || '');
+                  setDescOpen((v) => !v);
+                }}
+                className={`flex items-center gap-1 px-1.5 py-1 rounded-md border text-[11px] font-medium transition-colors ${
+                  descOpen || (flow.description && flow.description.trim().length > 0)
+                    ? 'bg-sky-950/40 border-sky-500/40 text-sky-300 hover:bg-sky-950/60'
+                    : 'bg-slate-800/70 border-slate-700/70 text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+                title={
+                  flow.description?.trim()
+                    ? `Process Description: ${flow.description}`
+                    : 'Add custom process description (shown when importing and in Run Sheet SOP)'
+                }
+              >
+                <FileText className="w-3 h-3" />
+                <span className="hidden 2xl:inline">
+                  {flow.description?.trim() ? 'Notes' : 'Add Desc'}
+                </span>
+              </button>
+
+              {descOpen && (
+                <div className="absolute left-0 mt-1.5 w-80 sm:w-96 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl p-3 z-50 space-y-2.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-white">
+                      Custom Process Description
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setDescOpen(false)}
+                      className="p-0.5 rounded text-slate-400 hover:text-white"
+                      aria-label="Close description editor"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <textarea
+                    rows={4}
+                    autoFocus
+                    value={descDraft}
+                    onChange={(e) => setDescDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                        handleDescriptionSave();
+                      } else if (e.key === 'Escape') {
+                        setDescOpen(false);
+                      }
+                    }}
+                    placeholder="Describe what this process flow fabricates, key targets, or module notes..."
+                    className="w-full px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-700 text-slate-100 placeholder-slate-500 text-xs leading-relaxed focus:outline-none focus:border-sky-500 resize-y"
+                  />
+
+                  <p className="text-[10.5px] text-slate-400 leading-snug">
+                    Saved in recipe JSON and shown in the Import Flow preview and Run Sheet SOP.
+                  </p>
+
+                  <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setDescDraft('')}
+                      disabled={!descDraft}
+                      className="text-[11px] text-slate-400 hover:text-rose-300 disabled:opacity-35"
+                    >
+                      Clear
+                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setDescOpen(false)}
+                        className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDescriptionSave}
+                        className="px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white font-semibold text-[11px]"
+                      >
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Primary Actions & Modals */}
@@ -647,6 +781,19 @@ export const Header: React.FC<HeaderProps> = ({
 
               <div className="my-1 border-t border-slate-800" />
 
+              {onOpenHelp && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onOpenHelp();
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+                >
+                  <HelpCircle className="w-4 h-4 text-sky-400" />
+                  <span>User Guide &amp; Help</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {

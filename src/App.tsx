@@ -34,6 +34,7 @@ import { VariantManagerModal } from './components/VariantManagerModal';
 import { AboutModal } from './components/AboutModal';
 import { BatchExportModal } from './components/BatchExportModal';
 import { ImportFromFlowModal } from './components/ImportFromFlowModal';
+import { HelpModal, HelpTopicId } from './components/HelpModal';
 import { FlowImportMode } from './lib/flowImportUtils';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { resolveFlowParameters } from './lib/variableUtils';
@@ -145,6 +146,12 @@ export default function App() {
   const [showMultiStep, setShowMultiStep] = useState<boolean>(false);
   const [showBatchExport, setShowBatchExport] = useState<boolean>(false);
   const [showAbout, setShowAbout] = useState<boolean>(false);
+  const [helpModal, setHelpModal] = useState<{
+    open: boolean;
+    topic: HelpTopicId;
+  }>({ open: false, topic: 'overview' });
+  const openHelp = (topic: HelpTopicId = 'overview') =>
+    setHelpModal({ open: true, topic });
 
   // Panel visibility state: docked open on desktop (>=1024px), drawer-closed on mobile/tablet
   const [leftSidebarOpen, setLeftSidebarOpen] = useState<boolean>(() =>
@@ -528,6 +535,10 @@ export default function App() {
     setFlow((prev) => ({ ...prev, title }));
   };
 
+  const handleUpdateDescription = (description: string) => {
+    setFlow((prev) => ({ ...prev, description }));
+  };
+
   const handleTogglePickReleaseMode = () => {
     if (!isSacrificialReleaseStep || !activeStep) {
       setPickReleaseMode(false);
@@ -770,6 +781,7 @@ export default function App() {
           thicknessUnit={thicknessUnit}
           onChangeThicknessUnit={setThicknessUnit}
           onUpdateTitle={handleUpdateTitle}
+          onUpdateDescription={handleUpdateDescription}
           onOpenPresets={() => setShowPresets(true)}
           onOpenMaterials={() => setShowMaterials(true)}
           onOpenEtchLibrary={() => setShowEtchLibrary(true)}
@@ -800,6 +812,7 @@ export default function App() {
               initialMode: mode || 'steps-and-masks',
             })
           }
+          onOpenHelp={() => openHelp('overview')}
         />
       )}
 
@@ -872,6 +885,7 @@ export default function App() {
                     setLeftSidebarOpen(false);
                   }
                 }}
+                onOpenHelp={() => openHelp('timeline')}
               />
             </div>
           </aside>
@@ -953,6 +967,7 @@ export default function App() {
                       setFlow(updated);
                     }
                   }}
+                  onOpenHelp={() => openHelp('steps')}
                 />
               ) : null}
             </div>
@@ -1054,6 +1069,7 @@ export default function App() {
               onRemoveReleaseRegion={handleRemoveReleaseRegion}
               onClearReleaseRegions={handleClearReleaseRegions}
               onOpenBatchExport={() => setShowBatchExport(true)}
+              onOpenHelp={() => openHelp('viewport')}
             />
           </div>
         </main>
@@ -1157,6 +1173,7 @@ export default function App() {
               initialMode: 'masks-only',
             })
           }
+          onOpenHelp={() => openHelp('masks')}
         />
       )}
 
@@ -1211,7 +1228,12 @@ export default function App() {
         />
       )}
 
-      {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+      {showAbout && (
+        <AboutModal
+          onClose={() => setShowAbout(false)}
+          onOpenHelp={() => openHelp('overview')}
+        />
+      )}
 
       {importFlowModal.open && (
         <ImportFromFlowModal
@@ -1232,6 +1254,15 @@ export default function App() {
           onClose={() =>
             setImportFlowModal((prev) => ({ ...prev, open: false }))
           }
+          onOpenHelp={() => openHelp('import')}
+        />
+      )}
+
+      {helpModal.open && (
+        <HelpModal
+          initialTopic={helpModal.topic}
+          onClose={() => setHelpModal((prev) => ({ ...prev, open: false }))}
+          onOpenAbout={() => setShowAbout(true)}
         />
       )}
     </div>
