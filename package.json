@@ -7,7 +7,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --import tsx --test src/lib/flowImportUtils.test.ts",
+    "test": "node --import tsx --test src/lib/*.test.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
@@ -17,6 +17,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "h264-mp4-encoder": "1.0.12",
     "jszip": "^3.10.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",

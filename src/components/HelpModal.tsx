@@ -343,6 +343,12 @@ const HELP_TOPICS: HelpTopic[] = [
         description:
           'Save your complete process flow—including substrates, variables, variants, masks, custom materials, and etch recipes—as a portable .json file.',
       },
+      {
+        title: 'Process Sequence Video (MP4)',
+        where: 'Process Traveller → Download Video (MP4), below Play',
+        description:
+          'Download a 720p MP4 video of the starting wafer followed by every enabled fabrication step, with step titles, axes, and material legends. The video uses the selected playback speed and plays on Windows and Mac. Progress and Cancel are available while the video is created locally in your browser.',
+      },
     ],
     tips: [
       'For clean academic figures, toggle off axis labels or switch to Solid fill in the Cross-Section Viewport before clicking SVG or Batch Export.',
