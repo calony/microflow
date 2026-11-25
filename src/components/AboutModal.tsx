@@ -135,6 +135,14 @@ export const AboutModal: React.FC<AboutModalProps> = ({ onClose, onOpenHelp }) =
             </div>
           </div>
 
+          <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/50 space-y-1.5">
+            <div className="font-semibold text-slate-200">MP4 Video Export</div>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Uses h264-mp4-encoder 1.0.12 (MIT) to create H.264 MP4 videos locally in a background worker.
+              The encoder loads only when you download a video; process data stays in your browser.
+            </p>
+          </div>
+
           {/* External Network Assets & Tooling */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/50 space-y-1.5">

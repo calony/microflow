@@ -45,6 +45,7 @@ import {
 import { getEtchRecipeById, formatDurationCompact } from '../lib/etchRates';
 import { getDefaultStepTitle } from '../lib/stepDefaults';
 import { ThicknessUnit, formatThickness } from '../lib/units';
+import { ProcessVideoExportButton } from './ProcessVideoExportButton';
 import {
   Plus,
   Layers,
@@ -1621,6 +1622,8 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           </div>
         </div>
       </div>
+
+      <ProcessVideoExportButton flow={flow} playSpeed={playSpeed} thicknessUnit={thicknessUnit} />
 
       {/* Step Search Filter */}
       <div className="px-2.5 py-1.5 border-b border-slate-800 bg-slate-950/50 shrink-0">
