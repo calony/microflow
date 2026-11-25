@@ -35,7 +35,7 @@ import { AboutModal } from './components/AboutModal';
 import { BatchExportModal } from './components/BatchExportModal';
 import { ImportFromFlowModal } from './components/ImportFromFlowModal';
 import { HelpModal, HelpTopicId } from './components/HelpModal';
-import { FlowImportMode } from './lib/flowImportUtils';
+import { FlowImportMode, normalizeIncomingFlow } from './lib/flowImportUtils';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { resolveFlowParameters } from './lib/variableUtils';
 import { syncActiveVariantSnapshot } from './lib/variantUtils';
@@ -111,6 +111,7 @@ export default function App() {
   const [activeStepIndex, setActiveStepIndex] = useState<number>(() =>
     flow.steps.length > 0 ? 0 : -1
   );
+  const [travellerVersion, setTravellerVersion] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playSpeed, setPlaySpeed] = useState<number>(1);
   const [thicknessUnit, setThicknessUnit] = useState<ThicknessUnit>(() => {
@@ -135,7 +136,7 @@ export default function App() {
   const [importFlowModal, setImportFlowModal] = useState<{
     open: boolean;
     initialMode: FlowImportMode;
-  }>({ open: false, initialMode: 'steps-and-masks' });
+  }>({ open: false, initialMode: 'replace-flow' });
   const [showMaterials, setShowMaterials] = useState<boolean>(false);
   const [showEtchLibrary, setShowEtchLibrary] = useState<boolean>(false);
   const [showMaskLevels, setShowMaskLevels] = useState<boolean>(false);
@@ -737,20 +738,13 @@ export default function App() {
   };
 
   const handleImportJson = (newFlow: ProcessFlow) => {
-    // ensure substrateLayers exists
-    if (!newFlow.substrateLayers || newFlow.substrateLayers.length === 0) {
-      newFlow.substrateLayers = [
-        {
-          id: 'sub_default',
-          name: 'Silicon <100> Substrate',
-          materialId: newFlow.substrateMaterialId || 'mat_si_sub',
-          thickness: newFlow.substrateThickness || 3000,
-        },
-      ];
-    }
-    setFlow(resolveFlowParameters(ensureFlowBlocks(ensureFlowMasks(newFlow))));
-    setActiveStepIndex(newFlow.steps.length > 0 ? 0 : -1);
+    const normalized = normalizeIncomingFlow(newFlow);
+    if (!normalized) return;
+    setFlow(normalized);
+    setActiveStepIndex(-1);
     setSelectedInsetStepIndex(null);
+    setIsPlaying(false);
+    setTravellerVersion((version) => version + 1);
   };
 
   const isCompactViewport = () =>
@@ -809,7 +803,7 @@ export default function App() {
           onOpenImportFlow={(mode) =>
             setImportFlowModal({
               open: true,
-              initialMode: mode || 'steps-and-masks',
+              initialMode: mode || 'replace-flow',
             })
           }
           onOpenHelp={() => openHelp('overview')}
@@ -860,6 +854,7 @@ export default function App() {
             </div>
             <div className="flex-1 min-h-0 overflow-hidden">
               <ProcessFlowSidebar
+                key={travellerVersion}
                 flow={flow}
                 activeStepIndex={activeStepIndex}
                 thicknessUnit={thicknessUnit}
@@ -876,7 +871,7 @@ export default function App() {
                 onOpenImportFlow={() =>
                   setImportFlowModal({
                     open: true,
-                    initialMode: 'steps-and-masks',
+                    initialMode: 'replace-flow',
                   })
                 }
                 onOpenParameters={() => {
@@ -1242,6 +1237,10 @@ export default function App() {
           thicknessUnit={thicknessUnit}
           initialMode={importFlowModal.initialMode}
           onApplyImport={(nextFlow, nextActiveStepIndex) => {
+            if (nextActiveStepIndex === -1) {
+              handleImportJson(nextFlow);
+              return;
+            }
             setFlow(nextFlow);
             setIsPlaying(false);
             if (
