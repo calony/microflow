@@ -36,6 +36,8 @@ export const MaskWindowArrayPanel: React.FC<MaskWindowArrayPanelProps> = ({
 
   const [count, setCount] = useState<number>(4);
   const [pitchNm, setPitchNm] = useState<number>(defaultPitchNm);
+  const [pitchFocused, setPitchFocused] = useState<boolean>(false);
+  const [pitchDraft, setPitchDraft] = useState<string>('');
   const [direction, setDirection] = useState<MaskWindowArrayDirection>('right');
 
   const preview = useMemo(
@@ -54,6 +56,11 @@ export const MaskWindowArrayPanel: React.FC<MaskWindowArrayPanelProps> = ({
     unit === 'nm'
       ? `${Math.round(nm)} nm`
       : `${(nm / 1000).toFixed(2)} µm`;
+
+  const displayPitch =
+    unit === 'nm'
+      ? String(pitchNm)
+      : String(Math.round((pitchNm / 1000) * 10000) / 10000);
 
   const handleSubmit = (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -107,14 +114,30 @@ export const MaskWindowArrayPanel: React.FC<MaskWindowArrayPanelProps> = ({
           </span>
           <input
             type="number"
-            min={unit === 'nm' ? 20 : 0.05}
-            step={unit === 'nm' ? 50 : 0.1}
-            value={unit === 'nm' ? pitchNm : Math.round((pitchNm / 1000) * 1000) / 1000}
+            min={unit === 'nm' ? 10 : 0.01}
+            step="any"
+            value={pitchFocused ? pitchDraft : displayPitch}
+            onFocus={(e) => {
+              setPitchFocused(true);
+              setPitchDraft(displayPitch);
+              e.target.select();
+            }}
             onChange={(e) => {
-              const v = parseFloat(e.target.value);
+              const raw = e.target.value;
+              setPitchDraft(raw);
+              const v = parseFloat(raw);
               if (Number.isFinite(v) && v > 0) {
-                setPitchNm(unit === 'nm' ? Math.round(v) : Math.round(v * 1000));
+                const nextNm = unit === 'nm' ? Math.round(v) : Math.round(v * 1000);
+                setPitchNm(Math.max(10, nextNm));
               }
+            }}
+            onBlur={() => {
+              const v = parseFloat(pitchDraft);
+              if (Number.isFinite(v) && v > 0) {
+                const nextNm = unit === 'nm' ? Math.round(v) : Math.round(v * 1000);
+                setPitchNm(Math.max(10, nextNm));
+              }
+              setPitchFocused(false);
             }}
             className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 focus:border-sky-500 text-slate-100 font-mono text-xs focus:outline-none"
           />
@@ -125,9 +148,9 @@ export const MaskWindowArrayPanel: React.FC<MaskWindowArrayPanelProps> = ({
           <div className="grid grid-cols-3 bg-slate-900 border border-slate-700 rounded p-0.5 text-[10px] font-mono">
             {(
               [
-                { id: 'right', label: '+X' },
-                { id: 'center', label: 'Center' },
                 { id: 'left', label: '-X' },
+                { id: 'center', label: 'Center' },
+                { id: 'right', label: '+X' },
               ] as const
             ).map((opt) => (
               <button

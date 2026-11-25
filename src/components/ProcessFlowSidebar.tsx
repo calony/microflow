@@ -81,6 +81,7 @@ import {
   Square,
   Minus,
   GitBranch,
+  FileInput,
 } from 'lucide-react';
 
 interface ProcessFlowSidebarProps {
@@ -94,6 +95,7 @@ interface ProcessFlowSidebarProps {
   onSelectStepIndex: (index: number) => void;
   onUpdateFlow: (updated: ProcessFlow) => void;
   onOpenPresets: () => void;
+  onOpenImportFlow?: () => void;
   onOpenParameters?: () => void;
 }
 
@@ -108,6 +110,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
   onSelectStepIndex,
   onUpdateFlow,
   onOpenPresets,
+  onOpenImportFlow,
   onOpenParameters,
 }) => {
   type AddStepPlacement =
@@ -1482,6 +1485,18 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
           >
             <span>Presets</span>
           </button>
+
+          {onOpenImportFlow && (
+            <button
+              type="button"
+              onClick={onOpenImportFlow}
+              className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 transition-colors"
+              title="Preview & import selected steps or masks from another process flow"
+            >
+              <FileInput className="w-3 h-3" />
+              <span>Import</span>
+            </button>
+          )}
         </div>
       </div>
 

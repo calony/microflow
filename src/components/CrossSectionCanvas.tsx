@@ -77,6 +77,8 @@ interface CrossSectionCanvasProps {
   mesh: CrossSectionMesh;
   polygons: RenderedPolygon[];
   sharedYBounds?: { minY: number; maxY: number };
+  lockSharedYScale?: boolean;
+  onToggleLockSharedYScale?: () => void;
   materials: Material[];
   waferWidth: number; // nm
   flowId?: string;
@@ -127,6 +129,8 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
   mesh,
   polygons,
   sharedYBounds,
+  lockSharedYScale: lockSharedYScaleProp,
+  onToggleLockSharedYScale,
   materials,
   waferWidth,
   flowId,
@@ -223,21 +227,23 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
 
   // Vertical Z-exaggeration factor (essential in semiconductor CAD)
   const [zScale, setZScale] = useState<number>(2.0);
-  const [lockSharedYScale, setLockSharedYScale] = useState<boolean>(() => {
+  const [internalLockSharedYScale, setInternalLockSharedYScale] = useState<boolean>(() => {
     try {
       return localStorage.getItem('microflow_lock_shared_y_scale') === 'true';
     } catch {
       return false;
     }
   });
+  const lockSharedYScale = lockSharedYScaleProp ?? internalLockSharedYScale;
 
   useEffect(() => {
+    if (lockSharedYScaleProp !== undefined) return;
     try {
-      localStorage.setItem('microflow_lock_shared_y_scale', String(lockSharedYScale));
+      localStorage.setItem('microflow_lock_shared_y_scale', String(internalLockSharedYScale));
     } catch {
       // ignore
     }
-  }, [lockSharedYScale]);
+  }, [internalLockSharedYScale, lockSharedYScaleProp]);
 
   // Piecewise Z-axis scaling for multi-order-of-magnitude layer stacks
   const [piecewiseMode, setPiecewiseMode] = useState<PiecewiseZMode>('linear');
@@ -1845,7 +1851,11 @@ export const CrossSectionCanvas: React.FC<CrossSectionCanvasProps> = ({
           <button
             type="button"
             onClick={() => {
-              setLockSharedYScale((prev) => !prev);
+              if (onToggleLockSharedYScale) {
+                onToggleLockSharedYScale();
+              } else {
+                setInternalLockSharedYScale((prev) => !prev);
+              }
               setLockedMetrics(null);
             }}
             aria-pressed={lockSharedYScale}

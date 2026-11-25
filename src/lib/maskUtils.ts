@@ -1120,6 +1120,27 @@ export interface MaskWindowArrayOptions {
 }
 
 /**
+ * Returns keyboard arrow nudge distances in nm for the photomask track editor.
+ * Normal arrow keys apply a fine nudge (50 nm on >=4 µm wafers), while Shift+Arrow
+ * scales proportionally with waferWidth (2.5% of wafer width, e.g. 250 nm at 10 µm,
+ * 2.5 µm at 100 µm, 25 µm at 1 mm).
+ */
+export function getMaskArrowStepSizes(waferWidth: number): {
+  fineNm: number;
+  coarseNm: number;
+} {
+  const safeWidth = Math.max(100, waferWidth || 10000);
+  const fineNm =
+    safeWidth < 4000
+      ? Math.max(10, Math.round((safeWidth * 0.005) / 10) * 10)
+      : 50;
+  const snap = safeWidth >= 10000 ? 50 : 10;
+  const scaledShift = Math.round((safeWidth * 0.025) / snap) * snap;
+  const coarseNm = Math.max(fineNm * 3, scaledShift);
+  return { fineNm, coarseNm };
+}
+
+/**
  * Duplicates a mask window shifted adjacent to the source so it remains visible and editable.
  */
 export function duplicateMaskWindow(

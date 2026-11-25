@@ -106,49 +106,305 @@ function initSubstrateColumns(
   return { width, currentY, columns };
 }
 
+interface SimCheckpointState {
+  width: number;
+  currentY: number;
+  columns: ColumnProfile[];
+  stepSummaries: { stepId: string; stepIndex: number; title: string }[];
+  scallopWalls: ScallopWall[];
+  activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[];
+}
+
+interface CachedPrefixStep {
+  stepRef: ProcessStep;
+  stepSig: string;
+  state: SimCheckpointState;
+  rawMinY: number;
+  rawMaxY: number;
+}
+
+interface PrefixSimCache {
+  substrateSig: string;
+  materialsRef: Material[];
+  materialsSig: string;
+  etchLibraryRef: EtchRecipe[] | undefined;
+  etchLibrarySig: string;
+  initState: SimCheckpointState;
+  initRawMinY: number;
+  initRawMaxY: number;
+  steps: CachedPrefixStep[];
+}
+
+const MAX_PREFIX_CACHES = 4;
+const prefixSimCaches: PrefixSimCache[] = [];
+const stepSimSigCache = new WeakMap<ProcessStep, string>();
+const materialsSimSigCache = new WeakMap<Material[], string>();
+const etchLibSimSigCache = new WeakMap<EtchRecipe[], string>();
+
+function cloneSimCheckpointState(state: SimCheckpointState): SimCheckpointState {
+  const srcCols = state.columns;
+  const colsLen = srcCols.length;
+  const columns: ColumnProfile[] = new Array(colsLen);
+  for (let i = 0; i < colsLen; i++) {
+    const col = srcCols[i];
+    const srcSegs = col.segments;
+    const segsLen = srcSegs.length;
+    const segments: MaterialSegment[] = new Array(segsLen);
+    for (let j = 0; j < segsLen; j++) {
+      segments[j] = { ...srcSegs[j] };
+    }
+    columns[i] = { x: col.x, segments };
+  }
+  return {
+    width: state.width,
+    currentY: state.currentY,
+    columns,
+    stepSummaries: state.stepSummaries.map((s) => ({ ...s })),
+    scallopWalls: state.scallopWalls.map((w) => ({ ...w })),
+    activeFrames: state.activeFrames.map((f) => ({ ...f })),
+  };
+}
+
+function computeColumnBounds(columns: ColumnProfile[]): { rawMinY: number; rawMaxY: number } {
+  let rawMinY = Infinity;
+  let rawMaxY = -Infinity;
+  for (let i = 0; i < columns.length; i++) {
+    const segs = columns[i].segments;
+    for (let j = 0; j < segs.length; j++) {
+      const seg = segs[j];
+      if (seg.yBottom < rawMinY) rawMinY = seg.yBottom;
+      if (seg.yTop > rawMaxY) rawMaxY = seg.yTop;
+    }
+  }
+  return { rawMinY, rawMaxY };
+}
+
+function getSubstrateSig(flow: ProcessFlow): string {
+  const layers = flow.substrateLayers;
+  if (layers && layers.length > 0) {
+    let s = `${flow.substrateWidth || 10000}|`;
+    for (let i = 0; i < layers.length; i++) {
+      const l = layers[i];
+      s += `${l.id}:${l.materialId}:${l.thickness};`;
+    }
+    return s;
+  }
+  return `${flow.substrateWidth || 10000}|sub:${flow.substrateMaterialId || 'mat_si_sub'}:${flow.substrateThickness || 3000}`;
+}
+
+function getMaterialsSimSig(materials: Material[]): string {
+  let sig = materialsSimSigCache.get(materials);
+  if (sig === undefined) {
+    sig = JSON.stringify(materials);
+    materialsSimSigCache.set(materials, sig);
+  }
+  return sig;
+}
+
+function getEtchLibSimSig(etchLibrary: EtchRecipe[] | undefined): string {
+  if (!etchLibrary || etchLibrary.length === 0) return '';
+  let sig = etchLibSimSigCache.get(etchLibrary);
+  if (sig === undefined) {
+    sig = JSON.stringify(etchLibrary);
+    etchLibSimSigCache.set(etchLibrary, sig);
+  }
+  return sig;
+}
+
+function getStepSimSig(step: ProcessStep): string {
+  let sig = stepSimSigCache.get(step);
+  if (sig === undefined) {
+    sig = JSON.stringify({
+      id: step.id,
+      type: step.type,
+      enabled: step.enabled,
+      side: step.side,
+      title: step.title,
+      thickness: step.thickness,
+      materialId: step.materialId,
+      deposition: step.deposition,
+      lithography: step.lithography,
+      etch: step.etch,
+      strip: step.strip,
+      cmp: step.cmp,
+      bonding: step.bonding,
+      dicing: step.dicing,
+      tapeFrame: step.tapeFrame,
+    });
+    stepSimSigCache.set(step, sig);
+  }
+  return sig;
+}
+
+function getOrCreatePrefixCache(flow: ProcessFlow): PrefixSimCache {
+  const substrateSig = getSubstrateSig(flow);
+  const materials = flow.materials;
+  const etchLibrary = flow.etchLibrary;
+
+  let hitIndex = prefixSimCaches.findIndex(
+    (c) =>
+      c.substrateSig === substrateSig &&
+      c.materialsRef === materials &&
+      c.etchLibraryRef === etchLibrary
+  );
+
+  if (hitIndex < 0) {
+    const materialsSig = getMaterialsSimSig(materials);
+    const etchLibrarySig = getEtchLibSimSig(etchLibrary);
+    hitIndex = prefixSimCaches.findIndex(
+      (c) =>
+        c.substrateSig === substrateSig &&
+        c.materialsSig === materialsSig &&
+        c.etchLibrarySig === etchLibrarySig
+    );
+    if (hitIndex >= 0) {
+      prefixSimCaches[hitIndex].materialsRef = materials;
+      prefixSimCaches[hitIndex].etchLibraryRef = etchLibrary;
+    }
+  }
+
+  if (hitIndex >= 0) {
+    const hit = prefixSimCaches[hitIndex];
+    if (hitIndex !== 0) {
+      prefixSimCaches.splice(hitIndex, 1);
+      prefixSimCaches.unshift(hit);
+    }
+    return hit;
+  }
+
+  const { width, currentY, columns } = initSubstrateColumns(flow);
+  const { rawMinY, rawMaxY } = computeColumnBounds(columns);
+  const entry: PrefixSimCache = {
+    substrateSig,
+    materialsRef: materials,
+    materialsSig: getMaterialsSimSig(materials),
+    etchLibraryRef: etchLibrary,
+    etchLibrarySig: getEtchLibSimSig(etchLibrary),
+    initState: {
+      width,
+      currentY,
+      columns,
+      stepSummaries: [],
+      scallopWalls: [],
+      activeFrames: [],
+    },
+    initRawMinY: rawMinY,
+    initRawMaxY: rawMaxY,
+    steps: [],
+  };
+
+  prefixSimCaches.unshift(entry);
+  if (prefixSimCaches.length > MAX_PREFIX_CACHES) {
+    prefixSimCaches.length = MAX_PREFIX_CACHES;
+  }
+  return entry;
+}
+
+function runCachedPrefixSteps(
+  flow: ProcessFlow,
+  enabledSteps: ProcessStep[],
+  maxIdx: number
+): { cache: PrefixSimCache; workingState: SimCheckpointState; rawMinY: number; rawMaxY: number } {
+  const cache = getOrCreatePrefixCache(flow);
+
+  let matchedCount = 0;
+  const checkLimit = Math.min(Math.max(0, maxIdx + 1), cache.steps.length);
+  while (matchedCount < checkLimit) {
+    const step = enabledSteps[matchedCount];
+    const cached = cache.steps[matchedCount];
+    if (step === cached.stepRef) {
+      matchedCount++;
+    } else {
+      const sig = getStepSimSig(step);
+      if (sig === cached.stepSig) {
+        cached.stepRef = step;
+        matchedCount++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  if (maxIdx < 0) {
+    return {
+      cache,
+      workingState: cloneSimCheckpointState(cache.initState),
+      rawMinY: cache.initRawMinY,
+      rawMaxY: cache.initRawMaxY,
+    };
+  }
+
+  const baseSnapshot =
+    matchedCount > 0 ? cache.steps[matchedCount - 1].state : cache.initState;
+  const workingState = cloneSimCheckpointState(baseSnapshot);
+  let lastRawMinY =
+    matchedCount > 0 ? cache.steps[matchedCount - 1].rawMinY : cache.initRawMinY;
+  let lastRawMaxY =
+    matchedCount > 0 ? cache.steps[matchedCount - 1].rawMaxY : cache.initRawMaxY;
+
+  if (matchedCount <= maxIdx) {
+    cache.steps.length = matchedCount;
+    for (let idx = matchedCount; idx <= maxIdx; idx++) {
+      const step = enabledSteps[idx];
+      workingState.stepSummaries.push({
+        stepId: step.id,
+        stepIndex: idx,
+        title: step.title,
+      });
+      applyStep(
+        workingState.columns,
+        step,
+        flow.materials,
+        workingState.width,
+        0,
+        workingState.scallopWalls,
+        workingState.activeFrames,
+        flow.etchLibrary
+      );
+      const bounds = computeColumnBounds(workingState.columns);
+      lastRawMinY = bounds.rawMinY;
+      lastRawMaxY = bounds.rawMaxY;
+      cache.steps.push({
+        stepRef: step,
+        stepSig: getStepSimSig(step),
+        state: cloneSimCheckpointState(workingState),
+        rawMinY: lastRawMinY,
+        rawMaxY: lastRawMaxY,
+      });
+    }
+  }
+
+  return {
+    cache,
+    workingState,
+    rawMinY: lastRawMinY,
+    rawMaxY: lastRawMaxY,
+  };
+}
+
 /**
  * Computes the global vertical bounds (minY, maxY in nm) across the starting substrate
- * and every enabled step in a single forward simulation pass.
+ * and every enabled step, reusing cached pre-step simulation checkpoints when possible.
  */
 export function computeFlowSharedYBounds(
   rawFlow: ProcessFlow
 ): { minY: number; maxY: number } {
   const flow = resolveFlowParameters(rawFlow);
-  const { width, currentY, columns } = initSubstrateColumns(flow);
-
-  let minY = Infinity;
-  let maxY = -Infinity;
-  const updateBounds = () => {
-    for (const col of columns) {
-      for (const seg of col.segments) {
-        if (seg.yBottom < minY) minY = seg.yBottom;
-        if (seg.yTop > maxY) maxY = seg.yTop;
-      }
-    }
-  };
-
-  updateBounds();
-
   const enabledSteps = flow.steps.filter((s) => s.enabled);
-  const scallopWalls: ScallopWall[] = [];
-  const activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[] = [];
+  const maxIdx = enabledSteps.length - 1;
+  const { cache } = runCachedPrefixSteps(flow, enabledSteps, maxIdx);
 
-  for (let idx = 0; idx < enabledSteps.length; idx++) {
-    applyStep(
-      columns,
-      enabledSteps[idx],
-      flow.materials,
-      width,
-      0,
-      scallopWalls,
-      activeFrames,
-      flow.etchLibrary
-    );
-    updateBounds();
+  let minY = cache.initRawMinY;
+  let maxY = cache.initRawMaxY;
+
+  for (let idx = 0; idx <= maxIdx; idx++) {
+    const cached = cache.steps[idx];
+    if (cached.rawMinY < minY) minY = cached.rawMinY;
+    if (cached.rawMaxY > maxY) maxY = cached.rawMaxY;
   }
 
   if (minY === Infinity) minY = 0;
-  if (maxY === -Infinity) maxY = currentY;
+  if (maxY === -Infinity) maxY = cache.initState.currentY;
 
   return { minY, maxY };
 }
@@ -158,35 +414,62 @@ function simulateCrossSectionInternal(
   upToStepIndex?: number,
   recursionDepth: number = 0
 ): CrossSectionMesh {
-  const { width, currentY, columns } = initSubstrateColumns(flow);
-
   const enabledSteps = flow.steps.filter((s) => s.enabled);
   const maxIdx =
     upToStepIndex !== undefined
       ? Math.min(upToStepIndex, enabledSteps.length - 1)
       : enabledSteps.length - 1;
 
-  const stepSummaries: { stepId: string; stepIndex: number; title: string }[] = [];
-  const scallopWalls: ScallopWall[] = [];
-  const activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[] = [];
+  let width: number;
+  let currentY: number;
+  let columns: ColumnProfile[];
+  let stepSummaries: { stepId: string; stepIndex: number; title: string }[];
+  let scallopWalls: ScallopWall[];
+  let activeFrames: { stepId: string; side: 'front' | 'back'; materialId: string }[];
+  let minY: number;
+  let maxY: number;
 
-  for (let idx = 0; idx <= maxIdx; idx++) {
-    const step = enabledSteps[idx];
-    stepSummaries.push({
-      stepId: step.id,
-      stepIndex: idx,
-      title: step.title,
-    });
-    applyStep(
-      columns,
-      step,
-      flow.materials,
-      width,
-      recursionDepth,
-      scallopWalls,
-      activeFrames,
-      flow.etchLibrary
-    );
+  if (recursionDepth === 0) {
+    const res = runCachedPrefixSteps(flow, enabledSteps, maxIdx);
+    width = res.workingState.width;
+    currentY = res.workingState.currentY;
+    columns = res.workingState.columns;
+    stepSummaries = res.workingState.stepSummaries;
+    scallopWalls = res.workingState.scallopWalls;
+    activeFrames = res.workingState.activeFrames;
+    minY = res.rawMinY;
+    maxY = res.rawMaxY;
+  } else {
+    const init = initSubstrateColumns(flow);
+    width = init.width;
+    currentY = init.currentY;
+    columns = init.columns;
+    stepSummaries = [];
+    scallopWalls = [];
+    activeFrames = [];
+
+    for (let idx = 0; idx <= maxIdx; idx++) {
+      const step = enabledSteps[idx];
+      stepSummaries.push({
+        stepId: step.id,
+        stepIndex: idx,
+        title: step.title,
+      });
+      applyStep(
+        columns,
+        step,
+        flow.materials,
+        width,
+        recursionDepth,
+        scallopWalls,
+        activeFrames,
+        flow.etchLibrary
+      );
+    }
+
+    const bounds = computeColumnBounds(columns);
+    minY = bounds.rawMinY;
+    maxY = bounds.rawMaxY;
   }
 
   // Resolve surviving mounted tape frame edge geometry for canvas bracket rendering
@@ -212,17 +495,6 @@ function simulateCrossSectionInternal(
           materialId: frame.materialId,
         });
       }
-    }
-  }
-
-  // Calculate bounding box from actual remaining geometry
-  let minY = Infinity;
-  let maxY = -Infinity;
-
-  for (const col of columns) {
-    for (const seg of col.segments) {
-      if (seg.yBottom < minY) minY = seg.yBottom;
-      if (seg.yTop > maxY) maxY = seg.yTop;
     }
   }
 

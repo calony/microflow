@@ -26,6 +26,7 @@ import {
   Minimize,
   Files,
   FileSpreadsheet,
+  FileInput,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -34,6 +35,7 @@ interface HeaderProps {
   onChangeThicknessUnit: (unit: ThicknessUnit) => void;
   onUpdateTitle: (title: string) => void;
   onOpenPresets: () => void;
+  onOpenImportFlow?: (initialMode?: 'steps-and-masks' | 'masks-only') => void;
   onOpenMaterials: () => void;
   onOpenEtchLibrary: () => void;
   onOpenMaskLevels: () => void;
@@ -62,6 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
   onChangeThicknessUnit,
   onUpdateTitle,
   onOpenPresets,
+  onOpenImportFlow,
   onOpenMaterials,
   onOpenEtchLibrary,
   onOpenMaskLevels,
@@ -277,6 +280,18 @@ export const Header: React.FC<HeaderProps> = ({
             <span>Presets</span>
           </button>
 
+          {onOpenImportFlow && (
+            <button
+              type="button"
+              onClick={() => onOpenImportFlow('steps-and-masks')}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
+              title="Preview & import selected steps or masks from another flow"
+            >
+              <FileInput className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Import Flow</span>
+            </button>
+          )}
+
           <button
             onClick={onOpenMaterials}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
@@ -471,6 +486,19 @@ export const Header: React.FC<HeaderProps> = ({
                 <FolderOpen className="w-4 h-4 text-sky-400" />
                 <span>Process Presets</span>
               </button>
+              {onOpenImportFlow && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    onOpenImportFlow('steps-and-masks');
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
+                >
+                  <FileInput className="w-4 h-4 text-emerald-400" />
+                  <span>Import Steps / Masks</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {

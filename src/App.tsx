@@ -33,6 +33,8 @@ import { VariablesModal } from './components/VariablesModal';
 import { VariantManagerModal } from './components/VariantManagerModal';
 import { AboutModal } from './components/AboutModal';
 import { BatchExportModal } from './components/BatchExportModal';
+import { ImportFromFlowModal } from './components/ImportFromFlowModal';
+import { FlowImportMode } from './lib/flowImportUtils';
 import { SubstrateEditor } from './components/SubstrateEditor';
 import { resolveFlowParameters } from './lib/variableUtils';
 import { syncActiveVariantSnapshot } from './lib/variantUtils';
@@ -119,9 +121,20 @@ export default function App() {
     }
     return 'nm';
   });
+  const [lockSharedYScale, setLockSharedYScale] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('microflow_lock_shared_y_scale') === 'true';
+    } catch {
+      return false;
+    }
+  });
 
   // Modals state
   const [showPresets, setShowPresets] = useState<boolean>(false);
+  const [importFlowModal, setImportFlowModal] = useState<{
+    open: boolean;
+    initialMode: FlowImportMode;
+  }>({ open: false, initialMode: 'steps-and-masks' });
   const [showMaterials, setShowMaterials] = useState<boolean>(false);
   const [showEtchLibrary, setShowEtchLibrary] = useState<boolean>(false);
   const [showMaskLevels, setShowMaskLevels] = useState<boolean>(false);
@@ -197,14 +210,44 @@ export default function App() {
     }
   };
 
-  // Save to localStorage on changes
+  const latestFlowRef = useRef(flow);
+  latestFlowRef.current = flow;
+
+  // Debounced autosave to localStorage so high-frequency edits/drags stay fluid
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem('microflow_current_flow', JSON.stringify(flow));
+      } catch (e) {
+        // ignore
+      }
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [flow]);
+
+  useEffect(() => {
+    const flushFlow = () => {
+      try {
+        localStorage.setItem('microflow_current_flow', JSON.stringify(latestFlowRef.current));
+      } catch {
+        // ignore
+      }
+    };
+    window.addEventListener('pagehide', flushFlow);
+    window.addEventListener('beforeunload', flushFlow);
+    return () => {
+      window.removeEventListener('pagehide', flushFlow);
+      window.removeEventListener('beforeunload', flushFlow);
+    };
+  }, []);
+
   useEffect(() => {
     try {
-      localStorage.setItem('microflow_current_flow', JSON.stringify(flow));
-    } catch (e) {
+      localStorage.setItem('microflow_lock_shared_y_scale', String(lockSharedYScale));
+    } catch {
       // ignore
     }
-  }, [flow]);
+  }, [lockSharedYScale]);
 
   useEffect(() => {
     try {
@@ -269,10 +312,11 @@ export default function App() {
     return buildRenderPolygons(activeMesh, flow.materials);
   }, [activeMesh, flow.materials]);
 
-  // Global vertical bounds shared across starting substrate and all enabled steps
+  // Global vertical bounds shared across starting substrate and all enabled steps (lazy when Lock Y is active)
   const sharedYBounds = useMemo(() => {
+    if (!lockSharedYScale) return undefined;
     return computeFlowSharedYBounds(flow);
-  }, [flow]);
+  }, [flow, lockSharedYScale]);
 
   // Identify the last enabled process step and all enabled steps after the currently selected step
   const finalEnabledStepIndex = useMemo(() => {
@@ -750,6 +794,12 @@ export default function App() {
           onToggleRightSidebar={handleToggleRightSidebar}
           isFullScreen={isFullScreenDisplay}
           onToggleFullScreen={handleToggleFullScreenDisplay}
+          onOpenImportFlow={(mode) =>
+            setImportFlowModal({
+              open: true,
+              initialMode: mode || 'steps-and-masks',
+            })
+          }
         />
       )}
 
@@ -810,6 +860,12 @@ export default function App() {
                 }}
                 onUpdateFlow={handleUpdateFlow}
                 onOpenPresets={() => setShowPresets(true)}
+                onOpenImportFlow={() =>
+                  setImportFlowModal({
+                    open: true,
+                    initialMode: 'steps-and-masks',
+                  })
+                }
                 onOpenParameters={() => {
                   setRightSidebarOpen(true);
                   if (isCompactViewport()) {
@@ -931,6 +987,8 @@ export default function App() {
               mesh={activeMesh}
               polygons={activePolygons}
               sharedYBounds={sharedYBounds}
+              lockSharedYScale={lockSharedYScale}
+              onToggleLockSharedYScale={() => setLockSharedYScale((prev) => !prev)}
               materials={flow.materials}
               waferWidth={flow.substrateWidth}
               flowId={flow.id}
@@ -1093,6 +1151,12 @@ export default function App() {
           onOpenVariablesModal={() => setShowVariables(true)}
           activeStepIndex={activeStepIndex}
           thicknessUnit={thicknessUnit}
+          onOpenImportMasks={() =>
+            setImportFlowModal({
+              open: true,
+              initialMode: 'masks-only',
+            })
+          }
         />
       )}
 
@@ -1148,6 +1212,28 @@ export default function App() {
       )}
 
       {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+
+      {importFlowModal.open && (
+        <ImportFromFlowModal
+          currentFlow={flow}
+          activeStepIndex={activeStepIndex}
+          thicknessUnit={thicknessUnit}
+          initialMode={importFlowModal.initialMode}
+          onApplyImport={(nextFlow, nextActiveStepIndex) => {
+            setFlow(nextFlow);
+            setIsPlaying(false);
+            if (
+              typeof nextActiveStepIndex === 'number' &&
+              nextActiveStepIndex >= 0
+            ) {
+              setActiveStepIndex(nextActiveStepIndex);
+            }
+          }}
+          onClose={() =>
+            setImportFlowModal((prev) => ({ ...prev, open: false }))
+          }
+        />
+      )}
     </div>
   );
 }

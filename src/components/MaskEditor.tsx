@@ -10,11 +10,12 @@ import {
   MaskWindowArrayOptions,
   createMaskWindowArray,
   duplicateMaskWindow,
+  getMaskArrowStepSizes,
 } from '../lib/maskUtils';
 import { getActiveStepVariant } from '../lib/variantUtils';
 import { ParamBindingBadge, ParamBindingPanel } from './ParamBindingControl';
 import { MaskWindowArrayPanel } from './MaskWindowArrayPanel';
-import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown, Copy, LayoutGrid, Undo2, Redo2, GitBranch } from 'lucide-react';
+import { Plus, Trash2, ArrowLeftRight, MoveHorizontal, GripVertical, Scan, Edit2, Check, Lock, Unlock, ChevronUp, ChevronDown, Copy, LayoutGrid, Undo2, Redo2, GitBranch, Eraser } from 'lucide-react';
 
 interface MaskEditorProps {
   step: ProcessStep;
@@ -142,10 +143,12 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const [selectedWindowIds, setSelectedWindowIds] = useState<string[]>([]);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [dragPreviewWindows, setDragPreviewWindows] = useState<MaskWindow[] | null>(null);
   const [trackMarquee, setTrackMarquee] = useState<TrackMarquee | null>(null);
   const [isEditingMaskName, setIsEditingMaskName] = useState<boolean>(false);
   const [editingMaskName, setEditingMaskName] = useState<string>(litho.maskName || '');
   const [internalMinimized, setInternalMinimized] = useState<boolean>(false);
+  const [showCoordRows, setShowCoordRows] = useState<boolean>(true);
   const [openWinBind, setOpenWinBind] = useState<{
     winId: string;
     field: 'width' | 'xStart' | 'xEnd';
@@ -186,11 +189,50 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   const undoStackRef = useRef<LithographyConfig[]>([]);
   const redoStackRef = useRef<LithographyConfig[]>([]);
   const dragStartLithoRef = useRef<LithographyConfig | null>(null);
+  const keyNudgeStartLithoRef = useRef<LithographyConfig | null>(null);
+  const keyNudgeIdleTimerRef = useRef<number | null>(null);
+  const liveWindowsRef = useRef<MaskWindow[] | null>(null);
+  const pendingDragWindowsRef = useRef<MaskWindow[] | null>(null);
+  const lastDragSigRef = useRef<string>('');
+  const lastSimSyncTsRef = useRef<number>(0);
+  const dragSyncRafRef = useRef<number | null>(null);
+  const dragSyncTimeoutRef = useRef<number | null>(null);
   const latestStepRef = useRef(step);
   latestStepRef.current = step;
   const latestLithoRef = useRef(litho);
   latestLithoRef.current = litho;
+  const selectedWindowIdsRef = useRef(selectedWindowIds);
+  selectedWindowIdsRef.current = selectedWindowIds;
+  const waferWidthRef = useRef(waferWidth);
+  waferWidthRef.current = waferWidth;
+  const dragStateRef = useRef(dragState);
+  dragStateRef.current = dragState;
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+
+  const cancelPendingDragSync = useCallback(() => {
+    if (dragSyncRafRef.current !== null) {
+      window.cancelAnimationFrame(dragSyncRafRef.current);
+      dragSyncRafRef.current = null;
+    }
+    if (dragSyncTimeoutRef.current !== null) {
+      window.clearTimeout(dragSyncTimeoutRef.current);
+      dragSyncTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearKeyNudgeTimer = useCallback(() => {
+    if (keyNudgeIdleTimerRef.current !== null) {
+      window.clearTimeout(keyNudgeIdleTimerRef.current);
+      keyNudgeIdleTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      cancelPendingDragSync();
+      clearKeyNudgeTimer();
+    };
+  }, [cancelPendingDragSync, clearKeyNudgeTimer]);
 
   const syncHistoryState = useCallback(() => {
     setHistoryState({
@@ -220,7 +262,73 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     [onUpdateStep, syncHistoryState]
   );
 
+  const scheduleWindowsSync = useCallback(() => {
+    if (dragSyncRafRef.current !== null || dragSyncTimeoutRef.current !== null) {
+      return;
+    }
+    const flushSync = () => {
+      dragSyncRafRef.current = null;
+      dragSyncTimeoutRef.current = null;
+      const nextWins = pendingDragWindowsRef.current;
+      if (!nextWins) return;
+      pendingDragWindowsRef.current = null;
+      lastSimSyncTsRef.current = performance.now();
+      commitLitho(
+        {
+          ...latestLithoRef.current,
+          windows: nextWins,
+        },
+        { skipHistory: true }
+      );
+    };
+    const DRAG_SIM_INTERVAL_MS = 45;
+    const elapsed = performance.now() - lastSimSyncTsRef.current;
+    if (elapsed >= DRAG_SIM_INTERVAL_MS) {
+      dragSyncRafRef.current = window.requestAnimationFrame(flushSync);
+    } else {
+      dragSyncTimeoutRef.current = window.setTimeout(() => {
+        dragSyncTimeoutRef.current = null;
+        dragSyncRafRef.current = window.requestAnimationFrame(flushSync);
+      }, Math.max(8, DRAG_SIM_INTERVAL_MS - elapsed));
+    }
+  }, [commitLitho]);
+
+  const flushKeyboardNudge = useCallback(() => {
+    clearKeyNudgeTimer();
+    if (dragStateRef.current) return;
+    const startSnap = keyNudgeStartLithoRef.current;
+    const pendingWins = pendingDragWindowsRef.current;
+    const liveWins = liveWindowsRef.current;
+    if (!startSnap && !pendingWins && !liveWins) return;
+
+    cancelPendingDragSync();
+    keyNudgeStartLithoRef.current = null;
+    pendingDragWindowsRef.current = null;
+    liveWindowsRef.current = null;
+
+    const finalWins = pendingWins ?? liveWins;
+    const finalLitho = finalWins
+      ? { ...latestLithoRef.current, windows: finalWins }
+      : latestLithoRef.current;
+
+    if (pendingWins) {
+      commitLitho(finalLitho, { skipHistory: true });
+    }
+
+    if (startSnap && JSON.stringify(startSnap) !== JSON.stringify(finalLitho)) {
+      undoStackRef.current = [
+        ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
+        startSnap,
+      ];
+      redoStackRef.current = [];
+      syncHistoryState();
+    }
+
+    setDragPreviewWindows(null);
+  }, [cancelPendingDragSync, clearKeyNudgeTimer, commitLitho, syncHistoryState]);
+
   const handleUndo = useCallback(() => {
+    flushKeyboardNudge();
     if (undoStackRef.current.length === 0) return;
     const prevLitho = undoStackRef.current[undoStackRef.current.length - 1];
     undoStackRef.current = undoStackRef.current.slice(0, -1);
@@ -228,7 +336,13 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       ...redoStackRef.current.slice(-(MAX_HISTORY - 1)),
       latestLithoRef.current,
     ];
+    cancelPendingDragSync();
+    clearKeyNudgeTimer();
+    pendingDragWindowsRef.current = null;
+    liveWindowsRef.current = null;
     dragStartLithoRef.current = null;
+    keyNudgeStartLithoRef.current = null;
+    setDragPreviewWindows(null);
     setDragState(null);
     setTrackMarquee(null);
     syncHistoryState();
@@ -236,9 +350,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       ...latestStepRef.current,
       lithography: prevLitho,
     });
-  }, [onUpdateStep, syncHistoryState]);
+  }, [cancelPendingDragSync, clearKeyNudgeTimer, flushKeyboardNudge, onUpdateStep, syncHistoryState]);
 
   const handleRedo = useCallback(() => {
+    flushKeyboardNudge();
     if (redoStackRef.current.length === 0) return;
     const nextLitho = redoStackRef.current[redoStackRef.current.length - 1];
     redoStackRef.current = redoStackRef.current.slice(0, -1);
@@ -246,7 +361,13 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
       latestLithoRef.current,
     ];
+    cancelPendingDragSync();
+    clearKeyNudgeTimer();
+    pendingDragWindowsRef.current = null;
+    liveWindowsRef.current = null;
     dragStartLithoRef.current = null;
+    keyNudgeStartLithoRef.current = null;
+    setDragPreviewWindows(null);
     setDragState(null);
     setTrackMarquee(null);
     syncHistoryState();
@@ -254,7 +375,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       ...latestStepRef.current,
       lithography: nextLitho,
     });
-  }, [onUpdateStep, syncHistoryState]);
+  }, [cancelPendingDragSync, clearKeyNudgeTimer, flushKeyboardNudge, onUpdateStep, syncHistoryState]);
 
   useEffect(() => {
     setIsEditingMaskName(false);
@@ -262,15 +383,22 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   }, [step.id, step.lithography?.maskName]);
 
   useEffect(() => {
+    cancelPendingDragSync();
+    clearKeyNudgeTimer();
+    pendingDragWindowsRef.current = null;
+    liveWindowsRef.current = null;
+    dragStartLithoRef.current = null;
+    keyNudgeStartLithoRef.current = null;
+    setDragPreviewWindows(null);
+    setDragState(null);
     setSelectedWindowIds([]);
     setArraySourceWinId(null);
     setOpenWinBind(null);
     setBranchNotice(null);
     undoStackRef.current = [];
     redoStackRef.current = [];
-    dragStartLithoRef.current = null;
     setHistoryState({ canUndo: false, canRedo: false });
-  }, [step.id, step.activeVariantId]);
+  }, [step.id, step.activeVariantId, cancelPendingDragSync, clearKeyNudgeTimer]);
 
   useEffect(() => {
     const prev = prevTrackMaskRef.current;
@@ -325,6 +453,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   };
 
   const windows = litho.windows || [];
+  const displayWindows = dragPreviewWindows ?? windows;
 
   useEffect(() => {
     const validIds = new Set(windows.map((w) => w.id));
@@ -336,9 +465,34 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
 
   // Keyboard shortcuts: Undo/Redo (Ctrl+Z / Ctrl+Y / Cmd+Shift+Z), Escape, Left/Right arrow nudging
   useEffect(() => {
-    if (isMinimized) return;
+    if (isMinimized) {
+      flushKeyboardNudge();
+      return;
+    }
+
+    const hasVisibleOverlay = () => {
+      const overlays = document.querySelectorAll('.fixed.inset-0');
+      for (let i = 0; i < overlays.length; i++) {
+        const el = overlays[i];
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+      }
+      return false;
+    };
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
+
+      const isUndoRedo =
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        (e.key.toLowerCase() === 'z' || (e.key.toLowerCase() === 'y' && !e.shiftKey));
+      const isEscape = e.key === 'Escape';
+      const isArrow = e.key === 'ArrowLeft' || e.key === 'ArrowRight';
+      if (!isUndoRedo && !isEscape && !isArrow) return;
+
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (
@@ -349,10 +503,9 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       ) {
         return;
       }
-      // Do not intercept while a modal dialog is open above the track
-      if (document.querySelector('.fixed.inset-0')) return;
+      if (hasVisibleOverlay()) return;
 
-      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+      if (isUndoRedo) {
         const keyLower = e.key.toLowerCase();
         if (keyLower === 'z') {
           e.preventDefault();
@@ -370,44 +523,81 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         }
       }
 
-      if (e.key === 'Escape' && selectedWindowIds.length > 0) {
-        setSelectedWindowIds([]);
+      if (isEscape) {
+        if (selectedWindowIdsRef.current.length > 0) {
+          setSelectedWindowIds([]);
+        }
         return;
       }
 
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (dragStateRef.current) return;
+
+      const currentLitho = latestLithoRef.current;
+      const currentWindows = liveWindowsRef.current ?? currentLitho.windows ?? [];
+      const curSelectedIds = selectedWindowIdsRef.current;
       const targetIds =
-        selectedWindowIds.length > 0
-          ? selectedWindowIds
-          : windows.length === 1
-          ? [windows[0].id]
+        curSelectedIds.length > 0
+          ? curSelectedIds
+          : currentWindows.length === 1
+          ? [currentWindows[0].id]
           : [];
       if (targetIds.length === 0) return;
 
-      const selectedTargets = windows.filter((w) => targetIds.includes(w.id));
+      const selectedTargets = currentWindows.filter((w) => targetIds.includes(w.id));
       if (selectedTargets.length === 0) return;
 
       e.preventDefault();
-      const nudgeNm = e.shiftKey ? 250 : 50;
+      const curWaferWidth = waferWidthRef.current;
+      const { fineNm, coarseNm } = getMaskArrowStepSizes(curWaferWidth);
+      const nudgeNm = e.shiftKey ? coarseNm : fineNm;
       const deltaNm = e.key === 'ArrowLeft' ? -nudgeNm : nudgeNm;
       const minDelta = -Math.min(...selectedTargets.map((w) => w.xStart));
-      const maxDelta = Math.min(...selectedTargets.map((w) => waferWidth - w.xEnd));
+      const maxDelta = Math.min(...selectedTargets.map((w) => curWaferWidth - w.xEnd));
       const clampedDelta = Math.round(Math.max(minDelta, Math.min(maxDelta, deltaNm)));
       if (clampedDelta === 0) return;
 
+      if (keyNudgeStartLithoRef.current === null) {
+        keyNudgeStartLithoRef.current = currentLitho;
+      }
+
       const selSet = new Set(selectedTargets.map((w) => w.id));
-      commitLitho({
-        ...litho,
-        windows: windows.map((w) =>
-          selSet.has(w.id)
-            ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
-            : w
-        ),
-      });
+      const nextWindows = currentWindows.map((w) =>
+        selSet.has(w.id)
+          ? { ...w, xStart: w.xStart + clampedDelta, xEnd: w.xEnd + clampedDelta }
+          : w
+      );
+
+      liveWindowsRef.current = nextWindows;
+      pendingDragWindowsRef.current = nextWindows;
+      setDragPreviewWindows(nextWindows);
+      scheduleWindowsSync();
+
+      clearKeyNudgeTimer();
+      keyNudgeIdleTimerRef.current = window.setTimeout(() => {
+        keyNudgeIdleTimerRef.current = null;
+        flushKeyboardNudge();
+      }, 180);
     };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        flushKeyboardNudge();
+      }
+    };
+
+    const onBlur = () => {
+      flushKeyboardNudge();
+    };
+
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isMinimized, selectedWindowIds, windows, waferWidth, litho, commitLitho, handleUndo, handleRedo]);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [isMinimized, handleUndo, handleRedo, scheduleWindowsSync, clearKeyNudgeTimer, flushKeyboardNudge]);
 
   const toggleWindowSelection = (id: string, additive: boolean) => {
     if (additive) {
@@ -455,6 +645,17 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     if (arraySourceWinId && delSet.has(arraySourceWinId)) {
       setArraySourceWinId(null);
     }
+  };
+
+  const handleClearTrack = () => {
+    if (windows.length === 0) return;
+    commitLitho({
+      ...litho,
+      windows: [],
+    });
+    setSelectedWindowIds([]);
+    setArraySourceWinId(null);
+    setOpenWinBind(null);
   };
 
   const handleDuplicateWindow = (id: string) => {
@@ -639,6 +840,11 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   const isLightField = maskField === 'light-field';
   const featureNoun = isLightField ? 'blocker' : 'aperture';
   const featureNounCap = isLightField ? 'Blocker' : 'Aperture';
+  const { fineNm: arrowFineNm, coarseNm: arrowCoarseNm } = getMaskArrowStepSizes(waferWidth);
+  const formatNudgeLabel = (nm: number) =>
+    nm >= 1000
+      ? `${(nm / 1000).toFixed(2).replace(/\.?0+$/, '')} µm`
+      : `${Math.round(nm)} nm`;
 
   const togglePolarity = () => {
     const newPol = litho.polarity === 'positive' ? 'negative' : 'positive';
@@ -685,6 +891,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
   ) => {
     e.preventDefault();
     e.stopPropagation();
+    flushKeyboardNudge();
     containerRef.current?.focus({ preventScroll: true });
 
     const isAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
@@ -705,6 +912,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         .filter((w) => nextSet.has(w.id))
         .map((w) => ({ id: w.id, xStart: w.xStart, xEnd: w.xEnd }));
       dragStartLithoRef.current = latestLithoRef.current;
+      lastDragSigRef.current = windows.map((w) => `${w.xStart}:${w.xEnd}`).join('|');
+      pendingDragWindowsRef.current = null;
+      liveWindowsRef.current = null;
+      lastSimSyncTsRef.current = 0;
       setDragState({
         winId: win.id,
         type,
@@ -734,6 +945,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     }
 
     dragStartLithoRef.current = latestLithoRef.current;
+    lastDragSigRef.current = windows.map((w) => `${w.xStart}:${w.xEnd}`).join('|');
+    pendingDragWindowsRef.current = null;
+    liveWindowsRef.current = null;
+    lastSimSyncTsRef.current = 0;
     setDragState({
       winId: win.id,
       type,
@@ -753,7 +968,9 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           0,
           Math.min(waferWidth, ((e.clientX - rect.left) / rect.width) * waferWidth)
         );
-        setTrackMarquee((prev) => (prev ? { ...prev, currentNm: nm } : null));
+        if (Math.round(nm) !== Math.round(trackMarquee.currentNm)) {
+          setTrackMarquee((prev) => (prev ? { ...prev, currentNm: nm } : null));
+        }
       }
       return;
     }
@@ -766,8 +983,9 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     const deltaNm = (e.clientX - dragState.startClientX) * pxToNm;
     // Snap to 50 nm precision
     const snap = 50;
+    const baseWindows = latestLithoRef.current.windows || [];
 
-    let updatedWindows = windows;
+    let updatedWindows = baseWindows;
 
     if (dragState.type === 'resize-start') {
       const rawStart = dragState.initialXStart + deltaNm;
@@ -775,7 +993,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       // Minimum aperture width 100 nm
       const clampedStart = Math.max(0, Math.min(dragState.initialXEnd - 100, snappedStart));
 
-      updatedWindows = windows.map((w) =>
+      updatedWindows = baseWindows.map((w) =>
         w.id === dragState.winId ? { ...w, xStart: clampedStart } : w
       );
     } else if (dragState.type === 'resize-end') {
@@ -783,7 +1001,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       const snappedEnd = Math.round(rawEnd / snap) * snap;
       const clampedEnd = Math.max(dragState.initialXStart + 100, Math.min(waferWidth, snappedEnd));
 
-      updatedWindows = windows.map((w) =>
+      updatedWindows = baseWindows.map((w) =>
         w.id === dragState.winId ? { ...w, xEnd: clampedEnd } : w
       );
     } else if (dragState.type === 'move') {
@@ -799,19 +1017,23 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         targets.map((t) => [t.id, { xStart: t.xStart + clampedDelta, xEnd: t.xEnd + clampedDelta }])
       );
 
-      updatedWindows = windows.map((w) => {
+      updatedWindows = baseWindows.map((w) => {
         const next = byId.get(w.id);
         return next ? { ...w, xStart: next.xStart, xEnd: next.xEnd } : w;
       });
     }
 
-    commitLitho(
-      {
-        ...litho,
-        windows: updatedWindows,
-      },
-      { skipHistory: true }
-    );
+    const sig = updatedWindows.map((w) => `${w.xStart}:${w.xEnd}`).join('|');
+    if (sig === lastDragSigRef.current) return;
+    lastDragSigRef.current = sig;
+
+    // Instant local visual update on the track
+    liveWindowsRef.current = updatedWindows;
+    pendingDragWindowsRef.current = updatedWindows;
+    setDragPreviewWindows(updatedWindows);
+
+    // Throttle cross-section re-simulation to ~22fps max aligned with requestAnimationFrame
+    scheduleWindowsSync();
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -841,10 +1063,24 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     }
 
     if (dragState) {
+      cancelPendingDragSync();
+      const pendingWins = pendingDragWindowsRef.current;
+      const liveWins = liveWindowsRef.current;
+      pendingDragWindowsRef.current = null;
+      liveWindowsRef.current = null;
+      const finalWins = pendingWins ?? liveWins;
+      const finalLitho = finalWins
+        ? { ...latestLithoRef.current, windows: finalWins }
+        : latestLithoRef.current;
+
+      if (pendingWins) {
+        commitLitho(finalLitho, { skipHistory: true });
+      }
+
       if (dragStartLithoRef.current) {
         const startSnap = dragStartLithoRef.current;
         dragStartLithoRef.current = null;
-        if (JSON.stringify(startSnap) !== JSON.stringify(latestLithoRef.current)) {
+        if (JSON.stringify(startSnap) !== JSON.stringify(finalLitho)) {
           undoStackRef.current = [
             ...undoStackRef.current.slice(-(MAX_HISTORY - 1)),
             startSnap,
@@ -858,6 +1094,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       } catch {
         // ignore
       }
+      setDragPreviewWindows(null);
       setDragState(null);
     }
   };
@@ -975,23 +1212,23 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
     : 'Chrome bg blocks UV · Clear apertures expose & crosslink resist';
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 sm:p-3 text-slate-200">
-      <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2 border-b border-slate-800">
-        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
-          <span className="text-xs font-semibold tracking-wider uppercase text-sky-400">
-            Photomask Track
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-2 text-slate-200">
+      <div className="flex flex-wrap items-center justify-between gap-1.5 pb-1.5 mb-1.5 border-b border-slate-800">
+        <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+          <span className="text-[11px] font-semibold tracking-wider uppercase text-sky-400 shrink-0">
+            Mask Track
           </span>
           {step.side === 'back' && (
-            <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-semibold">
-              Backside
+            <span className="text-[10px] font-mono font-semibold text-amber-300">
+              · Backside
             </span>
           )}
           {step.side === 'both' && (
-            <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[10px] font-semibold">
-              Both Sides
+            <span className="text-[10px] font-mono font-semibold text-emerald-300">
+              · Both Sides
             </span>
           )}
-          <span className="text-xs text-slate-500">·</span>
+          <span className="text-xs text-slate-600">·</span>
           {isEditingMaskName ? (
             <div className="flex items-center gap-1">
               <input
@@ -1008,7 +1245,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   }
                 }}
                 placeholder="Mask name..."
-                className="px-2 py-0.5 rounded bg-slate-950 border border-sky-500 text-xs text-white font-mono focus:outline-none w-36 sm:w-44"
+                className="px-1.5 py-0.5 rounded bg-slate-950 border border-sky-500 text-[11px] text-white font-mono focus:outline-none w-32 sm:w-40"
               />
               <button
                 type="button"
@@ -1019,7 +1256,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 className="p-0.5 text-emerald-400 hover:text-emerald-300"
                 title="Save Mask Name"
               >
-                <Check className="w-3.5 h-3.5" />
+                <Check className="w-3 h-3" />
               </button>
             </div>
           ) : (
@@ -1029,92 +1266,85 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 setEditingMaskName(litho.maskName || 'Photomask Layer');
                 setIsEditingMaskName(true);
               }}
-              className="group/maskname flex items-center gap-1.5 text-xs text-slate-300 hover:text-white font-mono px-1.5 py-0.5 rounded hover:bg-slate-800/80 border border-transparent hover:border-slate-700 transition-colors"
+              className="group/maskname flex items-center gap-1 text-[11px] text-slate-200 hover:text-white font-mono px-1 py-0.5 rounded hover:bg-slate-800/80 border border-transparent hover:border-slate-700 transition-colors"
               title="Click to rename assigned mask"
             >
-              <span className="truncate max-w-[140px] sm:max-w-none">{litho.maskName || 'Photomask Layer'}</span>
-              <Edit2 className="w-3 h-3 text-slate-500 group-hover/maskname:text-sky-400 transition-colors shrink-0" />
+              <span className="truncate max-w-[130px] sm:max-w-[200px]">{litho.maskName || 'Photomask Layer'}</span>
+              <Edit2 className="w-2.5 h-2.5 text-slate-500 group-hover/maskname:text-sky-400 transition-colors shrink-0" />
             </button>
           )}
           {activeVariant && !isMaskSharedWithOtherVariant && (
             <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 bg-violet-500/15 text-violet-300 border-violet-500/35"
+              className="inline-flex items-center gap-1 text-[10px] font-medium shrink-0 text-violet-300"
               title="Dedicated mask branch assigned to this variant in Mask Manager."
             >
               <GitBranch className="w-2.5 h-2.5" />
-              <span>{activeVariant.name} · Mask Branch</span>
+              <span>{activeVariant.name}</span>
             </span>
           )}
           {activeVariant && isMaskSharedWithOtherVariant && (
             <div
-              className="inline-flex items-center gap-1 bg-slate-950 border border-slate-700/80 rounded-lg p-0.5 text-[10px] shrink-0"
+              className="inline-flex items-center gap-0.5 bg-slate-950 border border-slate-700/80 rounded-md p-0.5 text-[10px] shrink-0"
               title={`Currently sharing reticle across ${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')}`}
             >
-              <span className="hidden sm:inline pl-1.5 pr-0.5 text-slate-400 font-medium">
-                {activeVariant.name}:
-              </span>
               <button
                 type="button"
                 onClick={() =>
                   onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'shared' })
                 }
-                className={`px-2 py-0.5 rounded-md font-medium transition-colors ${
+                className={`px-1.5 py-0.5 rounded font-medium transition-colors ${
                   variantMaskEditMode === 'shared'
-                    ? 'bg-sky-600 text-white shadow-sm'
+                    ? 'bg-sky-600 text-white'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
                 }`}
-                title={`Share reticle across variants: edits carry over to ${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')}`}
+                title={`Share reticle across variants (${[activeVariant.name, ...siblingVariantsSharingMask.map((v) => v.name)].join(', ')})`}
               >
-                Shared ({siblingVariantsSharingMask.length + 1} var)
+                Shared ({siblingVariantsSharingMask.length + 1})
               </button>
               <button
                 type="button"
                 onClick={() =>
                   onUpdateStep({ ...latestStepRef.current, variantMaskEditMode: 'branch' })
                 }
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-medium transition-colors ${
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-medium transition-colors ${
                   variantMaskEditMode === 'branch'
-                    ? 'bg-violet-600 text-white shadow-sm'
+                    ? 'bg-violet-600 text-white'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
                 }`}
                 title="Generate a new mask branch in Mask Manager when this variant's aperture track is modified"
               >
                 <GitBranch className="w-2.5 h-2.5" />
-                <span>New Branch</span>
+                <span>Branch</span>
               </button>
             </div>
           )}
-          <span className="hidden md:inline text-xs text-slate-500">·</span>
-          <span className="hidden md:inline text-[11px] text-slate-400">
-            Drag or ←/→ arrows to move (Shift/Ctrl+Click or drag track for multi) · Borders resize
-          </span>
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+        <div className="flex flex-wrap items-center gap-1">
+          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-md p-0.5">
             <button
               type="button"
               onClick={handleUndo}
               disabled={!historyState.canUndo}
-              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              className="p-0.5 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
               title="Undo aperture track edit (Ctrl+Z)"
             >
-              <Undo2 className="w-3.5 h-3.5" />
+              <Undo2 className="w-3 h-3" />
             </button>
             <button
               type="button"
               onClick={handleRedo}
               disabled={!historyState.canRedo}
-              className="p-1 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
+              className="p-0.5 rounded text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-35 disabled:pointer-events-none transition-colors"
               title="Redo aperture track edit (Ctrl+Y)"
             >
-              <Redo2 className="w-3.5 h-3.5" />
+              <Redo2 className="w-3 h-3" />
             </button>
           </div>
           <button
             type="button"
             onClick={toggleMaskField}
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
+            className={`flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded-md border transition-colors ${
               isLightField
                 ? 'bg-sky-950/60 hover:bg-sky-900/60 text-sky-200 border-sky-500/50'
                 : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
@@ -1126,77 +1356,87 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
             }
           >
             <span
-              className={`w-3 h-3 rounded-xs border shrink-0 flex items-center justify-center ${
+              className={`w-2.5 h-2.5 rounded-xs border shrink-0 flex items-center justify-center ${
                 isLightField
                   ? 'bg-sky-200/85 border-sky-300'
                   : 'bg-slate-950 border-slate-500'
               }`}
             >
               <span
-                className={`w-1.5 h-1.5 rounded-[1px] ${
+                className={`w-1 h-1 rounded-[1px] ${
                   isLightField ? 'bg-slate-900' : 'bg-amber-300'
                 }`}
               />
             </span>
-            <span>
-              Mask: <strong className="text-white">{isLightField ? 'Light-Field' : 'Dark-Field'}</strong>
-            </span>
+            <span>{isLightField ? 'Light-Field' : 'Dark-Field'}</span>
           </button>
 
           <button
             type="button"
             onClick={togglePolarity}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+            className="flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
             title="Switch Photoresist Tone: Positive (UV-exposed dissolves) vs Negative (UV-exposed crosslinks & stays)"
           >
-            <ArrowLeftRight className="w-3.5 h-3.5 text-amber-400" />
-            <span>
-              Resist: <strong className="capitalize text-white">{litho.polarity}</strong>
-            </span>
+            <ArrowLeftRight className="w-3 h-3 text-amber-400" />
+            <span className="capitalize">{litho.polarity}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleClearTrack}
+            disabled={windows.length === 0}
+            className="flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-amber-950/50 text-amber-300 hover:text-amber-200 border border-slate-700 hover:border-amber-500/40 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+            title={
+              isLightField
+                ? 'Clear all chrome blockers (100% clear quartz field)'
+                : 'Clear all apertures from this mask track (100% opaque dark field)'
+            }
+          >
+            <Eraser className="w-3 h-3" />
+            <span>Clear</span>
           </button>
 
           <button
             type="button"
             onClick={handleAddWindow}
-            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-sky-600 hover:bg-sky-500 text-white transition-colors shadow-sm"
+            className="flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded-md bg-sky-600 hover:bg-sky-500 text-white transition-colors shadow-sm"
             title={
               isLightField
                 ? 'Add an opaque chrome blocker island on the clear quartz mask'
                 : 'Add a clear quartz aperture window in the opaque chrome mask'
             }
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add {featureNounCap}</span>
+            <Plus className="w-3 h-3" />
+            <span>{featureNounCap}</span>
           </button>
 
           {onOpenMaskLevels && (
             <button
               type="button"
               onClick={onOpenMaskLevels}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 transition-colors"
+              className="flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-sky-400 hover:text-sky-300 border border-slate-700 transition-colors"
               title="Open Photolithography Mask Levels Panel"
             >
-              <Scan className="w-3.5 h-3.5" />
-              <span>Mask Levels</span>
+              <Scan className="w-3 h-3" />
+              <span className="hidden sm:inline">Masks</span>
             </button>
           )}
 
           <button
             type="button"
             onClick={handleToggleMinimize}
-            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors"
+            className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors"
             title="Minimize Photomask Track to maximize cross-section view"
           >
             <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
-            <span className="hidden xl:inline">Minimize</span>
           </button>
         </div>
       </div>
 
       {branchNotice && (
-        <div className="mb-2 px-2.5 py-1.5 rounded-lg bg-violet-950/50 border border-violet-500/40 text-violet-200 text-[11px] flex items-center justify-between gap-2">
+        <div className="mb-1.5 px-2 py-1 rounded-md bg-violet-950/50 border border-violet-500/40 text-violet-200 text-[10.5px] flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 min-w-0">
-            <GitBranch className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+            <GitBranch className="w-3 h-3 text-violet-400 shrink-0" />
             <span className="truncate">{branchNotice}</span>
           </div>
           {onOpenMaskLevels && (
@@ -1206,7 +1446,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 setBranchNotice(null);
                 onOpenMaskLevels();
               }}
-              className="text-[11px] font-semibold text-sky-300 hover:text-sky-200 hover:underline shrink-0"
+              className="text-[10.5px] font-semibold text-sky-300 hover:text-sky-200 hover:underline shrink-0"
             >
               View in Mask Manager →
             </button>
@@ -1215,21 +1455,24 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
       )}
 
       {/* Visual Photomask Bar */}
-      <div className="relative my-2 select-none">
-        <div className="text-[10px] text-slate-400 flex flex-wrap items-center justify-between gap-2 font-mono mb-1">
+      <div className="relative my-1 select-none">
+        <div className="text-[10px] text-slate-400 flex items-center justify-between gap-2 font-mono mb-0.5 leading-tight">
           <span>0 µm</span>
-          <span className="text-slate-400 truncate max-w-[75%]">
+          <span
+            className="text-slate-400 truncate max-w-[75%]"
+            title={`Drag or ←/→ (${formatNudgeLabel(arrowFineNm)}, Shift ${formatNudgeLabel(arrowCoarseNm)}) to move · Shift/Ctrl+Click or drag track for multi · Borders resize`}
+          >
             {dragState ? (
               <span className="text-amber-300 font-semibold animate-pulse">
                 {dragState.type === 'move'
                   ? (dragState.initialWindows?.length || 1) > 1
-                    ? `Sliding ${dragState.initialWindows?.length} ${featureNounCap}s together...`
+                    ? `Sliding ${dragState.initialWindows?.length} ${featureNounCap}s...`
                     : `Sliding ${featureNounCap}...`
-                  : `Resizing ${featureNounCap} Boundary...`}
+                  : `Resizing ${featureNounCap}...`}
               </span>
             ) : trackMarquee ? (
               <span className="text-sky-300 font-semibold">
-                Selecting {featureNoun}s across track...
+                Selecting {featureNoun}s...
               </span>
             ) : (
               <span className={isLightField ? 'text-sky-300/90' : 'text-slate-400'}>
@@ -1244,11 +1487,12 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
         <div
           ref={containerRef}
           tabIndex={0}
+          title={`Drag or ←/→ (${formatNudgeLabel(arrowFineNm)}, Shift ${formatNudgeLabel(arrowCoarseNm)}) to move · Shift/Ctrl+Click or drag track for multi · Borders resize`}
           onPointerDown={handleTrackPointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className={`relative h-11 w-full rounded-lg overflow-hidden shadow-inner select-none touch-none border focus:outline-none focus-visible:ring-1 focus-visible:ring-sky-500/60 ${
+          className={`relative h-8 w-full rounded-lg overflow-hidden shadow-inner select-none touch-none border focus:outline-none focus-visible:ring-1 focus-visible:ring-sky-500/60 ${
             isLightField
               ? 'bg-gradient-to-b from-sky-200/35 via-cyan-100/25 to-amber-100/30 border-sky-400/50'
               : 'bg-slate-950 border-slate-700'
@@ -1293,7 +1537,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           })()}
 
           {/* Movable Mask Blocks: Chrome Blockers (Light-Field) OR Clear Apertures (Dark-Field) */}
-          {windows.map((win) => {
+          {displayWindows.map((win) => {
             const leftPct = (win.xStart / waferWidth) * 100;
             const widthPct = Math.max(1.5, ((win.xEnd - win.xStart) / waferWidth) * 100);
             const isActive = selectedWindowIds.includes(win.id);
@@ -1321,7 +1565,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 onClick={(e) => {
                   e.stopPropagation();
                 }}
-                className={`absolute top-0 bottom-0 transition-shadow select-none group/box ${blockClasses}`}
+                className={`absolute top-0 bottom-0 select-none group/box ${dragState ? '' : 'transition-shadow'} ${blockClasses}`}
                 style={{
                   left: `${leftPct}%`,
                   width: `${widthPct}%`,
@@ -1337,29 +1581,29 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 {!win.fixedWidth && (
                   <div
                     onPointerDown={(e) => handlePointerDown(e, win, 'resize-start')}
-                    className={`absolute left-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center z-20 transition-all select-none group/left ${handleClasses}`}
+                    className={`absolute left-0 top-0 bottom-0 w-2.5 cursor-ew-resize flex items-center justify-center z-20 transition-colors select-none group/left ${handleClasses}`}
                     title={`Drag to resize ${featureNoun} left boundary`}
                   >
-                    <div className="w-1 h-5 rounded-full bg-slate-950/70" />
+                    <div className="w-0.5 h-3.5 rounded-full bg-slate-950/70" />
                   </div>
                 )}
 
                 {/* Central Drag & Slide Area */}
                 <div
                   onPointerDown={(e) => handlePointerDown(e, win, 'move')}
-                  className="w-full h-full flex items-center justify-center cursor-grab active:cursor-grabbing px-3 overflow-hidden select-none"
+                  className="w-full h-full flex items-center justify-center cursor-grab active:cursor-grabbing px-2.5 overflow-hidden select-none"
                   title={
                     win.fixedWidth
                       ? `Width locked — drag to slide ${featureNoun}`
                       : `Click and drag to slide ${featureNoun}`
                   }
                 >
-                  <div className="flex items-center gap-1 text-[11px] font-mono font-bold text-white drop-shadow truncate select-none pointer-events-none">
+                  <div className="flex items-center gap-1 text-[10.5px] font-mono font-bold text-white drop-shadow truncate select-none pointer-events-none">
                     {win.fixedWidth ? (
-                      <Lock className="w-3 h-3 text-amber-300 flex-shrink-0" />
+                      <Lock className="w-2.5 h-2.5 text-amber-300 flex-shrink-0" />
                     ) : (
                       <MoveHorizontal
-                        className={`w-3 h-3 flex-shrink-0 ${
+                        className={`w-2.5 h-2.5 flex-shrink-0 ${
                           isLightField ? 'text-slate-300' : 'text-amber-300'
                         }`}
                       />
@@ -1372,10 +1616,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 {!win.fixedWidth && (
                   <div
                     onPointerDown={(e) => handlePointerDown(e, win, 'resize-end')}
-                    className={`absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize flex items-center justify-center z-20 transition-all select-none group/right ${handleClasses}`}
+                    className={`absolute right-0 top-0 bottom-0 w-2.5 cursor-ew-resize flex items-center justify-center z-20 transition-colors select-none group/right ${handleClasses}`}
                     title={`Drag to resize ${featureNoun} right boundary`}
                   >
-                    <div className="w-1 h-5 rounded-full bg-slate-950/70" />
+                    <div className="w-0.5 h-3.5 rounded-full bg-slate-950/70" />
                   </div>
                 )}
               </div>
@@ -1400,59 +1644,86 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
           ? windows.findIndex((w) => w.id === singleSelectedWin.id)
           : -1;
         const allSelected = windows.length > 0 && selectedWindowIds.length === windows.length;
+        const hasExpandedInlinePanel = Boolean(arraySourceWinId || openWinBind);
 
         return (
-          <div className="mt-3 space-y-2">
+          <div className="mt-1.5 space-y-1">
             {/* Selected Aperture List Toolbar */}
-            <div className="flex flex-wrap items-center justify-between gap-2 px-0.5 text-[11px]">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-slate-400 font-medium">
-                  {featureNounCap} List ({windows.length})
-                  {effectiveSelectedIds.length === 1 && singleSelectedIdx >= 0 && (
-                    <span className="ml-2 text-sky-300 font-mono">
-                      · Selected: #{singleSelectedIdx + 1}
-                    </span>
+            <div className="flex flex-wrap items-center justify-between gap-1.5 px-0.5 text-[10.5px]">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShowCoordRows((prev) => !prev)}
+                  className="inline-flex items-center gap-1 text-slate-300 hover:text-white font-medium transition-colors"
+                  title={showCoordRows ? 'Collapse aperture coordinates list' : 'Expand aperture coordinates list'}
+                >
+                  {showCoordRows ? (
+                    <ChevronUp className="w-3 h-3 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-3 h-3 text-sky-400" />
                   )}
-                  {effectiveSelectedIds.length > 1 && (
-                    <span className="ml-2 text-amber-300 font-mono font-semibold">
-                      · {effectiveSelectedIds.length} selected
-                    </span>
-                  )}
-                </span>
+                  <span>
+                    {featureNounCap}s ({windows.length})
+                  </span>
+                </button>
+                {effectiveSelectedIds.length === 1 && singleSelectedIdx >= 0 && (
+                  <span className="text-sky-300 font-mono">
+                    · #{singleSelectedIdx + 1}
+                  </span>
+                )}
+                {effectiveSelectedIds.length > 1 && (
+                  <span className="text-amber-300 font-mono font-semibold">
+                    · {effectiveSelectedIds.length} sel
+                  </span>
+                )}
                 {windows.length > 1 && (
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setSelectedWindowIds(allSelected ? [] : windows.map((w) => w.id))
-                      }
-                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[10px]"
-                    >
-                      {allSelected ? 'Clear' : 'All'}
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedWindowIds(allSelected ? [] : windows.map((w) => w.id))
+                    }
+                    className="px-1.5 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[10px]"
+                  >
+                    {allSelected ? 'Clear' : 'All'}
+                  </button>
                 )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1">
                 {effectiveSelectedIds.length > 0 && (
-                  <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded px-1 py-0.5">
-                    <span className="text-[10px] text-slate-400 px-0.5">Move:</span>
+                  <div className="flex items-center gap-0.5 bg-slate-950 border border-slate-800 rounded px-1 py-0.5">
+                    <span className="text-[10px] text-slate-400 pr-0.5">Move:</span>
                     <button
                       type="button"
-                      onClick={() => handleShiftWindows(effectiveSelectedIds, -100)}
-                      className="px-1.5 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
-                      title="Shift selected -0.10 µm (-100 nm)"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, -arrowCoarseNm)}
+                      className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-[10px]"
+                      title={`Coarse shift left -${formatNudgeLabel(arrowCoarseNm)} (Shift+←)`}
                     >
-                      -0.1µm
+                      -{formatNudgeLabel(arrowCoarseNm).replace(' ', '')}
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleShiftWindows(effectiveSelectedIds, 100)}
-                      className="px-1.5 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
-                      title="Shift selected +0.10 µm (+100 nm)"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, -arrowFineNm)}
+                      className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
+                      title={`Fine shift left -${formatNudgeLabel(arrowFineNm)} (←)`}
                     >
-                      +0.1µm
+                      -{formatNudgeLabel(arrowFineNm).replace(' ', '')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, arrowFineNm)}
+                      className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px]"
+                      title={`Fine shift right +${formatNudgeLabel(arrowFineNm)} (→)`}
+                    >
+                      +{formatNudgeLabel(arrowFineNm).replace(' ', '')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleShiftWindows(effectiveSelectedIds, arrowCoarseNm)}
+                      className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-[10px]"
+                      title={`Coarse shift right +${formatNudgeLabel(arrowCoarseNm)} (Shift+→)`}
+                    >
+                      +{formatNudgeLabel(arrowCoarseNm).replace(' ', '')}
                     </button>
                   </div>
                 )}
@@ -1460,7 +1731,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   type="button"
                   disabled={effectiveSelectedIds.length === 0}
                   onClick={() => handleDuplicateSelectedWindows(effectiveSelectedIds)}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none text-slate-200 border border-slate-700 text-[10.5px] font-medium transition-colors"
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none text-slate-200 border border-slate-700 text-[10px] font-medium transition-colors"
                   title={
                     effectiveSelectedIds.length > 1
                       ? `Duplicate ${effectiveSelectedIds.length} selected ${featureNoun}s`
@@ -1469,11 +1740,11 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       : `Select a ${featureNoun} first to duplicate`
                   }
                 >
-                  <Copy className="w-3 h-3 text-sky-400" />
+                  <Copy className="w-2.5 h-2.5 text-sky-400" />
                   <span>
                     {effectiveSelectedIds.length > 1
-                      ? `Duplicate (${effectiveSelectedIds.length})`
-                      : 'Duplicate'}
+                      ? `Dup (${effectiveSelectedIds.length})`
+                      : 'Dup'}
                   </span>
                 </button>
                 <button
@@ -1481,13 +1752,14 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                   disabled={!singleSelectedWin}
                   onClick={() => {
                     if (!singleSelectedWin) return;
+                    setShowCoordRows(true);
                     setSelectedWindowIds([singleSelectedWin.id]);
                     setOpenWinBind(null);
                     setArraySourceWinId((prev) =>
                       prev === singleSelectedWin.id ? null : singleSelectedWin.id
                     );
                   }}
-                  className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[10.5px] font-medium transition-colors disabled:opacity-40 disabled:pointer-events-none ${
+                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium transition-colors disabled:opacity-40 disabled:pointer-events-none ${
                     singleSelectedWin && arraySourceWinId === singleSelectedWin.id
                       ? 'bg-sky-600/25 border-sky-500/60 text-sky-200'
                       : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
@@ -1498,24 +1770,25 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                       : `Select a single ${featureNoun} to make an array`
                   }
                 >
-                  <LayoutGrid className="w-3 h-3 text-sky-400" />
-                  <span>Make Array</span>
+                  <LayoutGrid className="w-2.5 h-2.5 text-sky-400" />
+                  <span>Array</span>
                 </button>
                 {selectedWindowIds.length > 1 && (
                   <button
                     type="button"
                     onClick={() => handleRemoveSelectedWindows(selectedWindowIds)}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-[10.5px] font-medium transition-colors"
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 text-[10px] font-medium transition-colors"
                     title={`Delete ${selectedWindowIds.length} selected ${featureNoun}s`}
                   >
-                    <Trash2 className="w-3 h-3" />
-                    <span>Delete ({selectedWindowIds.length})</span>
+                    <Trash2 className="w-2.5 h-2.5" />
+                    <span>Del ({selectedWindowIds.length})</span>
                   </button>
                 )}
               </div>
             </div>
 
-            <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+            {showCoordRows && (
+            <div className={`space-y-1 overflow-y-auto pr-0.5 ${hasExpandedInlinePanel ? 'max-h-56' : 'max-h-28'}`}>
               {windows.map((win, idx) => {
                 const isSelected = selectedWindowIds.includes(win.id);
                 const winWidth = Math.max(10, win.xEnd - win.xStart);
@@ -1533,67 +1806,58 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                     onClick={(e) =>
                       toggleWindowSelection(win.id, e.shiftKey || e.ctrlKey || e.metaKey)
                     }
-                    className={`p-2 rounded-lg text-xs transition-colors space-y-1.5 cursor-pointer ${
+                    className={`px-2 py-1 rounded-md text-[11px] transition-colors space-y-1 cursor-pointer ${
                       isSelected
                         ? 'bg-slate-800/90 border border-sky-500/50'
                         : 'bg-slate-950/60 border border-slate-800/80 hover:bg-slate-800/40'
                     }`}
                   >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                      <div className="flex items-center gap-1.5">
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
                             toggleWindowSelection(win.id, true);
                           }}
-                          className={`w-4 h-4 rounded border flex items-center justify-center transition-colors shrink-0 ${
+                          className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors shrink-0 ${
                             isSelected
                               ? 'bg-sky-600 border-sky-400 text-white'
                               : 'bg-slate-900 border-slate-600 hover:border-slate-400'
                           }`}
                           title={isSelected ? 'Deselect' : 'Add to selection'}
                         >
-                          {isSelected && <Check className="w-2.5 h-2.5" />}
+                          {isSelected && <Check className="w-2 h-2" />}
                         </button>
-                        <span className="w-5 h-5 rounded-md bg-slate-800 flex items-center justify-center font-mono text-[11px] text-slate-300">
-                          {idx + 1}
-                        </span>
-                        <span className="font-medium text-slate-300">
-                          {featureNounCap} #{idx + 1}
-                        </span>
-                        <span
-                          className={`px-1.5 py-0.5 rounded text-[9.5px] font-mono border ${
-                            isLightField
-                              ? 'bg-slate-900 border-slate-600 text-slate-300'
-                              : 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
-                          }`}
-                        >
-                          {isLightField ? 'Chrome Blocker' : 'Clear Aperture'}
+                        <span className="font-mono text-[11px] font-semibold text-slate-300">
+                          #{idx + 1}
                         </span>
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                         <div
                           className="flex items-center gap-1 font-mono text-[11px]"
                           onClick={(e) => e.stopPropagation()}
                         >
-                          <span className="text-sky-400">W:</span>
+                          <span className="text-sky-400">W</span>
                           <UmNumberInput
                             valueNm={winWidth}
                             minNm={10}
                             maxNm={waferWidth}
                             disabled={isFixed || Boolean(wExpr)}
                             onCommitNm={(valNm) => handleUpdateWindowWidth(win.id, valNm)}
+                            className={`w-14 px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
+                              isFixed || Boolean(wExpr) ? 'opacity-50 cursor-not-allowed text-slate-400' : ''
+                            }`}
                             title={
                               wExpr
                                 ? `Bound to: ${wExpr}`
                                 : isFixed
-                                ? 'Width is fixed (click Fix Width toggle to unlock)'
+                                ? 'Width is fixed (click Lock toggle to unlock)'
                                 : `Edit ${featureNoun} width (keeps block centered)`
                             }
                           />
-                          <span className="text-slate-500">µm</span>
+                          <span className="text-slate-500 text-[10px]">µm</span>
                           <ParamBindingBadge
                             expression={wExpr}
                             isOpen={activeBindField === 'width'}
@@ -1610,7 +1874,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                           <button
                             type="button"
                             onClick={() => handleToggleFixedWidth(win.id)}
-                            className={`ml-0.5 flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-sans font-medium transition-colors ${
+                            className={`p-0.5 rounded border transition-colors ${
                               isFixed
                                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 hover:bg-amber-500/30'
                                 : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-slate-200 hover:border-slate-600'
@@ -1622,11 +1886,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                             }
                           >
                             {isFixed ? (
-                              <Lock className="w-3 h-3 shrink-0" />
+                              <Lock className="w-3 h-3" />
                             ) : (
-                              <Unlock className="w-3 h-3 shrink-0" />
+                              <Unlock className="w-3 h-3" />
                             )}
-                            <span>{isFixed ? 'Width Fixed' : 'Fix Width'}</span>
                           </button>
                         </div>
 
@@ -1634,7 +1897,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                           className="flex items-center gap-1 font-mono text-[11px]"
                           onClick={(e) => e.stopPropagation()}
                         >
-                          <span className="text-slate-400">X₁:</span>
+                          <span className="text-slate-400">X</span>
                           <UmNumberInput
                             valueNm={win.xStart}
                             minNm={0}
@@ -1648,7 +1911,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                                 ? `Edit start X (slides ${featureNoun} with fixed width)`
                                 : `Edit ${featureNoun} start X`
                             }
-                            className={`w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
+                            className={`w-14 px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
                               xStartExpr ? 'opacity-65 cursor-not-allowed text-violet-300 border-violet-500/50' : ''
                             }`}
                           />
@@ -1665,7 +1928,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                             }}
                             compact
                           />
-                          <span className="text-slate-500">→</span>
+                          <span className="text-slate-500">–</span>
                           <UmNumberInput
                             valueNm={win.xEnd}
                             minNm={isFixed ? winWidth : 0}
@@ -1679,7 +1942,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                                 ? `Edit end X (slides ${featureNoun} with fixed width)`
                                 : `Edit ${featureNoun} end X`
                             }
-                            className={`w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
+                            className={`w-14 px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-right focus:outline-none focus:border-sky-500 ${
                               xEndExpr ? 'opacity-65 cursor-not-allowed text-violet-300 border-violet-500/50' : ''
                             }`}
                           />
@@ -1696,7 +1959,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                             }}
                             compact
                           />
-                          <span className="text-slate-500">µm</span>
+                          <span className="text-slate-500 text-[10px]">µm</span>
                         </div>
 
                         <div className="flex items-center gap-0.5">
@@ -1706,10 +1969,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                               e.stopPropagation();
                               handleDuplicateWindow(win.id);
                             }}
-                            className="p-1 rounded text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 transition-colors"
+                            className="p-0.5 rounded text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 transition-colors"
                             title={`Duplicate ${featureNoun}`}
                           >
-                            <Copy className="w-3.5 h-3.5" />
+                            <Copy className="w-3 h-3" />
                           </button>
                           <button
                             type="button"
@@ -1721,14 +1984,14 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                                 prev === win.id ? null : win.id
                               );
                             }}
-                            className={`p-1 rounded transition-colors ${
+                            className={`p-0.5 rounded transition-colors ${
                               isArrayOpen
                                 ? 'text-sky-300 bg-sky-500/20'
                                 : 'text-slate-400 hover:text-sky-300 hover:bg-sky-500/10'
                             }`}
                             title={`Make 1D array from ${featureNoun}`}
                           >
-                            <LayoutGrid className="w-3.5 h-3.5" />
+                            <LayoutGrid className="w-3 h-3" />
                           </button>
                           <button
                             type="button"
@@ -1736,10 +1999,10 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                               e.stopPropagation();
                               handleRemoveWindow(win.id);
                             }}
-                            className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                            className="p-0.5 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
                             title={`Delete ${featureNoun}`}
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Trash2 className="w-3 h-3" />
                           </button>
                         </div>
                       </div>
@@ -1796,6 +2059,7 @@ export const MaskEditor: React.FC<MaskEditorProps> = ({
                 );
               })}
             </div>
+            )}
           </div>
         );
       })()}
