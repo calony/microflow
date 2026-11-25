@@ -280,19 +280,19 @@ const HELP_TOPICS: HelpTopic[] = [
     order: '07',
     label: 'Importing Flows & Presets',
     summary:
-      'Load complete starter presets or selectively preview and merge steps and photomasks from another MicroFlow recipe without overwriting your current wafer.',
+      'Load a complete recipe to replace the current flow, or choose to add selected steps and photomasks to your current wafer.',
     entries: [
       {
         title: 'Presets vs. Import Flow',
         where: 'Top Bar → Presets vs. Import Flow / Traveller → Import',
         description:
-          'Presets replaces the active workspace with a complete reference flow (CMOS, MEMS Cantilever, Photonic Waveguide, TSV). Import Flow inspects another .json recipe or template and merges only what you select into your current flow.',
+          'Presets replaces the active workspace with a complete reference flow (CMOS, MEMS Cantilever, Photonic Waveguide, TSV). Import Flow previews another .json recipe or template and defaults to Replace Flow: it loads the complete recipe and resets the Process Traveller to the starting wafer (step 0). Choose an Add mode to merge selected items instead.',
       },
       {
         title: 'Pre-Import Analysis & Live Preview',
         where: 'Import Flow Modal → Right Pane',
         description:
-          'Before importing, inspect what the incoming flow does—its starting substrate, operation counts, materials, masks, step-by-step simulated cross-sections, and the Projected Merge Result inside your active wafer.',
+          'Before importing, inspect what the incoming flow does—its starting substrate, operation counts, materials, masks, step-by-step simulated cross-sections, and the Projected Result of replacing or adding to your active recipe.',
       },
       {
         title: 'Steps + Masks, Steps Only, or Masks Only',

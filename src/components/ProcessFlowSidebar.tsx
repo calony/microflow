@@ -1494,7 +1494,7 @@ export const ProcessFlowSidebar: React.FC<ProcessFlowSidebarProps> = ({
               type="button"
               onClick={onOpenImportFlow}
               className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 transition-colors"
-              title="Preview & import selected steps or masks from another process flow"
+              title="Import a complete recipe or add selected steps and masks"
             >
               <FileInput className="w-3 h-3" />
               <span>Import</span>

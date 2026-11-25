@@ -22,7 +22,7 @@ import { resolveFlowParameters } from './variableUtils';
 import { getActiveStepVariant } from './variantUtils';
 import { simulateCrossSection } from './simulationEngine';
 
-export type FlowImportMode = 'steps-and-masks' | 'steps-only' | 'masks-only';
+export type FlowImportMode = 'replace-flow' | 'steps-and-masks' | 'steps-only' | 'masks-only';
 export type MaskAssignmentMode = 'link-to-steps' | 'keep-unassigned';
 export type ImportInsertMode = 'end' | 'after-active';
 export type WidthScaleMode = 'scale' | 'clamp';
@@ -337,7 +337,7 @@ export function getMaskIdsUsedBySteps(
 }
 
 /**
- * Merges selected steps and/or masks from `sourceFlow` into `currentFlow` with clean ID remapping,
+ * Replaces the complete recipe, or merges selected steps and/or masks with clean ID remapping,
  * optional width scaling, material/recipe/variable merging, and optional mask linkage or unassignment.
  */
 export function mergeImportedFlowItems(
@@ -350,6 +350,18 @@ export function mergeImportedFlowItems(
   importedStepCount: number;
   importedMaskCount: number;
 } {
+  if (options.importMode === 'replace-flow') {
+    // Normalize a fresh copy of the source without carrying over any current recipe data.
+    const updatedFlow = normalizeIncomingFlow(sourceFlow);
+    if (!updatedFlow) throw new Error('Invalid process flow.');
+    return {
+      updatedFlow,
+      firstImportedStepIndex: -1,
+      importedStepCount: updatedFlow.steps.length,
+      importedMaskCount: (updatedFlow.masks || []).length,
+    };
+  }
+
   const stamp = Date.now();
   const nonce = Math.random().toString(36).slice(2, 6);
   const targetWidth = currentFlow.substrateWidth || 10000;

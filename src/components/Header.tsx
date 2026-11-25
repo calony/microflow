@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ProcessFlow } from '../types/microfab';
 import { ThicknessUnit } from '../lib/units';
+import { FlowImportMode } from '../lib/flowImportUtils';
 import {
   Layers,
   FolderOpen,
@@ -37,7 +38,7 @@ interface HeaderProps {
   onUpdateTitle: (title: string) => void;
   onUpdateDescription?: (description: string) => void;
   onOpenPresets: () => void;
-  onOpenImportFlow?: (initialMode?: 'steps-and-masks' | 'masks-only') => void;
+  onOpenImportFlow?: (initialMode?: FlowImportMode) => void;
   onOpenMaterials: () => void;
   onOpenEtchLibrary: () => void;
   onOpenMaskLevels: () => void;
@@ -417,9 +418,9 @@ export const Header: React.FC<HeaderProps> = ({
           {onOpenImportFlow && (
             <button
               type="button"
-              onClick={() => onOpenImportFlow('steps-and-masks')}
+              onClick={() => onOpenImportFlow('replace-flow')}
               className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors"
-              title="Preview & import selected steps or masks from another flow"
+              title="Import a complete recipe or add selected steps and masks"
             >
               <FileInput className="w-3.5 h-3.5 text-emerald-400" />
               <span>Import Flow</span>
@@ -625,12 +626,12 @@ export const Header: React.FC<HeaderProps> = ({
                   type="button"
                   onClick={() => {
                     setMobileMenuOpen(false);
-                    onOpenImportFlow('steps-and-masks');
+                    onOpenImportFlow('replace-flow');
                   }}
                   className="w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left text-slate-200 hover:bg-slate-800"
                 >
                   <FileInput className="w-4 h-4 text-emerald-400" />
-                  <span>Import Steps / Masks</span>
+                  <span>Import Flow</span>
                 </button>
               )}
               <button

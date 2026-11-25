@@ -90,7 +90,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
   currentFlow,
   activeStepIndex,
   thicknessUnit = 'nm',
-  initialMode = 'steps-and-masks',
+  initialMode = 'replace-flow',
   onApplyImport,
   onClose,
   onOpenHelp,
@@ -139,7 +139,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
     setInspectedStepIndex(lastEnabled >= 0 ? lastEnabled : normalized.steps.length - 1);
     setPreviewTab(initialMode === 'masks-only' ? 'source' : 'source');
 
-    if (normalized.steps.length === 0 && (normalized.masks || []).length > 0) {
+    if (importMode !== 'replace-flow' && normalized.steps.length === 0 && (normalized.masks || []).length > 0) {
       setImportMode('masks-only');
     }
   };
@@ -362,18 +362,24 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
   };
 
   const effectiveStepCount =
-    importMode === 'masks-only' ? 0 : selectedStepIds.size;
+    importMode === 'replace-flow'
+      ? sourceFlow?.steps.length || 0
+      : importMode === 'masks-only' ? 0 : selectedStepIds.size;
   const effectiveMaskCount =
-    importMode === 'steps-only' ? 0 : selectedMaskIds.size;
+    importMode === 'replace-flow'
+      ? (sourceFlow?.masks || []).length
+      : importMode === 'steps-only' ? 0 : selectedMaskIds.size;
   const canApplyImport =
     Boolean(sourceFlow && projectedMergeResult) &&
-    (effectiveStepCount > 0 || effectiveMaskCount > 0);
+    (importMode === 'replace-flow' || effectiveStepCount > 0 || effectiveMaskCount > 0);
 
   const handleConfirmImport = () => {
     if (!projectedMergeResult || !canApplyImport) return;
     onApplyImport(
       projectedMergeResult.updatedFlow,
-      projectedMergeResult.firstImportedStepIndex >= 0
+      importMode === 'replace-flow'
+        ? -1
+        : projectedMergeResult.firstImportedStepIndex >= 0
         ? projectedMergeResult.firstImportedStepIndex
         : undefined
     );
@@ -515,7 +521,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
             </span>
             <div className="min-w-0">
               <h2 className="text-xs sm:text-sm font-bold text-white tracking-tight truncate">
-                Import Steps &amp; Masks from Another Flow
+                Import Process Flow
               </h2>
               <p className="text-[11px] text-slate-400 truncate">
                 Target: <span className="text-slate-200 font-medium">{currentFlow.title}</span>
@@ -624,7 +630,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                 Drop a MicroFlow <span className="font-mono text-sky-300">.json</span> file here, or click to browse
               </p>
               <p className="text-xs text-slate-400 mt-1 max-w-lg mx-auto">
-                The incoming flow will be simulated and summarized before anything is added to your current recipe.
+                Preview the incoming recipe before replacing your current flow or adding selected steps and masks.
               </p>
             </div>
 
@@ -697,7 +703,19 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
 
                 {/* Primary Mode Switcher */}
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="inline-flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px]">
+                  <div className="inline-flex flex-wrap items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setImportMode('replace-flow')}
+                      aria-pressed={importMode === 'replace-flow'}
+                      className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+                        importMode === 'replace-flow'
+                          ? 'bg-sky-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Replace Flow
+                    </button>
                     <button
                       type="button"
                       onClick={() => setImportMode('steps-and-masks')}
@@ -707,7 +725,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      Steps + Masks
+                      Add Steps + Masks
                     </button>
                     <button
                       type="button"
@@ -718,7 +736,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      Steps Only
+                      Add Steps Only
                     </button>
                     <button
                       type="button"
@@ -729,7 +747,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      Masks Only
+                      Add Masks Only
                     </button>
                   </div>
 
@@ -764,6 +782,12 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                   )}
                 </div>
 
+                {importMode === 'replace-flow' && (
+                  <p className="text-[11px] text-sky-300">
+                    Replaces the entire current recipe, including its substrate, steps, masks, and libraries.
+                    The Process Traveller restarts at the starting wafer (step 0).
+                  </p>
+                )}
                 {importMode === 'steps-only' && (
                   <p className="text-[11px] text-slate-400">
                     Photolithography steps will be imported with blank, unlinked aperture tracks. No masks will be added.
@@ -783,8 +807,24 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
 
               {/* Scrollable Checklists Area */}
               <div className="flex-1 overflow-y-auto p-3 space-y-4">
+                {importMode === 'replace-flow' && (
+                  <section className="space-y-2">
+                    <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-300">
+                      Complete Recipe · {sourceFlow.steps.length} Steps
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      All steps and masks from this file will be loaded. Export your current recipe first if you want to keep a copy.
+                    </p>
+                    {sourceFlow.steps.map((step, index) => (
+                      <div key={step.id} className="flex items-center gap-2 text-xs text-slate-200">
+                        <span className="text-slate-500 font-mono">{index + 1}.</span>
+                        <span>{step.title}</span>
+                      </div>
+                    ))}
+                  </section>
+                )}
                 {/* STEPS CHECKLIST */}
-                {importMode !== 'masks-only' && (
+                {importMode !== 'replace-flow' && importMode !== 'masks-only' && (
                   <section className="space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
@@ -955,7 +995,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                 )}
 
                 {/* MASKS CHECKLIST */}
-                {importMode !== 'steps-only' && (
+                {importMode !== 'replace-flow' && importMode !== 'steps-only' && (
                   <section className="space-y-2 pt-1">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
@@ -1107,6 +1147,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
               </div>
 
               {/* Merge Options Strip */}
+              {importMode !== 'replace-flow' && (
               <div className="px-3.5 py-2.5 bg-slate-900/70 border-t border-slate-800 space-y-2 shrink-0 text-[11px]">
                 {importMode !== 'masks-only' && (
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1229,6 +1270,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                   </div>
                 )}
               </div>
+              )}
             </div>
 
             {/* RIGHT COLUMN: Flow Preview & Analytical Breakdown */}
@@ -1256,7 +1298,7 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                         : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    Projected Merge Result
+                    Projected Result
                   </button>
                 </div>
 
@@ -1368,6 +1410,8 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
                               sourceFlow.masks
                             )
                           : sourceSummary?.substrateSummary
+                        : importMode === 'replace-flow'
+                        ? `Replaces "${currentFlow.title}" with "${sourceFlow.title}".`
                         : projectedMergeResult
                         ? `Adds ${projectedMergeResult.importedStepCount} step${
                             projectedMergeResult.importedStepCount === 1 ? '' : 's'
@@ -1492,6 +1536,11 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
           <div className="text-[11px] text-slate-400 font-mono tabular-nums">
             {!sourceFlow ? (
               <span>Select a JSON recipe or built-in template to preview its steps and masks.</span>
+            ) : importMode === 'replace-flow' ? (
+              <span>
+                Replace current flow with <strong className="text-white">{effectiveStepCount}</strong> steps
+                {' '}and <strong className="text-white">{effectiveMaskCount}</strong> masks · restart at step 0
+              </span>
             ) : !canApplyImport ? (
               <span className="text-amber-300">Select at least one step or mask to import.</span>
             ) : importMode === 'masks-only' ? (
@@ -1531,7 +1580,9 @@ export const ImportFromFlowModal: React.FC<ImportFromFlowModalProps> = ({
             >
               <Check className="w-3.5 h-3.5" />
               <span>
-                {importMode === 'masks-only'
+                {importMode === 'replace-flow'
+                  ? 'Replace Current Flow'
+                  : importMode === 'masks-only'
                   ? `Import ${effectiveMaskCount} Mask${effectiveMaskCount === 1 ? '' : 's'}`
                   : importMode === 'steps-only'
                   ? `Import ${effectiveStepCount} Step${effectiveStepCount === 1 ? '' : 's'}`
