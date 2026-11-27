@@ -4,6 +4,12 @@ A GitHub Pages deployment of [dred36/microflow](https://github.com/dred36/microf
 
 [Open Microflow](https://calony.github.io/microflow/)
 
+## Showcase: vertically stacked silicon waveguides
+
+A step-by-step fabrication sequence for vertically stacked silicon waveguides, exported directly from MicroFlow.
+
+https://github.com/user-attachments/assets/0e72ea1a-2729-4f20-a32d-869b78623161
+
 ## MicroFlow quick start
 
 MicroFlow lets you build a microfabrication process and see a simulated **cross-section**, or side view, of the wafer after each step.
